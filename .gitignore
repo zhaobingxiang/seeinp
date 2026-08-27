@@ -1,0 +1,69 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.bin
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+bin/
+
+# Logs
+logs/
+*.log
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Config files with secrets
+conf/authcode*
+conf/*-test.toml
+conf/*-local.toml
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Backup
+backup_*/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+
+# Node.js
+node_modules/
+
+# Frontend build
+web-pm/dist/
+web-ps/dist/
+
+# Go build cache
+.gocache/

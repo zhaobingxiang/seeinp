@@ -1,0 +1,12 @@
+seeinpm：
+	服务器信息：这是一个公网服务器，用于部署seeinpm
+	IP：170.106.109.105
+	SSH端口：22
+	用户名：root
+	密码：Zbx.9705
+seeinps：
+	服务器信息：这个服务器可以连通seeinpm的服务器170.106.109.105，但是他的地址不是公网地址，他的内网地址是192.168.0.10，为了方便使用，我将它的SSH端口映射到了see.timemsee.cn的27141，65443端口映射到了see.timemsee.cn的27143
+	地址：see.timemsee.cn
+	SSH端口：27141
+	用户名：hik  SSH需要先使用hik登录，再切换root账号，root密码与hik一致
+	密码：Zbx.9705

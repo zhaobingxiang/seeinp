@@ -1,0 +1,237 @@
+# seeinp API 规范
+
+| 项 | 内容 |
+|---|---|
+| 文档版本 | v1.0 |
+| 状态 | 评审稿 |
+| 关联文档 | 01-需求文档.md、02-通信协议规范.md、04-数据存储规范.md |
+
+---
+
+## 1. 通用规范
+
+### 1.1 端口与同源
+
+- **seeinpm**：B端 Web 页面、全部 REST API、WebSocket 统一监听 **999 端口**（同源，无跨域）；API 路径前缀 `/api/v1`；
+- **seeinps**：B端与 API 同源监听 **65443**，路径前缀 `/api/v1`；
+- seeinps 部署工具调用的校验接口：seeinpm `/api/v1/auth/verify-code`（HTTPS 建议，见 §2.2）。
+
+### 1.2 统一响应壳
+
+所有 REST 响应（含错误）：
+
+```json
+{ "code": 0, "message": "ok", "data": { } }
+```
+
+| 字段 | 说明 |
+|---|---|
+| code | 0 成功；非 0 见错误码表（§1.5） |
+| message | 人类可读信息（成功为 "ok"） |
+| data | 业务数据，成功时存在 |
+
+分页响应壳：
+
+```json
+{ "code": 0, "message": "ok",
+  "data": { "list": [], "page": 1, "pageSize": 20, "total": 128 } }
+```
+
+### 1.3 鉴权
+
+| 项 | 说明 |
+|---|---|
+| Token 类型 | JWT：`access_token`（默认 30min）+ `refresh_token`（默认 24h） |
+| 传递 | `Authorization: Bearer <access_token>` |
+| 刷新 | `POST /api/v1/auth/refresh`，refresh_token 在 body；刷新后旧 refresh 失效（旋转） |
+| 吊销 | 修改密码/重置授权码 → 服务端吊销该用户全部会话 |
+| 脚本调用 | 支持创建 **API Token**（长期，可限定只读/范围，可吊销），用于 CI/自动化 |
+| 对象级鉴权 | seeinps 用户仅能访问自己的代理/统计/日志（IDOR 防护，服务端逐请求校验归属） |
+
+### 1.4 列表接口约定
+
+- 分页：`?page=1&pageSize=20`（pageSize ≤ 100）；
+- 筛选：`?status=online&type=tcp&group=groupA&keyword=xx`；
+- 排序：`?sort=created_at&order=desc`（白名单字段，防止注入）；
+- 时间区间：`?start=2026-08-01T00:00:00Z&end=2026-08-05T00:00:00Z`（ISO8601 UTC）。
+
+### 1.5 错误码分段
+
+| 段 | 含义 | 示例 |
+|---|---|---|
+| 1xxx | 鉴权/会话 | 1001 登录失败、1002 凭证不匹配、1003 会话过期、1004 账号锁定、1005 授权码已使用、1006 无权访问 |
+| 2xxx | 参数错误 | 2001 参数缺失、2002 格式错误、2003 端口非法、2004 密码强度不足 |
+| 3xxx | 资源冲突 | 3001 用户名已存在、3002 端口冲突、3003 端口池耗尽、3004 超出限制区间、3005 代理数上限 |
+| 4xxx | 资源不存在 | 4001 用户不存在、4002 代理不存在 |
+| 5xxx | 服务端错误 | 5000 内部错误（详情记服务端日志，不外泄） |
+| 6xxx | 限流 | 6001 请求过于频繁、6002 登录尝试过多 |
+
+---
+
+## 2. seeinpm API 清单
+
+### 2.1 认证与平台管理员
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | /api/v1/auth/login | 平台管理员登录（账号+密码）→ `{access_token, refresh_token, mustInit:false}`；首次启动引导创建管理员：`POST /api/v1/auth/init`（仅当管理员表为空时可用） |
+| POST | /api/v1/auth/refresh | 刷新令牌（旋转） |
+| POST | /api/v1/auth/logout | 登出，吊销当前 refresh |
+| POST | /api/v1/auth/change-password | 修改管理员密码（旧密码+新密码，新密码强度校验） |
+| POST | /api/v1/auth/verify-code | **部署工具专用**：校验授权码+用户名。请求 `{username, authCode}`；响应 `{code:0, data:{tlsFingerprint, serverAddr, serverPort, userConfig}}` / `code:1002 AUTH_CODE_IN_USE`（含 onlineSince）/ `code:1003` 用户已禁用 |
+
+### 2.2 seeinps 用户管理
+
+> 已实现条目按用户名（username）作为资源标识（`:id` 槽位传 username），与现有 DELETE /api/v1/users 行为一致。
+
+| 方法 | 路径 | 说明 | 状态 |
+|---|---|---|---|
+| GET | /api/v1/users | 用户列表 `{id, username, remark, status, online}`（status: 1 启用 / 0 禁用；online 为实时会话判定） | 已实现 |
+| POST | /api/v1/users | 创建用户 `{username, remark?}` → 自动生成授权码，响应含 `authCode`（**仅此一次明文返回**） | 已实现 |
+| POST | /api/v1/users/:id/disable | 禁用用户；请求体 `{disconnectNow?: bool}`，`true` 时立即断开已建立的全部连接（推送 SESSION_REVOKE + 释放端口）；禁用后 REGISTER/verify-code 拒绝（1003） | 已实现 |
+| POST | /api/v1/users/:id/enable | 启用用户；seeinps 重连后自动恢复 | 已实现 |
+| POST | /api/v1/users/:id/reset-code | 重置授权码：旧码立即失效、在线实例被断开（SESSION_REVOKE）；响应 `data.authCode` 新授权码**仅此一次明文返回**。seeinps 侧进程保持运行，在其管理页输入新授权码重绑后自动恢复（见 §3.1 /auth/rebind） | 已实现 |
+| DELETE | /api/v1/users?username= | 删除用户（级联：释放端口、断开会话） | 已实现 |
+| GET | /api/v1/users/:id | 用户详情（授权码不返回明文，仅 `authCodeUpdatedAt`） | 二期 |
+| PATCH | /api/v1/users/:id | 修改备注/分组/端口区间（端口区间变更时冲突校验） | 二期 |
+| GET | /api/v1/users/:id/proxies | 该用户全部代理（含配置、状态） | 二期 |
+| GET | /api/v1/users/:id/stats | 该用户流量/连接统计（时间区间） | 二期 |
+| GET/POST/PATCH/DELETE | /api/v1/groups | 用户分组管理 | 二期 |
+
+### 2.3 端口池
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/v1/port-pool | 端口池配置 + 使用情况（已分配/空闲/保留，含色块数据） |
+| PUT | /api/v1/port-pool | 调整端口池（追加/移除区间、排除端口；冲突检测，缩容时列出受影响端口） |
+| GET | /api/v1/port-pool/allocations | 全部端口分配明细（port → 用户/代理） |
+
+### 2.4 代理总览（平台管理员视角）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/v1/proxies | 全局代理列表（分组/状态/类型/用户筛选） |
+| GET | /api/v1/proxies/:id | 代理详情（配置 + 状态 + 连接数） |
+| GET | /api/v1/proxies/:id/connections | 连接历史（分页，含断开时间、来源 IP、流量） |
+| GET | /api/v1/proxies/:id/traffic | 流量时序（minute/hour/day 粒度） |
+| POST | /api/v1/proxies/:id/disconnect | 强制断开该代理全部连接 |
+
+### 2.5 统计与仪表板
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/v1/stats/overview | 仪表板聚合：在线 seeinps 数、代理数（按状态）、实时带宽、今日流量、端口池水位、系统健康（CPU/内存/磁盘） |
+| GET | /api/v1/stats/traffic | 全局流量趋势（时序，按区间与粒度） |
+| GET | /api/v1/stats/online-users | 在线 seeinps 列表（含心跳延迟、版本） |
+
+### 2.6 审计与日志
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/v1/audit-logs | 审计日志（操作人/时间/来源 IP/操作/详情，分页筛选） |
+| GET | /api/v1/audit-logs/export | 导出（CSV/JSON） |
+| GET | /api/v1/logs | 本机运行日志文件列表 + 下载（`?file=xxx&lines=500` 尾部读取） |
+| GET | /api/v1/logs/seeinps/:username | 某 seeinps 的运行日志（经控制通道拉取/推送，B端统一入口） |
+| WS | /api/v1/logs/stream | 实时日志流（WebSocket，见 §4） |
+
+### 2.7 版本与升级
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/v1/version/latest | 最新版本信息（三端）：`{seeinpm:{version,url,sha256}, seeinps:{...}, seeinpc:{...}}`；部署工具/seeinpc/seeinps 据此升级 |
+| GET | /api/v1/version/current | 本机 seeinpm 版本 |
+| POST | /api/v1/version/upload | 上传新版本包（平台管理员鉴权）。`multipart/form-data`：`endpoint=seeinpm\|seeinps\|seeinpc`、`version`（SemVer）、`releaseNote`（更新说明，多行文本）、`file`（安装包）；服务端落盘到 `data/releases/{endpoint}/`，计算 SHA256，写入 versions 表，自动生成下载地址 `/releases/{endpoint}/<file>`。响应 `data: {version, url, sha256, releasedAt}`。审计日志记录 action=`version.upload` |
+| GET | /api/v1/version/history | 指定端的版本历史列表。`?endpoint=seeinpm\|seeinps\|seeinpc`（必填），可选 `?page&pageSize`。响应 `data.list: [{version, url, sha256, releaseNote, releasedAt, uploadedBy}]`，按 released_at 倒序 |
+| GET | /api/v1/version/check | 升级检查。`?endpoint=seeinps\|seeinpc&current=<本地版本号>`（current 为 SemVer）。服务端比较 current 与该端最新版本：若最新版本 > current，返回 `data: {hasUpdate:true, latest:{version, url, sha256, releaseNote, releasedAt}}`；否则 `hasUpdate:false`。客户端据此决定是否弹窗提醒 |
+
+> **「该版本不再提醒」说明**：服务端**不记录**用户的忽略状态，只负责发布版本；客户端在本地持久化已忽略的版本号（seeinps 用 localStorage 键 `seeinp:ignored-versions`，seeinpc 用 `conf/config.json` 的 `ignoredVersions` 字段，见 04 数据存储规范）。客户端逻辑：调用 `/version/check` 得到 `latest.version` 后，若该版本已在本地忽略列表中则不弹窗；当 `latest.version` 高于忽略列表中所有版本时才重新提醒。
+
+---
+
+## 3. seeinps API 清单（B端，:65443）
+
+### 3.1 认证与本地用户
+
+| 方法 | 路径 | 说明 | 状态 |
+|---|---|---|---|
+| GET | /api/v1/auth/status | 本地账号状态：`{initialized, username, authCodeReset}`；`authCodeReset=true` 表示 seeinpm 已重置授权码，需重绑 | 已实现 |
+| POST | /api/v1/auth/login | seeinps 用户登录（用户名+密码，密码仅存本地） | 已实现 |
+| POST | /api/v1/auth/init | 首次初始化：设置管理页密码（见需求文档 §5.4 运行细节③），同时保存 seeinpm 用户名+授权码并立即发起注册 | 已实现 |
+| POST | /api/v1/auth/rebind | 重新绑定授权码：seeinpm 侧重置授权码后，B端输入新码 `{authCode}` 触发；更新本地凭证并立即重连，代理数据保留、端口复用自动恢复，无需重新部署 | 已实现 |
+| POST | /api/v1/auth/change-password | 修改管理页密码（新密码强度校验；修改后旧会话吊销，元数据同步 seeinpm） | 二期 |
+
+### 3.2 代理管理（本地）
+
+**已实现（v0.1.0）**：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/v1/proxies | 本地代理列表。响应 `data: [{id, type, localAddr, localPort, forwardPort, opsId?, proxyUsername?, acl?}]`；ops 类型额外返回 `opsId`（=对外端口）与 `acl` |
+| POST | /api/v1/proxies | 添加代理：`{id, type: tcp\|ops_http, localAddr?, localPort?, proxyUsername?, proxyPassword?, acl?}`。`id` 限字母/数字/下划线/连字符（1-32 位，字母或数字开头）；tcp 必填 `localPort`；ops_http 必填 `proxyUsername` + `proxyPassword`（强度：≥10 位且含大写/小写/数字/特殊字符，需求 §10.3），`acl` 为 CIDR 数组可省略（默认 `10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16`）。已连接 seeinpm 时触发 `ALLOC_PORT` 实时申请端口，失败则回滚删除（错误码 5002）；响应含 `forwardPort` |
+| PATCH | /api/v1/proxies/:id | 修改代理（tcp 可改 localAddr/localPort；ops 可改 proxyUsername/acl，`proxyPassword` 留空表示不修改密码）。修改后通知 seeinpm 更新 |
+| DELETE | /api/v1/proxies/:id | 删除（通知 seeinpm `RELEASE_PORT` 释放端口） |
+
+> ops_http 代理的使用方式：外网 seeinpc 以 `seeinpm公网:opsId` 为 HTTP 代理，携带 `Proxy-Authorization: Basic <proxyUsername:proxyPassword>`；未认证返回 407，目标不在 ACL 网段返回 403，支持 CONNECT 隧道与绝对 URI 转发（协议 §8.4）。
+
+**二期规划**：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | /api/v1/proxies/:id/disable \| /enable | 启停 |
+| POST | /api/v1/proxies/:id/restart | 重启该代理 |
+| GET | /api/v1/proxies/:id/connections | 连接历史（含认证失败记录） |
+| GET | /api/v1/proxies/:id/traffic | 流量时序 |
+| GET | /api/v1/proxies/export | 导出配置 JSON |
+| POST | /api/v1/proxies/import | 导入配置（校验后应用） |
+| — | — | `type: udp`（UDP 映射）与 `type: ops_socks`（SOCKS5 运维代理）暂未实现，请求返回错误码 2002 |
+
+### 3.3 系统与日志
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/v1/system/health | CPU/内存/磁盘/文件描述符（或句柄） |
+| GET | /api/v1/system/status | 与 seeinpm 连接状态（在线/重连中/离线）、心跳延迟、重连历史 |
+| POST | /api/v1/system/reload | 配置热重载 |
+| GET | /api/v1/logs | 本地运行/访问/审计日志（文件列表、尾部读取、下载） |
+| WS | /api/v1/logs/stream | 本地实时日志流 |
+| GET | /api/v1/audit-logs | 本地操作审计（B端操作） |
+
+---
+
+## 4. WebSocket 实时流
+
+### 4.1 通用约定
+
+- 端点：`/api/v1/logs/stream`（认证方式：URL query `?token=<access_token>` 或首帧 `{"type":"auth","token":"..."}`）；
+- 帧格式：JSON 文本帧 `{ "type": "log"|"status"|"stats"|"ping", "data": {...} }`；
+- 服务端每 30s 发 `ping`，客户端 60s 内无响应判定断开，客户端自动重连（指数退避）。
+
+### 4.2 帧类型
+
+| type | 说明 |
+|---|---|
+| log | 日志行 `{level, ts, component, message, proxyId?}` |
+| status | 连接/代理状态变更（seeinpm 推送全部 seeinps 状态；seeinps 推送自身状态） |
+| stats | 实时带宽/连接数快照（默认 2s 一次，可订阅指定 proxyId） |
+| ping / pong | 保活 |
+
+---
+
+## 5. OpenAPI 与版本管理
+
+- 每个程序提供 `GET /api/v1/openapi.json`（OpenAPI 3.0 规范），前端与外部集成据此生成 SDK；
+- 接口演进：新增字段向后兼容；破坏性变更提升 API 主版本（`/api/v2`）；
+- 所有写操作（POST/PATCH/DELETE）在审计日志记录：操作人、时间、来源 IP、请求摘要（脱敏）。
+
+---
+
+## 6. API 与内部协议的关系
+
+| 场景 | 走 API | 走控制协议（999） |
+|---|---|---|
+| 平台管理员管理用户/端口池/全局视图 | ✔ | — |
+| seeinps 用户管理本地代理 | ✔（65443） | — |
+| seeinps 申请/释放对外端口 | — | ✔（ALLOC_PORT / RELEASE_PORT） |
+| seeinpm 推送配置/吊销会话 | — | ✔（CONFIG_PUSH / SESSION_REVOKE） |
+| seeinpm B端查看 seeinps 日志 | ✔（B端聚合入口） | ✔（底层拉取/推送） |
+| 部署工具校验授权码 | ✔（verify-code，HTTPS） | —（注册在部署完成后的 seeinps 启动时发生） |

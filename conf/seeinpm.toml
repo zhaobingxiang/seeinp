@@ -1,0 +1,28 @@
+﻿# seeinpm configuration
+
+[server]
+addr = ":999"  # Listen address
+
+[tls]
+enabled = true
+cert_file = ""  # Empty for auto-generate
+key_file = ""   # Empty for auto-generate
+
+[auth]
+jwt_secret = ""  # Empty for auto-generate
+jwt_expire = 1800  # 30 minutes in seconds
+jwt_refresh_expire = 86400  # 24 hours in seconds
+
+[database]
+path = "data/seeinpm.db"
+
+[logging]
+level = "info"  # debug, info, warn, error
+path = "logs"
+max_size = 100  # MB
+max_backups = 7
+
+[port_pool]
+ranges = [
+    { start = 20000, end = 30000 }
+]

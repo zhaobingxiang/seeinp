@@ -1,0 +1,21 @@
+# seeinps test config
+
+[server]
+server_addr = "127.0.0.1:999"
+
+[auth]
+username = "user1"
+auth_code = "seeinp_4fde18e7ee07d4fbeb9314340601e8da31d20dba370d6ed2e2ab7c4ce6cf6079"
+
+[tls]
+enabled = true
+skip_verify = true
+
+[local]
+bend_addr = "127.0.0.1:65443"
+
+[logging]
+level = "info"
+path = "logs"
+max_size = 100
+max_backups = 7
