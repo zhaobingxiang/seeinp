@@ -202,7 +202,7 @@ const uploadForm = reactive({ endpoint: 'seeinps', platform: 'linux/amd64', vers
 
 const showUpgrade = ref(false)
 const upgrading = ref(false)
-const upgradeForm = reactive({ username: '', currentVersion: '', versionId: 0 as number, goos: '', goarch: '' })
+const upgradeForm = reactive({ username: '', currentVersion: '', versionId: 0 as number, goos: '', goarch: '', preSessionId: '' })
 
 const platforms = [
   { value: 'linux/amd64', label: 'Linux x86_64 (amd64)' },
@@ -393,6 +393,7 @@ const deleteVersion = async (row: any) => {
 const openUpgrade = (row: any) => {
   upgradeForm.username = row.username
   upgradeForm.currentVersion = row.version || ''
+  upgradeForm.preSessionId = row.sessionId || ''
   upgradeForm.goos = row.goos || ''
   upgradeForm.goarch = row.goarch || ''
   upgradeForm.versionId = versions.value.length ? versions.value[0].id : 0
@@ -533,7 +534,9 @@ const watchNodeVersion = () => {
     waited += 3
     await loadClients()
     const row = clients.value.find((c: any) => c.username === upgradeForm.username)
-    if (row && row.version === upgradeTargetVersion.value) {
+    // 会话 ID 变化 = 节点确实重启过：重装（目标版本==当前版本）时版本号恒等，只能靠会话区分
+    const restarted = !!(upgradeForm.preSessionId && row && row.sessionId && row.sessionId !== upgradeForm.preSessionId)
+    if (row && restarted && row.version === upgradeTargetVersion.value) {
       stopUpgradeWatch()
       stopUpgradePoll()
       upgradeDone.value = true

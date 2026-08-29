@@ -127,12 +127,16 @@ const formatSize = (n?: number) => {
   return n + ' B'
 }
 
+const preSessionId = ref('')
+
 const loadCurrent = async () => {
   try {
     const res: any = await statusApi.getStatus()
     if (res.code === 0) {
       currentVersion.value = res.data?.version || ''
       nodePlatform.value = res.data?.platform || ''
+      // 升级等待期记录升级前的会话 ID，作为"节点确实重启过"的判定依据
+      if (!preSessionId.value) preSessionId.value = res.data?.sessionId || ''
     }
   } catch (error) {
     console.error('Load status error:', error)
@@ -182,7 +186,9 @@ const pollStatus = () => {
         // 状态归位：进程已重启，检查版本号判定完成
         stopPoll()
         await loadCurrent()
-        if (upTargetVersion.value && currentVersion.value === upTargetVersion.value) {
+        // 会话 ID 变化 = 节点确实重启过（重装同版本时版本号恒等，只能靠会话区分）
+        const restarted = !!(preSessionId.value && res.data?.sessionId && res.data.sessionId !== preSessionId.value)
+        if (upTargetVersion.value && restarted && currentVersion.value === upTargetVersion.value) {
           upDone.value = true
           ElMessage.success(`升级完成：节点已运行 ${currentVersion.value}，代理已自动恢复`)
         } else if (upTargetVersion.value) {
@@ -200,6 +206,9 @@ const stopPoll = () => {
 
 const upgradeFromPM = async (version: string) => {
   try {
+    // 记录当前会话 ID：节点重启重连后会变化，用于判定升级完成
+    const st: any = await statusApi.getStatus()
+    if (st.code === 0) preSessionId.value = st.data?.sessionId || preSessionId.value
     const res: any = await versionApi.pmUpgrade(version)
     if (res.code === 0) {
       upTargetVersion.value = version
@@ -224,6 +233,8 @@ const handleSelfUpload = async () => {
     fd.append('file', uploadFile.value)
     const res: any = await versionApi.selfUpload(fd, (p: number) => { uploadPercent.value = p })
     if (res.code === 0) {
+      // 后端自动识别包内版本，作为完成判定依据
+      upTargetVersion.value = res.data?.version || ''
       ElMessage.success('上传完成，节点正在应用升级（即将重启）')
       upStage.value = 'applying'
       pollStatus()
