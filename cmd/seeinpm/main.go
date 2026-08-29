@@ -24,6 +24,7 @@ import (
 	"github.com/hashicorp/yamux"
 	"github.com/seeinp/seeinp/internal/auth"
 	"github.com/seeinp/seeinp/internal/config"
+	"github.com/seeinp/seeinp/internal/gzhttp"
 	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/mux"
 	"github.com/seeinp/seeinp/internal/portpool"
@@ -31,6 +32,7 @@ import (
 	"github.com/seeinp/seeinp/internal/store"
 	"github.com/seeinp/seeinp/internal/tlsutil"
 	"github.com/seeinp/seeinp/internal/version"
+	"github.com/seeinp/seeinp/internal/webui"
 )
 
 const (
@@ -71,6 +73,9 @@ type proxyTraffic struct {
 
 type Client struct {
 	username      string
+	version       string // seeinps 上报的版本号（HELLO 时获取）
+	goos          string // seeinps 运行平台（HELLO 时获取，升级包平台匹配用）
+	goarch        string
 	sessionID     string
 	connected     time.Time
 	lastPing      time.Time
@@ -172,6 +177,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go s.startControlListener(ctx)
 	go s.startHTTPListener()
 	go s.startCleanupRoutine(ctx)
+	go s.startExpiryTicker(ctx)
 	go s.trafficSampler(ctx)
 	go s.trafficFlusher(ctx)
 
@@ -212,10 +218,16 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("/api/v1/auth/login", s.handleAuthLogin)
 	mux.HandleFunc("/api/v1/auth/refresh", s.handleAuthRefresh)
 	mux.HandleFunc("/api/v1/users", s.authMiddleware(s.handleUsers))
+	mux.HandleFunc("PUT /api/v1/users/{username}", s.authMiddleware(s.handleUpdateUser))
 	mux.HandleFunc("POST /api/v1/users/{username}/disable", s.authMiddleware(s.handleUserDisable))
 	mux.HandleFunc("POST /api/v1/users/{username}/enable", s.authMiddleware(s.handleUserEnable))
 	mux.HandleFunc("POST /api/v1/users/{username}/reset-code", s.authMiddleware(s.handleUserResetCode))
 	mux.HandleFunc("/api/v1/clients", s.authMiddleware(s.handleClientsAPI))
+	mux.HandleFunc("POST /api/v1/clients/{username}/upgrade", s.authMiddleware(s.handleClientUpgrade))
+	mux.HandleFunc("GET /api/v1/clients/{username}/upgrade-status", s.authMiddleware(s.handleUpgradeStatus))
+	mux.HandleFunc("GET /api/v1/versions", s.authMiddleware(s.handleVersionsList))
+	mux.HandleFunc("POST /api/v1/versions", s.authMiddleware(s.handleVersionUpload))
+	mux.HandleFunc("DELETE /api/v1/versions/{id}", s.authMiddleware(s.handleVersionDelete))
 	mux.HandleFunc("/api/v1/auth/verify-code", s.handleVerifyCode)
 	mux.HandleFunc("/api/v1/port-pool", s.authMiddleware(s.handlePortPool))
 	mux.HandleFunc("GET /api/v1/proxies", s.authMiddleware(s.handleListProxies))
@@ -229,23 +241,16 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("GET /api/v1/ps-logs", s.authMiddleware(s.handlePSLogList))
 	mux.HandleFunc("GET /api/v1/ps-logs/content", s.authMiddleware(s.handlePSLogContent))
 
-	staticDir := "./web-pm/dist"
-	if _, err := os.Stat(staticDir); err == nil {
-		fs := http.FileServer(http.Dir(staticDir))
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			path := filepath.Join(staticDir, filepath.Clean(r.URL.Path))
-			info, err := os.Stat(path)
-			if err != nil || info.IsDir() {
-				http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
-				return
-			}
-			fs.ServeHTTP(w, r)
-		})
-	}
+	// 前端内嵌于二进制（internal/webui），与后端版本严格一致，随版本包同步更新
+	mux.HandleFunc("/", webui.SPAHandler(webui.PM()))
 
-	addr := ":9998"
+	addr := s.config.Server.HTTPAddr
+	if addr == "" {
+		addr = ":9998"
+	}
 	fmt.Printf("[HTTP] Listening on %s\n", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	// gzip：前端产物与 API 响应压缩（窄带链路下体积 -60% 以上）
+	if err := http.ListenAndServe(addr, gzhttp.Handler(mux)); err != nil {
 		log.Printf("[HTTP] Error: %v", err)
 	}
 }
@@ -331,6 +336,37 @@ func (s *Server) startCleanupRoutine(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.cleanupStaleAllocations()
+		}
+	}
+}
+
+// startExpiryTicker 每 30s 检查一次有效期：过期用户的 seeinps 控制连接与全部代理被断开；
+// 有效期改回今天或以后后，seeinps 重连注册成功并自动恢复全部代理
+func (s *Server) startExpiryTicker(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.checkExpiredUsers()
+		}
+	}
+}
+
+func (s *Server) checkExpiredUsers() {
+	users, err := s.store.ListUsers()
+	if err != nil {
+		return
+	}
+	for _, u := range users {
+		if u.Status != 1 || !userExpired(u) {
+			continue
+		}
+		if _, active := s.isClientActive(u.Username); active {
+			fmt.Printf("[USER] %s expired, kicking (reason=user_expired)\n", u.Username)
+			s.kickClient(u.Username, "user_expired")
 		}
 	}
 }
@@ -732,16 +768,28 @@ func (s *Server) handleListUsers(w http.ResponseWriter) {
 		return
 	}
 	type userResp struct {
-		ID       int64  `json:"id"`
-		Username string `json:"username"`
-		Remark   string `json:"remark,omitempty"`
-		Status   int    `json:"status"`
-		Online   bool   `json:"online"`
+		ID         int64             `json:"id"`
+		Username   string            `json:"username"`
+		Remark     string            `json:"remark,omitempty"`
+		Status     int               `json:"status"`
+		Online     bool              `json:"online"`
+		ExpireDate string            `json:"expireDate,omitempty"`
+		Expired    bool              `json:"expired"`
+		MaxPorts   int               `json:"maxPorts"`
+		PortRanges []store.PortRange `json:"portRanges"`
+		UsedPorts  int               `json:"usedPorts"`
 	}
 	list := make([]userResp, 0, len(users))
 	for _, u := range users {
 		_, active := s.isClientActive(u.Username)
-		list = append(list, userResp{ID: u.ID, Username: u.Username, Remark: u.Remark, Status: u.Status, Online: active})
+		used, _ := s.store.CountActiveAllocationsByUser(u.Username)
+		item := userResp{ID: u.ID, Username: u.Username, Remark: u.Remark, Status: u.Status, Online: active,
+			MaxPorts: u.MaxPorts, PortRanges: u.PortRanges, UsedPorts: used}
+		if u.ExpiresAt > 0 {
+			item.ExpireDate = time.Unix(u.ExpiresAt, 0).Format("2006-01-02")
+			item.Expired = userExpired(u)
+		}
+		list = append(list, item)
 	}
 	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": list})
 	w.Write(data)
@@ -749,8 +797,11 @@ func (s *Server) handleListUsers(w http.ResponseWriter) {
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Username string `json:"username"`
-		Remark   string `json:"remark"`
+		Username   string            `json:"username"`
+		Remark     string            `json:"remark"`
+		ExpireDate string            `json:"expireDate"`
+		MaxPorts   int               `json:"maxPorts"`
+		PortRanges []store.PortRange `json:"portRanges"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -762,15 +813,127 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"code":2002,"message":"username min 3 chars"}`)
 		return
 	}
+	expiresAt, maxPorts, ranges, err := s.parseUserLimits(req.ExpireDate, req.MaxPorts, req.PortRanges)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
+		return
+	}
 	code, salt, _ := auth.GenerateAuthCode()
 	authCodeHash := auth.HashAuthCode(code, salt)
-	if err := s.store.CreateUser(req.Username, authCodeHash, salt); err != nil {
+	if err := s.store.CreateUser(req.Username, authCodeHash, salt, expiresAt, maxPorts, ranges); err != nil {
 		w.WriteHeader(http.StatusConflict)
 		fmt.Fprintf(w, `{"code":3001,"message":"username already exists"}`)
 		return
 	}
-	s.audit(r, "user_create", req.Username, fmt.Sprintf("remark=%s", req.Remark))
+	s.audit(r, "user_create", req.Username, fmt.Sprintf("remark=%s expire=%s maxPorts=%d portRanges=%v", req.Remark, req.ExpireDate, maxPorts, ranges))
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"username":"%s","authCode":"%s","remark":"%s"}}`, req.Username, code, req.Remark)
+}
+
+// handleUpdateUser PUT /api/v1/users/{username}：修改有效期/端口数量/用户端口池。
+// 配置收紧导致现有分配违规（池外或超配额）时踢线重连，seeinps 30s 内按新约束重新分配端口。
+func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	username := r.PathValue("username")
+	if _, err := s.store.GetUserByUsername(username); err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `{"code":2004,"message":"user not found"}`)
+		return
+	}
+	var req struct {
+		ExpireDate string            `json:"expireDate"`
+		MaxPorts   int               `json:"maxPorts"`
+		PortRanges []store.PortRange `json:"portRanges"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2001,"message":"invalid request"}`)
+		return
+	}
+	expiresAt, maxPorts, ranges, err := s.parseUserLimits(req.ExpireDate, req.MaxPorts, req.PortRanges)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
+		return
+	}
+	if err := s.store.UpdateUserLimits(username, expiresAt, maxPorts, ranges); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"code":5000,"message":"update failed"}`)
+		return
+	}
+	allocs, _ := s.store.GetAllocationsByUser(username)
+	overQuota := maxPorts > 0 && len(allocs) > maxPorts
+	outsidePool := len(ranges) > 0 && !allocsInRanges(allocs, ranges)
+	kicked := false
+	if overQuota || outsidePool {
+		s.kickClient(username, "user_config_changed")
+		kicked = true
+	}
+	fmt.Printf("[USER] %s updated (expire=%s maxPorts=%d ranges=%v kicked=%v)\n", username, req.ExpireDate, maxPorts, ranges, kicked)
+	s.audit(r, "user_update", username, fmt.Sprintf("expire=%s maxPorts=%d portRanges=%v kicked=%v", req.ExpireDate, maxPorts, ranges, kicked))
+	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"kicked":%v}}`, kicked)
+}
+
+// parseUserLimits 校验并归一化用户配置：有效期（YYYY-MM-DD，取当天 23:59:59 本地时间，留空=不过期）、
+// 端口数量配额（0=不限）、用户端口池（自动合并重叠段；每段必须完整落在总端口池某一段内；
+// 配置了配额时用户池总跨度不得超过配额）
+func (s *Server) parseUserLimits(expireDate string, maxPorts int, portRanges []store.PortRange) (int64, int, []store.PortRange, error) {
+	var expiresAt int64
+	if expireDate != "" {
+		t, err := time.ParseInLocation("2006-01-02", expireDate, time.Local)
+		if err != nil {
+			return 0, 0, nil, fmt.Errorf("有效期格式应为 YYYY-MM-DD")
+		}
+		expiresAt = t.Add(23*time.Hour + 59*time.Minute + 59*time.Second).Unix()
+	}
+	if maxPorts < 0 {
+		return 0, 0, nil, fmt.Errorf("端口数量不能为负数")
+	}
+	if len(portRanges) == 0 {
+		return expiresAt, maxPorts, nil, nil
+	}
+	merged, err := normalizeRanges(portRanges)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	global := s.portPool.GetRanges()
+	for _, rg := range merged {
+		covered := false
+		for _, g := range global {
+			if rg.Start >= g.Start && rg.End <= g.End {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return 0, 0, nil, fmt.Errorf("用户端口池 %d-%d 不在总端口池范围内", rg.Start, rg.End)
+		}
+	}
+	if maxPorts > 0 {
+		span := 0
+		for _, rg := range merged {
+			span += rg.End - rg.Start + 1
+		}
+		if span > maxPorts {
+			return 0, 0, nil, fmt.Errorf("用户端口池共 %d 个端口，超过端口数量配额 %d", span, maxPorts)
+		}
+	}
+	return expiresAt, maxPorts, merged, nil
+}
+
+// allocsInRanges 判断全部分配是否都在给定范围集合内
+func allocsInRanges(allocs []*store.PortAllocation, ranges []store.PortRange) bool {
+	for _, a := range allocs {
+		if !portInRanges(a.Port, ranges) {
+			return false
+		}
+	}
+	return true
+}
+
+// userExpired 有效期是否已过（ExpiresAt=0 表示永不过期）
+func userExpired(u *store.User) bool {
+	return u.ExpiresAt > 0 && time.Now().Unix() > u.ExpiresAt
 }
 
 func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
@@ -901,14 +1064,27 @@ func (s *Server) handleClientsAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	s.clientsMu.RLock()
 	type clientInfo struct {
-		Username  string `json:"username"`
-		SessionID string `json:"sessionId"`
-		Connected int64  `json:"connected"`
-		LastPing  int64  `json:"lastPing"`
+		Username   string `json:"username"`
+		SessionID  string `json:"sessionId"`
+		Connected  int64  `json:"connected"`
+		LastPing   int64  `json:"lastPing"`
+		Version    string `json:"version"`
+		GoOS       string `json:"goos"`
+		GoArch     string `json:"goarch"`
+		Upgradable bool   `json:"upgradable"`
+		Upgrading  bool   `json:"upgrading"`
 	}
 	list := make([]clientInfo, 0, len(s.clients))
 	for _, c := range s.clients {
-		list = append(list, clientInfo{Username: c.username, SessionID: c.sessionID, Connected: c.connected.Unix(), LastPing: c.lastPing.Unix()})
+		// 心跳超 90s 的陈旧连接视为离线不展示（链路半死时避免"假在线/假升级中"误导）
+		if time.Since(c.lastPing) > 90*time.Second || c.session == nil || c.session.IsClosed() {
+			continue
+		}
+		// 可升级判断按节点自身平台取最新包，避免跨平台误判
+		latest, _ := s.store.GetLatestVersion("seeinps", c.goos, c.goarch)
+		upgradable := latest != nil && compareVersions(latest.Version, c.version) > 0
+		list = append(list, clientInfo{Username: c.username, SessionID: c.sessionID, Connected: c.connected.Unix(), LastPing: c.lastPing.Unix(),
+			Version: c.version, GoOS: c.goos, GoArch: c.goarch, Upgradable: upgradable, Upgrading: isUpgrading(c.username)})
 	}
 	s.clientsMu.RUnlock()
 	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": list})
@@ -1514,12 +1690,14 @@ func (s *Server) handleControlConnection(conn net.Conn) {
 		return
 	}
 
-	client, err := s.handleRegister(controlStream, registerMsg, session)
+	client, err := s.handleRegister(controlStream, registerMsg, session, helloData)
 	if err != nil {
 		log.Printf("[CTRL] Register error: %v", err)
 		return
 	}
 	fmt.Printf("[+] Client registered: %s (session: %s)\n", client.username, client.sessionID)
+	// 版本管理：升级后节点重连上报的版本与目标一致时推进升级状态（校验回报可能在重启瞬间丢失）
+	completeUpgradeIfMatches(client.username, client.version)
 	s.handleHeartbeat(controlStream, client)
 }
 
@@ -1539,7 +1717,7 @@ func (s *Server) isClientActive(username string) (*Client, bool) {
 	return c, true
 }
 
-func (s *Server) handleRegister(stream net.Conn, msg *protocol.Message, session *yamux.Session) (*Client, error) {
+func (s *Server) handleRegister(stream net.Conn, msg *protocol.Message, session *yamux.Session, hello *protocol.HelloData) (*Client, error) {
 	codec := protocol.NewCodec()
 	dataBytes, _ := json.Marshal(msg.Data)
 	regData := &protocol.RegisterData{}
@@ -1564,6 +1742,13 @@ func (s *Server) handleRegister(stream net.Conn, msg *protocol.Message, session 
 		resp := protocol.NewResponse(msg, protocol.CodeSessionRevoked, map[string]string{"reason": "user_disabled"})
 		codec.WriteMessage(stream, resp)
 		return nil, fmt.Errorf("user disabled: %s", regData.Username)
+	}
+
+	// 有效期已过拒绝注册：seeinps 收到 1003 转入低速重试，有效期改回后自动恢复
+	if userExpired(user) {
+		resp := protocol.NewResponse(msg, protocol.CodeSessionRevoked, map[string]string{"reason": "user_expired"})
+		codec.WriteMessage(stream, resp)
+		return nil, fmt.Errorf("user expired: %s", regData.Username)
 	}
 
 	if user.OnlineSession != nil {
@@ -1591,6 +1776,9 @@ func (s *Server) handleRegister(stream net.Conn, msg *protocol.Message, session 
 
 	client := &Client{
 		username:      regData.Username,
+		version:       hello.Version,
+		goos:          hello.OS,
+		goarch:        hello.Arch,
 		sessionID:     sessionID,
 		connected:     time.Now(),
 		lastPing:      time.Now(),
@@ -1639,8 +1827,17 @@ func (s *Server) handleHeartbeat(stream net.Conn, client *Client) {
 		case protocol.TypeAuditSync:
 			// 混合架构：B 端上报审计记录，按 username 区分来源写入统一 audit_logs
 			s.handleAuditSync(msg, client)
-		case protocol.TypeLogListResp, protocol.TypeLogContentResp:
-			// A 端发起的日志拉取响应，转交等待协程
+		case protocol.TypeUpgradeReport:
+			// 版本管理：B 端上报升级包接收结果（downloaded/failed），最终成功以重连后 HELLO 版本为准
+			s.handleUpgradeReport(msg, client)
+		case protocol.TypeVersionListReq:
+			// B 端自主升级：查询本端可用版本列表（按节点平台过滤）
+			s.handleVersionListReq(msg, client)
+		case protocol.TypeVersionPullReq:
+			// B 端自主升级：按版本号请求拉取升级包（应答元信息后经 0x05 流直传）
+			s.handleVersionPullReq(msg, client)
+		case protocol.TypeLogListResp, protocol.TypeLogContentResp, protocol.TypeUpgradePushResp:
+			// A 端发起的日志拉取/升级推送响应，转交等待协程
 			client.pendingMu.Lock()
 			ch, ok := client.pending[msg.ID]
 			if ok {
@@ -1700,10 +1897,14 @@ func (s *Server) clientRequest(client *Client, msg *protocol.Message, timeout ti
 	}
 }
 
-// writeControl 带锁写控制流：心跳应答/端口响应与 SESSION_REVOKE 推送共用一把锁防帧交错
+// writeControl 带锁写控制流：心跳应答/端口响应与 SESSION_REVOKE 推送共用一把锁防帧交错。
+// 节点链路可能半死（TCP 未断但读端停止），无截止时间会让写入永久阻塞并卡死
+// 升级/端口分配等协程——30s 写失败快速返回，由调用方触发会话清理，节点自动重连自愈。
 func (c *Client) writeControl(msg *protocol.Message) error {
 	c.ctrlWriteMu.Lock()
 	defer c.ctrlWriteMu.Unlock()
+	c.controlStream.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	defer c.controlStream.SetWriteDeadline(time.Time{})
 	return protocol.NewCodec().WriteMessage(c.controlStream, msg)
 }
 
@@ -1719,6 +1920,28 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 		return
 	}
 
+	user, err := s.store.GetUserByUsername(client.username)
+	if err != nil {
+		client.writeControl(protocol.NewResponse(msg, protocol.CodeAuthFailed, nil))
+		return
+	}
+	// 用户已过期：拒绝分配并断开（30s 过期定时器也会兜底踢线）
+	if userExpired(user) {
+		fmt.Printf("[ALLOC] proxy=%s rejected: user %s expired\n", d.ProxyID, client.username)
+		client.writeControl(protocol.NewResponse(msg, protocol.CodeSessionRevoked, map[string]string{"reason": "user_expired"}))
+		return
+	}
+	// 端口数量配额：仅对"新分配"生效，代理重连的端口复用不受限
+	if user.MaxPorts > 0 {
+		if _, err := s.store.GetPortByProxyID(d.ProxyID); err != nil {
+			if n, err := s.store.CountActiveAllocationsByUser(client.username); err == nil && n >= user.MaxPorts {
+				fmt.Printf("[ALLOC] proxy=%s rejected: port quota %d reached (user=%s)\n", d.ProxyID, user.MaxPorts, client.username)
+				client.writeControl(protocol.NewResponse(msg, protocol.CodePortPoolExhausted, map[string]string{"reason": "port_quota"}))
+				return
+			}
+		}
+	}
+
 	s.publicMu.RLock()
 	if oldPL, ok := s.publicConnsByProxy[d.ProxyID]; ok {
 		s.publicMu.RUnlock()
@@ -1727,7 +1950,12 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 		s.publicMu.RUnlock()
 	}
 
-	alloc, err := s.portPool.Allocate(client.username, d.ProxyID, d.Type, d.Port)
+	// 用户端口池：非空时新端口只能落在用户池与全局池的交集中
+	var userRanges []portpool.Range
+	for _, rg := range user.PortRanges {
+		userRanges = append(userRanges, portpool.Range{Start: rg.Start, End: rg.End})
+	}
+	alloc, err := s.portPool.Allocate(client.username, d.ProxyID, d.Type, d.Port, userRanges)
 	if err != nil {
 		log.Printf("[ALLOC] Error: %v", err)
 		client.writeControl(protocol.NewResponse(msg, protocol.CodePortConflict, nil))

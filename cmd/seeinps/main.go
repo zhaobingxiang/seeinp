@@ -66,6 +66,13 @@ type Proxy struct {
 // DefaultOpsACL 运维代理默认 ACL：仅内网网段（F-P5）
 var DefaultOpsACL = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 
+// errPortPoolExhausted seeinpm 对 ALLOC 失败统一回 3001；seeinps 只发随机端口申请，
+// 被拒即端口池无可用端口，向前端透出友好提示
+var errPortPoolExhausted = errors.New("端口池获取失败，请联系管理员")
+
+// errPortQuotaExhausted seeinpm 回 3002：用户端口数量配额已用满，新代理无法再分配端口
+var errPortQuotaExhausted = errors.New("端口数量已达上限，请联系管理员")
+
 type proxySnapshot struct {
 	LocalAddr, ProxyUsername, ProxyPasswordHash, ACLRaw string
 	LocalPort                                           int
@@ -220,6 +227,13 @@ func (l *controlLink) readLoop() {
 			}
 			continue
 		}
+		// A 端推送升级包（随后经 0x05 数据流传输二进制）
+		if msg.Type == protocol.TypeUpgradePush {
+			if c := l.client; c != nil {
+				l.send(c.handleUpgradePush(msg))
+			}
+			continue
+		}
 		l.pendingMu.Lock()
 		ch, ok := l.pending[msg.ID]
 		l.pendingMu.Unlock()
@@ -369,8 +383,16 @@ func (c *Client) connectOnce(ctx context.Context) error {
 		if registerResp.Code != nil {
 			code = int(*registerResp.Code)
 		}
-		// 会话被吊销：码正确但用户被禁用 → 低速重试等管理员启用（启用后自动恢复）
+		// 会话被吊销：码正确但用户被禁用或已过期 → 低速重试，管理员处理（启用/改有效期）后自动恢复
 		if code == int(protocol.CodeSessionRevoked) {
+			b, _ := json.Marshal(registerResp.Data)
+			reason := &struct {
+				Reason string `json:"reason"`
+			}{}
+			json.Unmarshal(b, reason)
+			if reason.Reason == "user_expired" {
+				return fmt.Errorf("register rejected: user expired (code=1003)")
+			}
 			return errUserDisabled
 		}
 		// 授权码错误（1001）：码已被重置或从未生效 → 置重绑提示，继续退避重试
@@ -552,6 +574,12 @@ func (c *Client) allocProxy(link *controlLink, p *Proxy) (int, error) {
 		if code == int(protocol.CodeProxyDisabled) {
 			return 0, fmt.Errorf("ALLOC_PORT rejected: proxy disabled on seeinpm (code=1006)")
 		}
+		if code == int(protocol.CodePortConflict) {
+			return 0, errPortPoolExhausted
+		}
+		if code == int(protocol.CodePortPoolExhausted) {
+			return 0, errPortQuotaExhausted
+		}
 		return 0, fmt.Errorf("ALLOC_PORT code=%d", code)
 	}
 	d := &protocol.AllocPortRespData{}
@@ -614,12 +642,21 @@ func (c *Client) acceptDataStreams(session *yamux.Session) {
 
 func (c *Client) handleDataStream(stream net.Conn) {
 	defer stream.Close()
-	// 流头: stype(1B) + proxyIdLen(1B) + proxyId，精确按长度读取，剩余字节留给载荷
-	var head [2]byte
-	if _, err := io.ReadFull(stream, head[:]); err != nil {
+	// 流头: stype(1B)，代理流随后为 proxyIdLen(1B) + proxyId，精确按长度读取，剩余字节留给载荷
+	var stype [1]byte
+	if _, err := io.ReadFull(stream, stype[:]); err != nil {
 		return
 	}
-	idLen := int(head[1])
+	if stype[0] == protocol.StreamTypeUpgrade {
+		// 版本管理升级流：无 proxyID，头部为 4B 长度 + JSON 元信息 + 二进制内容
+		c.handleUpgradeStream(stream)
+		return
+	}
+	var idLenByte [1]byte
+	if _, err := io.ReadFull(stream, idLenByte[:]); err != nil {
+		return
+	}
+	idLen := int(idLenByte[0])
 	if idLen < 1 || idLen > 128 {
 		fmt.Printf("[DATA] invalid proxyIdLen %d\n", idLen)
 		return
@@ -636,13 +673,13 @@ func (c *Client) handleDataStream(stream net.Conn) {
 		fmt.Printf("[DATA] unknown proxyID %q\n", proxyID)
 		return
 	}
-	switch head[0] {
+	switch stype[0] {
 	case protocol.StreamTypeOps:
 		c.handleOpsStream(stream, proxy)
 	case protocol.StreamTypeTCP:
 		c.handleTCPStream(stream, proxy)
 	default:
-		fmt.Printf("[DATA] unsupported stype %d for %s\n", head[0], proxyID)
+		fmt.Printf("[DATA] unsupported stype %d for %s\n", stype[0], proxyID)
 	}
 }
 

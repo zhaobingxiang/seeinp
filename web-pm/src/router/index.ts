@@ -44,6 +44,12 @@ const routes = [
     meta: { requiresAuth: true, title: '端口池' }
   },
   {
+    path: '/pm/versions',
+    name: 'Versions',
+    component: () => import('@/views/Versions.vue'),
+    meta: { requiresAuth: true, title: '版本管理' }
+  },
+  {
     path: '/',
     redirect: '/pm/login'
   }

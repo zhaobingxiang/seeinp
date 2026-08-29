@@ -86,17 +86,23 @@
 
 | 方法 | 路径 | 说明 | 状态 |
 |---|---|---|---|
-| GET | /api/v1/users | 用户列表 `{id, username, remark, status, online}`（status: 1 启用 / 0 禁用；online 为实时会话判定） | 已实现 |
-| POST | /api/v1/users | 创建用户 `{username, remark?}` → 自动生成授权码，响应含 `authCode`（**仅此一次明文返回**） | 已实现 |
+| GET | /api/v1/users | 用户列表 `{id, username, remark, status, online, expireDate?, expired, maxPorts, portRanges, usedPorts}`（expireDate 为 YYYY-MM-DD，空=永久；usedPorts 为当前活跃分配数） | 已实现 |
+| POST | /api/v1/users | 创建用户 `{username, remark?, expireDate?, maxPorts?, portRanges?}` → 自动生成授权码，响应含 `authCode`（**仅此一次明文返回**）。可选限制：expireDate 有效期（YYYY-MM-DD，到期断开+拒绝注册）、maxPorts 端口数量配额（0=不限）、portRanges 用户端口池（须在总池内且总跨度 ≤ maxPorts） | 已实现 |
+| PUT | /api/v1/users/:id | 修改用户限制 `{expireDate?, maxPorts?, portRanges?}`；配置收紧导致现有分配违规（池外/超配额）时自动踢线重连，seeinps 30s 内按新约束重新分配端口，响应 `data.kicked` 标记 | 已实现 |
 | POST | /api/v1/users/:id/disable | 禁用用户；请求体 `{disconnectNow?: bool}`，`true` 时立即断开已建立的全部连接（推送 SESSION_REVOKE + 释放端口）；禁用后 REGISTER/verify-code 拒绝（1003） | 已实现 |
 | POST | /api/v1/users/:id/enable | 启用用户；seeinps 重连后自动恢复 | 已实现 |
 | POST | /api/v1/users/:id/reset-code | 重置授权码：旧码立即失效、在线实例被断开（SESSION_REVOKE）；响应 `data.authCode` 新授权码**仅此一次明文返回**。seeinps 侧进程保持运行，在其管理页输入新授权码重绑后自动恢复（见 §3.1 /auth/rebind） | 已实现 |
 | DELETE | /api/v1/users?username= | 删除用户（级联：释放端口、断开会话） | 已实现 |
 | GET | /api/v1/users/:id | 用户详情（授权码不返回明文，仅 `authCodeUpdatedAt`） | 二期 |
-| PATCH | /api/v1/users/:id | 修改备注/分组/端口区间（端口区间变更时冲突校验） | 二期 |
+| PATCH | /api/v1/users/:id | 修改备注/分组（备注/端口限制已由 PUT 覆盖） | 二期 |
 | GET | /api/v1/users/:id/proxies | 该用户全部代理（含配置、状态） | 二期 |
 | GET | /api/v1/users/:id/stats | 该用户流量/连接统计（时间区间） | 二期 |
 | GET/POST/PATCH/DELETE | /api/v1/groups | 用户分组管理 | 二期 |
+
+> **有效期/配额执行语义**（2026-08-29 实现）：
+> - 有效期到期：PM 30s 定时器断开该用户控制连接与全部代理（kick reason=`user_expired`）；REGISTER 拒绝（1003, reason=`user_expired`）转 seeinps 低速重试；有效期改回今天或以后后 seeinps 自动重连恢复，代理端口保持稳定（历史端口复用）。
+> - 端口数量配额：仅限制**新分配**（代理重连复用端口不受限）。超配额的 ALLOC_PORT 被拒（3002），seeinps 创建代理时返回「端口数量已达上限，请联系管理员」；释放端口后 resync 自动恢复。
+> - 用户端口池：见 §3.4 users 表 `port_ranges`；分配只能落在用户池 ∩ 总池。
 
 ### 2.3 端口池
 
@@ -147,44 +153,29 @@
 | GET | /api/v1/logs/seeinps/:username | 某 seeinps 的运行日志（经控制通道拉取/推送，B端统一入口） |
 | WS | /api/v1/logs/stream | 实时日志流（WebSocket，见 §4） |
 
-### 2.7 版本与升级
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | /api/v1/version/latest | 最新版本信息（三端）：`{seeinpm:{version,url,sha256}, seeinps:{...}, seeinpc:{...}}`；部署工具/seeinpc/seeinps 据此升级 |
-| GET | /api/v1/version/current | 本机 seeinpm 版本 |
-| POST | /api/v1/version/upload | 上传新版本包（平台管理员鉴权）。`multipart/form-data`：`endpoint=seeinpm\|seeinps\|seeinpc`、`version`（SemVer）、`releaseNote`（更新说明，多行文本）、`file`（安装包）；服务端落盘到 `data/releases/{endpoint}/`，计算 SHA256，写入 versions 表，自动生成下载地址 `/releases/{endpoint}/<file>`。响应 `data: {version, url, sha256, releasedAt}`。审计日志记录 action=`version.upload` |
-| GET | /api/v1/version/history | 指定端的版本历史列表。`?endpoint=seeinpm\|seeinps\|seeinpc`（必填），可选 `?page&pageSize`。响应 `data.list: [{version, url, sha256, releaseNote, releasedAt, uploadedBy}]`，按 released_at 倒序 |
-| GET | /api/v1/version/check | 升级检查。`?endpoint=seeinps\|seeinpc&current=<本地版本号>`（current 为 SemVer）。服务端比较 current 与该端最新版本：若最新版本 > current，返回 `data: {hasUpdate:true, latest:{version, url, sha256, releaseNote, releasedAt}}`；否则 `hasUpdate:false`。客户端据此决定是否弹窗提醒 |
-
-> **「该版本不再提醒」说明**：服务端**不记录**用户的忽略状态，只负责发布版本；客户端在本地持久化已忽略的版本号（seeinps 用 localStorage 键 `seeinp:ignored-versions`，seeinpc 用 `conf/config.json` 的 `ignoredVersions` 字段，见 04 数据存储规范）。客户端逻辑：调用 `/version/check` 得到 `latest.version` 后，若该版本已在本地忽略列表中则不弹窗；当 `latest.version` 高于忽略列表中所有版本时才重新提醒。
-
----
-
-## 3. seeinps API 清单（B端，:65443）
-
-### 3.1 认证与本地用户
+### 2.7 版本与升级（2026-08-29 实现，v1 仅 seeinps 远程升级）
 
 | 方法 | 路径 | 说明 | 状态 |
 |---|---|---|---|
-| GET | /api/v1/auth/status | 本地账号状态：`{initialized, username, authCodeReset}`；`authCodeReset=true` 表示 seeinpm 已重置授权码，需重绑 | 已实现 |
-| POST | /api/v1/auth/login | seeinps 用户登录（用户名+密码，密码仅存本地） | 已实现 |
-| POST | /api/v1/auth/init | 首次初始化：设置管理页密码（见需求文档 §5.4 运行细节③），同时保存 seeinpm 用户名+授权码并立即发起注册 | 已实现 |
-| POST | /api/v1/auth/rebind | 重新绑定授权码：seeinpm 侧重置授权码后，B端输入新码 `{authCode}` 触发；更新本地凭证并立即重连，代理数据保留、端口复用自动恢复，无需重新部署 | 已实现 |
-| POST | /api/v1/auth/change-password | 修改管理页密码（新密码强度校验；修改后旧会话吊销，元数据同步 seeinpm） | 二期 |
+| GET | /api/v1/versions | 版本包列表。`?endpoint=seeinps`（默认 seeinps）。响应 `data: [{id, endpoint, version, fileName, fileSize, sha256, note, releasedBy, createdAt}]`，按时间倒序 | 已实现 |
+| POST | /api/v1/versions | 上传版本包（管理员鉴权）。`multipart/form-data`：`endpoint=seeinps`、`version`（五段数字版本号 `1.0.26.0829.01`：大版本.大版本.年.月日.当日序号）、`goos`/`goarch`（目标平台，缺省 linux/amd64；白名单 linux/windows/darwin × amd64/arm64/arm/386）、`note`（更新说明）、`file`（seeinps 二进制，≤200MB）。服务端落盘 `data/releases/seeinps/<version>/<goos>-<goarch>/` 并计算 SHA256。同端同版本号**同平台**重复返回 409。审计 `version_upload` | 已实现 |
+| DELETE | /api/v1/versions/{id} | 删除版本记录及安装包文件。审计 `version_delete` | 已实现 |
+| GET | /api/v1/clients | 在线节点列表，新增字段 `version`（HELLO 上报）、`goos`/`goarch`（节点平台）、`upgradable`（与节点同平台的最新包比较）、`upgrading`（升级进行中标记） | 已实现 |
+| POST | /api/v1/clients/{username}/upgrade | 一键升级。body `{versionId}`；**升级包平台必须与节点平台（goos/goarch）完全一致，否则 400**。流程：UPGRADE_PUSH 预检（PM 与 PS 双重平台校验）→ 0x05 数据流直传二进制 → B 端校验后 rename+exec 自替换重启。低版本推送即回滚。审计 `client_upgrade`。响应后前端轮询 /api/v1/clients 观察版本变化 | 已实现 |
+| GET | /api/v1/version/check | 升级检查（三端通用，预留给 seeinpc） | 未实现 |
 
-### 3.2 代理管理（本地）
-
-**已实现（v0.1.0）**：
+#### 2.7.1 seeinps B 端自主升级（2026-08-30 实现）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | /api/v1/proxies | 本地代理列表。响应 `data: [{id, type, localAddr, localPort, forwardPort, opsId?, proxyUsername?, acl?}]`；ops 类型额外返回 `opsId`（=对外端口）与 `acl` |
-| POST | /api/v1/proxies | 添加代理：`{id, type: tcp\|ops_http, localAddr?, localPort?, proxyUsername?, proxyPassword?, acl?}`。`id` 限字母/数字/下划线/连字符（1-32 位，字母或数字开头）；tcp 必填 `localPort`；ops_http 必填 `proxyUsername` + `proxyPassword`（强度：≥10 位且含大写/小写/数字/特殊字符，需求 §10.3），`acl` 为 CIDR 数组可省略（默认 `10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16`）。已连接 seeinpm 时触发 `ALLOC_PORT` 实时申请端口，失败则回滚删除（错误码 5002）；响应含 `forwardPort` |
-| PATCH | /api/v1/proxies/:id | 修改代理（tcp 可改 localAddr/localPort；ops 可改 proxyUsername/acl，`proxyPassword` 留空表示不修改密码）。修改后通知 seeinpm 更新 |
-| DELETE | /api/v1/proxies/:id | 删除（通知 seeinpm `RELEASE_PORT` 释放端口） |
+| GET | /api/v1/self-upgrade/status | 自主升级状态 `{stage: idle\|pulling\|receiving\|applying\|failed, version, error, totalBytes, doneBytes}` |
+| POST | /api/v1/self-upgrade | 自上传升级（multipart: `version` + `file`，平台须与本节点一致；≤200MB）。后台应用，状态轮询见上 |
+| GET | /api/v1/pm-versions | 向 seeinpm 查询本平台可用版本列表（控制通道 VERSION_LIST），返回 `[{id, version, note, fileSize, createdAt}]` |
+| POST | /api/v1/pm-upgrade | 从 seeinpm 拉取指定版本升级（body `{version}`），经 VERSION_PULL + 0x05 流直传，完成判定轮询 /auth/status 的 version |
 
-> ops_http 代理的使用方式：外网 seeinpc 以 `seeinpm公网:opsId` 为 HTTP 代理，携带 `Proxy-Authorization: Basic <proxyUsername:proxyPassword>`；未认证返回 407，目标不在 ACL 网段返回 403，支持 CONNECT 隧道与绝对 URI 转发（协议 §8.4）。
+> **升级语义**：升级期间该节点全部代理短暂断开，节点换二进制后自动重连并按历史端口复用恢复映射；
+> 允许推送相同或更低版本（手动回滚）；PM 侧不对节点做自动回滚（v1 手动：推送旧包，或节点上用 `seeinps.old` 恢复）。
+ ops_http 代理的使用方式：外网 seeinpc 以 `seeinpm公网:opsId` 为 HTTP 代理，携带 `Proxy-Authorization: Basic <proxyUsername:proxyPassword>`；未认证返回 407，目标不在 ACL 网段返回 403，支持 CONNECT 隧道与绝对 URI 转发（协议 §8.4）。
 
 **二期规划**：
 

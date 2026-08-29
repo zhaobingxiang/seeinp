@@ -4,15 +4,15 @@
 server_addr = "127.0.0.1:999"
 
 [auth]
-username = "user1"
-auth_code = "seeinp_b0a258d4b0cd5b431b26ca7365cd0bd31eed500e6a90d2040afc602a3128418d"
+username = "user2"
+auth_code = "seeinp_102a7011a70c3caa36acfe38972347961901712494c40f25965402dd2b90fd07"
 
 [tls]
 enabled = true
 skip_verify = true
 
 [local]
-bend_addr = "127.0.0.1:65443"
+bend_addr = "127.0.0.1:16444"
 
 [logging]
 level = "info"

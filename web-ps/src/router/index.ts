@@ -32,6 +32,12 @@ const routes = [
     meta: { requiresAuth: true, title: '系统日志' }
   },
   {
+    path: '/ps/versions',
+    name: 'Version',
+    component: () => import('@/views/Version.vue'),
+    meta: { requiresAuth: true, title: '版本升级' }
+  },
+  {
     path: '/',
     redirect: '/ps/login'
   }

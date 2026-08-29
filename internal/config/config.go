@@ -20,7 +20,8 @@ type PMConfig struct {
 }
 
 type ServerConfig struct {
-	Addr string `toml:"addr"`
+	Addr     string `toml:"addr"`      // 控制通道监听地址（seeinps 拨入）
+	HTTPAddr string `toml:"http_addr"` // B 端 Web/API 监听地址（空=默认 :9998）
 }
 
 type TLSConfig struct {
@@ -58,7 +59,7 @@ type PortRange struct {
 // LoadPMConfig loads seeinpm configuration from file
 func LoadPMConfig(path string) (*PMConfig, error) {
 	config := &PMConfig{
-		Server: ServerConfig{Addr: ":999"},
+		Server: ServerConfig{Addr: ":999", HTTPAddr: ":9998"},
 		TLS:    TLSConfig{Enabled: true},
 		Auth: PMAuthConfig{
 			JWTExpire:        1800,

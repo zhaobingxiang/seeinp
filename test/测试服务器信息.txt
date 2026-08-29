@@ -10,3 +10,5 @@ seeinps：
 	SSH端口：27141
 	用户名：hik  SSH需要先使用hik登录，再切换root账号，root密码与hik一致
 	密码：Zbx.9705
+seeinpm正式服务器信息
+	域名see.timesee.cn ssh端口55555 用户名root，密码Zbx.9705

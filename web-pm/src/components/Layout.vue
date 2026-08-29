@@ -10,6 +10,7 @@
         <el-menu-item index="/pm/users"><el-icon><User /></el-icon><span>用户管理</span></el-menu-item>
         <el-menu-item index="/pm/proxies"><el-icon><Share /></el-icon><span>代理管理</span></el-menu-item>
         <el-menu-item index="/pm/ports"><el-icon><Connection /></el-icon><span>端口池</span></el-menu-item>
+        <el-menu-item index="/pm/versions"><el-icon><Box /></el-icon><span>版本管理</span></el-menu-item>
         <el-menu-item index="/pm/audit-logs"><el-icon><Tickets /></el-icon><span>审计日志</span></el-menu-item>
         <el-menu-item index="/pm/system-logs"><el-icon><Document /></el-icon><span>系统日志</span></el-menu-item>
       </el-menu>
@@ -32,7 +33,7 @@
 <script setup lang="ts">
 import { computed } from "vue"
 import { useRoute, useRouter } from "vue-router"
-import { DataBoard, User, Share, Connection, Tickets, Document, SwitchButton } from "@element-plus/icons-vue"
+import { DataBoard, User, Share, Connection, Box, Tickets, Document, SwitchButton } from "@element-plus/icons-vue"
 const route = useRoute()
 const router = useRouter()
 const pageTitle = computed(() => (route.meta.title as string) || "seeinpm")

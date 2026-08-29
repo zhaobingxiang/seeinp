@@ -3,21 +3,25 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/seeinp/seeinp/internal/auth"
+	"github.com/seeinp/seeinp/internal/gzhttp"
 	"github.com/seeinp/seeinp/internal/protocol"
 	"github.com/seeinp/seeinp/internal/store"
 	"github.com/seeinp/seeinp/internal/version"
+	"github.com/seeinp/seeinp/internal/webui"
 )
 
 const legacyLocalUserPath = "data/local-user.json"
@@ -92,40 +96,28 @@ func (c *Client) startLocalServer() error {
 	mux.HandleFunc("GET /api/v1/logs", c.requireAuth(c.handleListLogFiles))
 	mux.HandleFunc("GET /api/v1/logs/content", c.requireAuth(c.handleLogFileContent))
 
-	for _, dir := range []string{"web", "web-ps/dist", "/root/seeinp/web"} {
-		if _, err := os.Stat(dir); err == nil {
-			c.serveWeb(mux, dir)
-			break
-		}
-	}
+	// 版本管理（B 端自主升级）：状态 / 自上传 / 从 seeinpm 查询版本 / 从 seeinpm 拉取升级
+	mux.HandleFunc("GET /api/v1/self-upgrade/status", c.requireAuth(c.handleSelfUpgradeStatus))
+	mux.HandleFunc("POST /api/v1/self-upgrade", c.requireAuth(c.handleSelfUpgrade))
+	mux.HandleFunc("GET /api/v1/pm-versions", c.requireAuth(c.handlePMVersions))
+	mux.HandleFunc("POST /api/v1/pm-upgrade", c.requireAuth(c.handlePMUpgrade))
+
+	// 前端内嵌于二进制（internal/webui），与后端版本严格一致，随一键升级同步更新
+	mux.HandleFunc("/", webui.SPAHandler(webui.PS()))
+	fmt.Printf("[B端] Serving embedded web (version %s)\n", version.Version)
 
 	addr := c.config.Local.BendAddr
 	fmt.Printf("[B端] Listening on %s\n", addr)
 
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		// gzip：前端产物与 API 响应压缩（窄带链路下体积 -60% 以上）
+		Handler:      gzhttp.Handler(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 	return server.ListenAndServe()
-}
-
-func (c *Client) serveWeb(mux *http.ServeMux, webDir string) {
-	fs := http.FileServer(http.Dir(webDir))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		path := filepath.Join(webDir, filepath.Clean(r.URL.Path))
-		if info, err := os.Stat(path); err != nil || info.IsDir() {
-			// SPA 入口：禁止缓存，保证前端升级后浏览器立即拉到新版（assets 文件名带 hash 可长缓存）
-			w.Header().Set("Cache-Control", "no-cache")
-			http.ServeFile(w, r, filepath.Join(webDir, "index.html"))
-			return
-		}
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-		fs.ServeHTTP(w, r)
-	})
-	fmt.Printf("[B端] Serving web from %s\n", webDir)
 }
 
 type ctxKey string
@@ -556,7 +548,11 @@ func (c *Client) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 			c.proxiesMu.Lock()
 			delete(c.proxies, req.ID)
 			c.proxiesMu.Unlock()
-			writeErr(w, http.StatusBadGateway, 5002, "端口分配失败，代理未保存: "+err.Error())
+			if errors.Is(err, errPortPoolExhausted) || errors.Is(err, errPortQuotaExhausted) {
+				writeErr(w, http.StatusBadGateway, 5002, err.Error())
+			} else {
+				writeErr(w, http.StatusBadGateway, 5002, "端口分配失败，代理未保存: "+err.Error())
+			}
 			return
 		}
 	}
@@ -673,6 +669,8 @@ func (c *Client) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"serverAddr":    c.config.Server.ServerAddr,
 		"lastPing":      c.lastPing.Load(),
 		"authCodeReset": c.revoked.Load(),
+		"version":       version.Version,
+		"platform":      runtime.GOOS + "/" + runtime.GOARCH,
 	})
 }
 

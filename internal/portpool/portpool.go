@@ -64,7 +64,22 @@ func (p *Pool) containsLocked(port int) bool {
 	return false
 }
 
-func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int) (*Allocation, error) {
+// inRanges 判断端口是否在给定范围列表内；ranges 为空表示不限制
+func inRanges(port int, ranges []Range) bool {
+	if len(ranges) == 0 {
+		return true
+	}
+	for _, r := range ranges {
+		if port >= r.Start && port <= r.End {
+			return true
+		}
+	}
+	return false
+}
+
+// Allocate 分配端口；userRanges 非空时（用户端口池），候选端口必须同时落在
+// 用户范围与全局池的交集中，历史端口复用同样受此约束
+func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, userRanges []Range) (*Allocation, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -84,6 +99,9 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int) (
 		if err := p.checkAvailable(*preferredPort); err != nil {
 			return nil, err
 		}
+		if !inRanges(*preferredPort, userRanges) {
+			return nil, fmt.Errorf("port %d outside user pool", *preferredPort)
+		}
 		port = *preferredPort
 	} else {
 		// 复用该代理的历史端口（含已释放）：见 inps 断线重连后对外端口保持稳定，
@@ -91,9 +109,13 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int) (
 		// 注意：历史端口必须仍在新池内（端口池改小后池外端口不再复用，强制回池内重新分配）
 		if last, err := p.store.GetLastPortByProxyID(proxyID); err == nil && !p.store.IsPortAllocated(last.Port) {
 			if p.containsLocked(last.Port) {
-				if err := p.checkSystemPort(last.Port); err == nil {
-					port = last.Port
-					fmt.Printf("[POOL] Restoring port %d for proxy %s\n", port, proxyID)
+				if inRanges(last.Port, userRanges) {
+					if err := p.checkSystemPort(last.Port); err == nil {
+						port = last.Port
+						fmt.Printf("[POOL] Restoring port %d for proxy %s\n", port, proxyID)
+					}
+				} else {
+					fmt.Printf("[POOL] Historical port %d for proxy %s outside user pool, re-allocating\n", last.Port, proxyID)
 				}
 			} else {
 				fmt.Printf("[POOL] Historical port %d for proxy %s outside current pool, re-allocating\n", last.Port, proxyID)
@@ -101,7 +123,7 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int) (
 		}
 		if port == 0 {
 			var err error
-			port, err = p.findAvailable()
+			port, err = p.findAvailable(userRanges)
 			if err != nil {
 				return nil, err
 			}
@@ -150,9 +172,12 @@ func (p *Pool) checkAvailable(port int) error {
 	return nil
 }
 
-func (p *Pool) findAvailable() (int, error) {
+func (p *Pool) findAvailable(userRanges []Range) (int, error) {
 	for _, r := range p.ranges {
 		for port := r.Start; port <= r.End; port++ {
+			if !inRanges(port, userRanges) {
+				continue
+			}
 			if p.store.IsPortAllocated(port) {
 				continue
 			}

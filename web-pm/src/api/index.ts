@@ -32,6 +32,7 @@ export const authApi = {
 export const userApi = {
   list: () => api.get('/users'),
   create: (data: any) => api.post('/users', data),
+  update: (username: string, data: any) => api.put('/users/' + encodeURIComponent(username), data),
   delete: (username: string) => api.delete('/users?username=' + username),
   disable: (username: string, disconnectNow: boolean) => api.post(`/users/${username}/disable`, { disconnectNow }),
   enable: (username: string) => api.post(`/users/${username}/enable`),
@@ -70,7 +71,21 @@ export const healthApi = {
 }
 
 export const clientApi = {
-  list: () => api.get('/clients')
+  list: () => api.get('/clients'),
+  // 升级请求只等到"通知节点成功"即返回，传输进度经 upgrade-status 轮询
+  upgrade: (username: string, versionId: number) => api.post('/clients/' + encodeURIComponent(username) + '/upgrade', { versionId }, { timeout: 30000 }),
+  upgradeStatus: (username: string) => api.get('/clients/' + encodeURIComponent(username) + '/upgrade-status', { timeout: 10000 })
+}
+
+// 版本管理：大包在慢链路上传可能持续数十分钟，不设客户端超时，进度经 onProgress 回调反馈
+export const versionApi = {
+  list: (endpoint: string) => api.get('/versions', { params: { endpoint } }),
+  upload: (formData: FormData, onProgress?: (percent: number) => void) => api.post('/versions', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 0,
+    onUploadProgress: (e: any) => { if (e.total) onProgress?.(Math.round((e.loaded / e.total) * 100)) }
+  }),
+  remove: (id: number) => api.delete('/versions/' + id)
 }
 
 export default api

@@ -10,6 +10,7 @@
         <el-menu-item index="/ps/proxies"><el-icon><Share /></el-icon><span>代理管理</span></el-menu-item>
         <el-menu-item index="/ps/audit-logs"><el-icon><Tickets /></el-icon><span>审计日志</span></el-menu-item>
         <el-menu-item index="/ps/system-logs"><el-icon><Document /></el-icon><span>系统日志</span></el-menu-item>
+        <el-menu-item index="/ps/versions"><el-icon><Box /></el-icon><span>版本升级</span></el-menu-item>
       </el-menu>
       <div class="sidebar-foot">
         <div class="conn-state">
@@ -40,7 +41,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from "vue"
 import { useRoute, useRouter } from "vue-router"
-import { DataBoard, Share, Tickets, Document, SwitchButton, Connection } from "@element-plus/icons-vue"
+import { DataBoard, Share, Tickets, Document, SwitchButton, Connection, Box } from "@element-plus/icons-vue"
 import { statusApi } from "@/api"
 
 const route = useRoute()

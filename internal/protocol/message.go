@@ -29,6 +29,17 @@ const (
 	TypeLogListResp      = "LOG_LIST_RESP"
 	TypeLogContentReq    = "LOG_CONTENT_REQ"
 	TypeLogContentResp   = "LOG_CONTENT_RESP"
+	// 版本管理（2026-08-29）：A 端推送升级包（UPGRADE_PUSH 通知 + 0x05 数据流直传二进制），
+	// B 端校验通过后换二进制重启，成功与否由重连后的 HELLO 版本判定，异常经 UPGRADE_REPORT 上报
+	TypeUpgradePush     = "UPGRADE_PUSH"
+	TypeUpgradePushResp = "UPGRADE_PUSH_RESP"
+	TypeUpgradeReport   = "UPGRADE_REPORT"
+	// B 端自主升级（2026-08-30）：B 端查询 A 端可用版本列表（VERSION_LIST），
+	// 并按版本号请求拉取升级包（VERSION_PULL 应答包元信息，随后 A 端经 0x05 数据流直传）
+	TypeVersionListReq  = "VERSION_LIST_REQ"
+	TypeVersionListResp = "VERSION_LIST_RESP"
+	TypeVersionPullReq  = "VERSION_PULL_REQ"
+	TypeVersionPullResp = "VERSION_PULL_RESP"
 )
 
 // Stream types for data channel
@@ -37,6 +48,7 @@ const (
 	StreamTypeUDP     byte = 0x02
 	StreamTypeHTTP    byte = 0x03
 	StreamTypeOps     byte = 0x04
+	StreamTypeUpgrade byte = 0x05
 )
 
 // Error codes
@@ -159,6 +171,46 @@ type LogContentReqData struct {
 type LogContentRespData struct {
 	File    string `json:"file"`
 	Content string `json:"content"`
+}
+
+// VersionListItem 是 VERSION_LIST_RESP 中的一条版本摘要（不含文件）
+type VersionListItem struct {
+	ID        int64  `json:"id"`
+	Version   string `json:"version"`
+	Note      string `json:"note"`
+	FileSize  int64  `json:"fileSize"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+// VersionListRespData 是 VERSION_LIST_RESP 的载荷（A 端 -> B 端，按 B 端平台过滤后的可用版本）
+type VersionListRespData struct {
+	Items []VersionListItem `json:"items"`
+}
+
+// VersionListReqData 是 VERSION_LIST_REQ 的载荷（B 端 -> A 端，按 B 端平台过滤）
+type VersionListReqData struct{}
+
+// VersionPullReqData 是 VERSION_PULL_REQ 的载荷（B 端 -> A 端，请求拉取指定版本）
+type VersionPullReqData struct {
+	Version string `json:"version"`
+}
+
+// UpgradePushData 是 UPGRADE_PUSH 的载荷（A 端 -> B 端，通知即将推送升级包）
+type UpgradePushData struct {
+	ReleaseID int64  `json:"releaseId"`
+	Version   string `json:"version"`
+	GoOS      string `json:"goos"`
+	GoArch    string `json:"goarch"`
+	Sha256    string `json:"sha256"`
+	Size      int64  `json:"size"`
+}
+
+// UpgradeReportData 是 UPGRADE_REPORT 的载荷（B 端 -> A 端，上报升级包接收结果；
+// stage=downloaded 表示校验通过即将换二进制重启，stage=failed 表示校验失败）
+type UpgradeReportData struct {
+	Version string `json:"version,omitempty"`
+	Stage   string `json:"stage"`
+	Error   string `json:"error,omitempty"`
 }
 
 // StreamHeader is the header at the beginning of each data stream

@@ -12,7 +12,7 @@
         <span class="conn-dot" :class="{ offline: status.status !== 'connected' }"></span>
         <div>
           <div class="conn-title">{{ status.status === 'connected' ? '连接正常' : '未连接' }}</div>
-          <div class="conn-desc">服务器 {{ status.serverAddr || '-' }} · 授权码绑定 {{ status.username || '-' }}</div>
+          <div class="conn-desc">授权码绑定 {{ status.username || '-' }} · 版本 {{ status.version || '-' }}</div>
         </div>
       </div>
       <el-button type="primary" size="small" @click="router.push('/ps/proxies')">查看代理</el-button>
@@ -111,7 +111,8 @@ const status = reactive({
   sessionId: '',
   serverAddr: '',
   lastPing: 0,
-  authCodeReset: false
+  authCodeReset: false,
+  version: ''
 })
 
 const allocatedPorts = computed(() => proxies.value.filter((p: any) => p.forwardPort).length)

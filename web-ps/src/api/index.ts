@@ -41,6 +41,18 @@ export const proxyApi = {
   delete: (id: string) => api.delete('/proxies/' + id)
 }
 
+// 版本管理（B 端自主升级）：大包上传不设超时，进度经 onProgress 反馈
+export const versionApi = {
+  status: () => api.get('/self-upgrade/status', { timeout: 10000 }),
+  selfUpload: (formData: FormData, onProgress?: (percent: number) => void) => api.post('/self-upgrade', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 0,
+    onUploadProgress: (e: any) => { if (e.total) onProgress?.(Math.round((e.loaded / e.total) * 100)) }
+  }),
+  pmVersions: () => api.get('/pm-versions', { timeout: 20000 }),
+  pmUpgrade: (version: string) => api.post('/pm-upgrade', { version }, { timeout: 30000 })
+}
+
 export const statusApi = {
   getStatus: () => api.get('/status'),
   getStats: () => api.get('/stats')

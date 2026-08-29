@@ -49,6 +49,7 @@ func (s *Store) migrate() error {
 		"CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)",
 		"CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC)",
 		"CREATE TABLE IF NOT EXISTS port_pool_config (id INTEGER PRIMARY KEY CHECK(id=1), ranges TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+		"CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, endpoint TEXT NOT NULL, version TEXT NOT NULL, goos TEXT NOT NULL DEFAULT 'linux', goarch TEXT NOT NULL DEFAULT 'amd64', file_name TEXT NOT NULL, file_size INTEGER NOT NULL, sha256 TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', released_by TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, UNIQUE(endpoint, version, goos, goarch))",
 	}
 	for _, q := range queries {
 		if _, err := s.db.Exec(q); err != nil {
@@ -64,6 +65,40 @@ func (s *Store) migrate() error {
 	}
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_audit_logs_source_created ON audit_logs(source, created_at DESC)"); err != nil {
 		return fmt.Errorf("migrate audit_logs index: %w", err)
+	}
+	// v4: versions 表增加平台维度（goos/goarch），唯一约束扩为 (endpoint, version, goos, goarch)。
+	// SQLite 无法修改表内 UNIQUE，老库检测到旧 schema（无 goos 列）时整表重建，历史行回填 linux/amd64。
+	var hasVersions int
+	s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='versions'").Scan(&hasVersions)
+	if hasVersions > 0 {
+		var hasGoos int
+		s.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('versions') WHERE name='goos'").Scan(&hasGoos)
+		if hasGoos == 0 {
+			steps := []string{
+				"CREATE TABLE versions_v4 (id INTEGER PRIMARY KEY AUTOINCREMENT, endpoint TEXT NOT NULL, version TEXT NOT NULL, goos TEXT NOT NULL DEFAULT 'linux', goarch TEXT NOT NULL DEFAULT 'amd64', file_name TEXT NOT NULL, file_size INTEGER NOT NULL, sha256 TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', released_by TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, UNIQUE(endpoint, version, goos, goarch))",
+				"INSERT INTO versions_v4 (id, endpoint, version, goos, goarch, file_name, file_size, sha256, note, released_by, created_at) SELECT id, endpoint, version, 'linux', 'amd64', file_name, file_size, sha256, COALESCE(note,''), COALESCE(released_by,''), created_at FROM versions",
+				"DROP TABLE versions",
+				"ALTER TABLE versions_v4 RENAME TO versions",
+			}
+			for _, q := range steps {
+				if _, err := s.db.Exec(q); err != nil {
+					return fmt.Errorf("migrate versions v4: %w", err)
+				}
+			}
+		}
+	}
+
+	// v3: 用户有效期/端口数量配额/用户端口池（老库 ALTER 补齐）
+	for _, col := range []string{
+		"ALTER TABLE users ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE users ADD COLUMN max_ports INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE users ADD COLUMN port_ranges TEXT NOT NULL DEFAULT '[]'",
+	} {
+		if _, err := s.db.Exec(col); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("migrate users limits: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -106,21 +141,58 @@ type User struct {
 	Status        int
 	OnlineSession *string
 	OnlineSince   *int64
+	ExpiresAt     int64 // 有效期截止时间（unix 秒；0=不过期），到期断开并拒绝注册
+	MaxPorts      int   // 端口数量配额（0=不限）
+	PortRanges    []PortRange
 	CreatedAt     int64
 	UpdatedAt     int64
 }
 
-func (s *Store) CreateUser(username, authCodeHash, authCodeSalt string) error {
+func (s *Store) CreateUser(username, authCodeHash, authCodeSalt string, expiresAt int64, maxPorts int, portRanges []PortRange) error {
 	now := time.Now().Unix()
-	_, err := s.db.Exec("INSERT INTO users (username, auth_code, auth_code_salt, status, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)", username, authCodeHash, authCodeSalt, now, now)
+	rj := "[]"
+	if len(portRanges) > 0 {
+		b, _ := json.Marshal(portRanges)
+		rj = string(b)
+	}
+	_, err := s.db.Exec("INSERT INTO users (username, auth_code, auth_code_salt, status, expires_at, max_ports, port_ranges, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)",
+		username, authCodeHash, authCodeSalt, expiresAt, maxPorts, rj, now, now)
 	return err
+}
+
+// UpdateUserLimits 更新用户有效期/端口数量配额/用户端口池
+func (s *Store) UpdateUserLimits(username string, expiresAt int64, maxPorts int, portRanges []PortRange) error {
+	now := time.Now().Unix()
+	rj := "[]"
+	if len(portRanges) > 0 {
+		b, _ := json.Marshal(portRanges)
+		rj = string(b)
+	}
+	res, err := s.db.Exec("UPDATE users SET expires_at = ?, max_ports = ?, port_ranges = ?, updated_at = ? WHERE username = ?",
+		expiresAt, maxPorts, rj, now, username)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("user not found")
+	}
+	return nil
+}
+
+// CountActiveAllocationsByUser 统计用户当前活跃（status=1）的端口分配数
+func (s *Store) CountActiveAllocationsByUser(userID string) (int, error) {
+	var n int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM port_allocations WHERE status = 1 AND user_id = ?", userID).Scan(&n)
+	return n, err
 }
 
 func (s *Store) GetUserByUsername(username string) (*User, error) {
 	u := &User{}
 	var onlineSession sql.NullString
 	var onlineSince sql.NullInt64
-	err := s.db.QueryRow("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, created_at, updated_at FROM users WHERE username = ?", username).Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.CreatedAt, &u.UpdatedAt)
+	var portRanges string
+	err := s.db.QueryRow("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), created_at, updated_at FROM users WHERE username = ?", username).
+		Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -131,11 +203,12 @@ func (s *Store) GetUserByUsername(username string) (*User, error) {
 		v := onlineSince.Int64
 		u.OnlineSince = &v
 	}
+	json.Unmarshal([]byte(portRanges), &u.PortRanges)
 	return u, nil
 }
 
 func (s *Store) ListUsers() ([]*User, error) {
-	rows, err := s.db.Query("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, created_at, updated_at FROM users ORDER BY created_at DESC")
+	rows, err := s.db.Query("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), created_at, updated_at FROM users ORDER BY created_at DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +218,8 @@ func (s *Store) ListUsers() ([]*User, error) {
 		u := &User{}
 		var onlineSession sql.NullString
 		var onlineSince sql.NullInt64
-		if err := rows.Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		var portRanges string
+		if err := rows.Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if onlineSession.Valid {
@@ -155,6 +229,7 @@ func (s *Store) ListUsers() ([]*User, error) {
 			v := onlineSince.Int64
 			u.OnlineSince = &v
 		}
+		json.Unmarshal([]byte(portRanges), &u.PortRanges)
 		users = append(users, u)
 	}
 	return users, nil
@@ -669,4 +744,85 @@ func (s *Store) SavePortPoolConfig(ranges []PortRange) error {
 		"ON CONFLICT(id) DO UPDATE SET ranges=excluded.ranges, updated_at=excluded.updated_at",
 		string(b), time.Now().Unix())
 	return err
+}
+
+// ==================== 版本管理（versions） ====================
+
+// Version 一条版本发布记录：包文件落盘于 data/releases/{endpoint}/，表只存元数据
+type Version struct {
+	ID         int64
+	Endpoint   string // seeinps（v1 仅此端）
+	Version    string // 五段数字版本号，如 1.0.26.0829.01
+	GoOS       string // linux / windows / darwin
+	GoArch     string // amd64 / arm64 / ...
+	FileName   string
+	FileSize   int64
+	Sha256     string
+	Note       string
+	ReleasedBy string
+	CreatedAt  int64
+}
+
+const versionCols = "id, endpoint, version, goos, goarch, file_name, file_size, sha256, COALESCE(note,''), COALESCE(released_by,''), created_at"
+
+func scanVersion(row interface{ Scan(...interface{}) error }) (*Version, error) {
+	v := &Version{}
+	if err := row.Scan(&v.ID, &v.Endpoint, &v.Version, &v.GoOS, &v.GoArch, &v.FileName, &v.FileSize, &v.Sha256, &v.Note, &v.ReleasedBy, &v.CreatedAt); err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// CreateVersion 新增版本发布记录
+func (s *Store) CreateVersion(v *Version) error {
+	res, err := s.db.Exec("INSERT INTO versions (endpoint, version, goos, goarch, file_name, file_size, sha256, note, released_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		v.Endpoint, v.Version, v.GoOS, v.GoArch, v.FileName, v.FileSize, v.Sha256, v.Note, v.ReleasedBy, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+	v.ID, _ = res.LastInsertId()
+	return nil
+}
+
+// ListVersions 按端返回版本列表（新版本在前）
+func (s *Store) ListVersions(endpoint string) ([]*Version, error) {
+	rows, err := s.db.Query("SELECT "+versionCols+" FROM versions WHERE endpoint = ? ORDER BY created_at DESC, id DESC", endpoint)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []*Version
+	for rows.Next() {
+		v, err := scanVersion(rows)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, v)
+	}
+	return list, rows.Err()
+}
+
+// GetVersion 按 ID 取版本记录
+func (s *Store) GetVersion(id int64) (*Version, error) {
+	return scanVersion(s.db.QueryRow("SELECT "+versionCols+" FROM versions WHERE id = ?", id))
+}
+
+// GetVersionByName 按端/版本号/平台取记录（上传查重用）
+func (s *Store) GetVersionByName(endpoint, version, goos, goarch string) (*Version, error) {
+	return scanVersion(s.db.QueryRow("SELECT "+versionCols+" FROM versions WHERE endpoint = ? AND version = ? AND goos = ? AND goarch = ?", endpoint, version, goos, goarch))
+}
+
+// GetLatestVersion 返回该端指定平台最新发布的版本；无记录返回 sql.ErrNoRows
+func (s *Store) GetLatestVersion(endpoint, goos, goarch string) (*Version, error) {
+	return scanVersion(s.db.QueryRow("SELECT "+versionCols+" FROM versions WHERE endpoint = ? AND goos = ? AND goarch = ? ORDER BY created_at DESC, id DESC LIMIT 1", endpoint, goos, goarch))
+}
+
+// DeleteVersion 删除版本记录；返回是否存在
+func (s *Store) DeleteVersion(id int64) (bool, error) {
+	res, err := s.db.Exec("DELETE FROM versions WHERE id = ?", id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }

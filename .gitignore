@@ -120,3 +120,12 @@ deploy_out.txt
 # E2E runtime data & DB backups
 test/e2e/runtime/*/data/*.bak*
 test/e2e/runtime/ps/data/
+
+# Embedded frontend build outputs (build.sh copies web dist here; placeholder index.html stays tracked)
+internal/webui/pm/files/*
+!internal/webui/pm/files/index.html
+internal/webui/ps/files/*
+!internal/webui/ps/files/index.html
+
+# e2e runtime release packages
+test/e2e/runtime/pm/data/releases/
