@@ -66,7 +66,7 @@
       </div>
       <el-form label-width="90px" style="max-width:560px">
         <el-form-item label="安装包">
-          <div class="form-tip" style="margin-bottom:6px">版本号将自动从包内识别；包平台必须与本节点（{{ nodePlatform }}）一致</div>
+          <div class="form-tip" style="margin-bottom:6px">版本号将自动从包内识别；包平台必须与本节点（{{ nodePlatform }}）一致<template v-if="detectedVersion">，已识别：<b style="font-family:var(--font-mono,monospace)">{{ detectedVersion }}</b></template></div>
           <el-upload ref="uploadRef" :limit="1" :auto-upload="false" :on-change="onFileChange" :on-remove="() => uploadFile = null"
             :disabled="busy" drag style="width:100%">
             <div style="padding:12px 0">拖拽或点击选择 seeinps 二进制文件（≤200MB）</div>
@@ -89,6 +89,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { versionApi, statusApi } from '@/api'
+import { extractVersionFromFile } from '@/utils/version'
 import Layout from '@/components/Layout.vue'
 
 const currentVersion = ref('')
@@ -151,7 +152,17 @@ const loadPMVersions = async () => {
   }
 }
 
-const onFileChange = (file: UploadFile) => { uploadFile.value = file.raw }
+const detectedVersion = ref('')
+
+const onFileChange = async (file: UploadFile) => {
+  uploadFile.value = file.raw
+  detectedVersion.value = ''
+  if (file.raw) {
+    detectedVersion.value = (await extractVersionFromFile(file.raw)) || ''
+    if (detectedVersion.value) ElMessage.success(`已识别包内版本号：${detectedVersion.value}`)
+    else ElMessage.warning('未能从包内识别版本号，请确认包由 scripts/build.sh 构建')
+  }
+}
 
 const pollStatus = () => {
   if (pollTimer) return

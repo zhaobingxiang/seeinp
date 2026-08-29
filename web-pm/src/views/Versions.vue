@@ -186,6 +186,7 @@ import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules, UploadFile } from 'element-plus'
 import { versionApi, clientApi } from '@/api'
+import { extractVersionFromFile } from '@/utils/version'
 import Layout from '@/components/Layout.vue'
 
 const versions = ref<any[]>([])
@@ -321,9 +322,19 @@ const openUpload = () => {
   showUpload.value = true
 }
 
-const onFileChange = (file: UploadFile) => {
+const onFileChange = async (file: UploadFile) => {
   uploadForm.file = file.raw
   uploadFormRef.value?.validateField('file')
+  // 本地识别包内版本号并自动填入
+  if (file.raw) {
+    const detected = await extractVersionFromFile(file.raw)
+    if (detected) {
+      uploadForm.version = detected
+      ElMessage.success(`已识别包内版本号：${detected}`)
+    } else {
+      ElMessage.warning('未能从包内识别版本号，请手动填写')
+    }
+  }
 }
 
 const resetUploadForm = () => {

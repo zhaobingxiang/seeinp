@@ -17,6 +17,7 @@ import (
 
 	"github.com/seeinp/seeinp/internal/protocol"
 	"github.com/seeinp/seeinp/internal/store"
+	versionpkg "github.com/seeinp/seeinp/internal/version"
 )
 
 // writeOK/writeErr 与 seeinps B 端响应格式保持一致：{"code":..,"message":..,"data":..}
@@ -301,14 +302,30 @@ func (s *Server) handleVersionUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, 2000, "平台参数非法（goos: linux/windows/darwin，goarch: amd64/arm64/arm/386）")
 		return
 	}
-	if !versionPattern.MatchString(version) {
-		os.Remove(tmpPath)
-		writeErr(w, http.StatusBadRequest, 2002, "版本号格式应为五段数字，如 1.0.26.0829.01")
-		return
-	}
 	if size <= 0 || size > maxReleaseSize {
 		os.Remove(tmpPath)
 		writeErr(w, http.StatusBadRequest, 2000, "升级包为空或超过 200MB 限制")
+		return
+	}
+	// 自动识别包内版本（构建时注入 seeinp-version: 标识）：未填写则采用，填写了则校验一致
+	detected, derr := versionpkg.ExtractVersionFromFile(tmpPath)
+	if derr == nil && detected != "" {
+		if version == "" {
+			version = detected
+		} else if version != detected {
+			os.Remove(tmpPath)
+			writeErr(w, http.StatusBadRequest, 2002,
+				fmt.Sprintf("包内版本为 %s，与填写的 %s 不一致，请修正后重试", detected, version))
+			return
+		}
+	} else if version == "" {
+		os.Remove(tmpPath)
+		writeErr(w, http.StatusBadRequest, 2002, "无法识别包内版本，请使用 scripts/build.sh 构建或手动填写版本号")
+		return
+	}
+	if !versionPattern.MatchString(version) {
+		os.Remove(tmpPath)
+		writeErr(w, http.StatusBadRequest, 2002, "版本号格式应为五段数字，如 1.0.26.0829.01")
 		return
 	}
 	// 先查重：同端同版本号同平台已存在时只清理本次临时文件，绝不能动已发布版本的目录
