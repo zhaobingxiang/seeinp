@@ -1,8 +1,10 @@
 <template>
-  <div class="login-container">
+  <div class="login-page">
     <div class="login-card">
-      <h1>seeinpm</h1>
-      <p class="subtitle">管理中心</p>
+      <div class="login-brand">
+        <div class="brand-name"><span>seeinpm</span></div>
+      </div>
+      <p class="login-sub">管理中心 · 代理端口统一管理</p>
       <el-form :model="form" :rules="rules" ref="formRef">
         <el-form-item prop="username">
           <el-input v-model="form.username" placeholder="用户名" prefix-icon="User" size="large" />
@@ -36,6 +38,7 @@ import { useRouter } from "vue-router"
 import { ElMessage } from "element-plus"
 import type { FormInstance, FormRules } from "element-plus"
 import { authApi } from "@/api"
+
 const router = useRouter()
 const loading = ref(false)
 const initLoading = ref(false)
@@ -50,9 +53,5 @@ const handleLogin = async () => { if (!formRef.value) return; await formRef.valu
 const handleInit = async () => { if (!initFormRef.value) return; await initFormRef.value.validate(async (valid) => { if (!valid) return; initLoading.value = true; try { const res: any = await authApi.init(initForm); if (res.code === 0) { ElMessage.success("初始化成功"); showInit.value = false } else ElMessage.error(res.message || "初始化失败") } catch (e: any) { ElMessage.error(e.response?.data?.message || "初始化失败") } finally { initLoading.value = false } }) }
 </script>
 <style scoped>
-.login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-.login-card { width: 400px; padding: 40px; background: white; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.15); }
-.login-card h1 { text-align: center; margin: 0 0 8px 0; color: #303133; font-size: 28px; }
-.subtitle { text-align: center; color: #909399; margin-bottom: 30px; }
-.footer { text-align: center; margin-top: 20px; }
+.footer { text-align: center; margin-top: 8px; }
 </style>

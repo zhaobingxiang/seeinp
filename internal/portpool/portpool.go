@@ -33,6 +33,37 @@ func New(ranges []Range, s *store.Store) *Pool {
 	}
 }
 
+// SetRanges 运行时更新端口池范围（web 配置热生效，带锁）
+func (p *Pool) SetRanges(ranges []Range) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ranges = append([]Range(nil), ranges...)
+}
+
+// GetRanges 返回当前端口池范围副本
+func (p *Pool) GetRanges() []Range {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return append([]Range(nil), p.ranges...)
+}
+
+// Contains 判断端口是否在当前池内
+func (p *Pool) Contains(port int) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.containsLocked(port)
+}
+
+// containsLocked 无锁内部版：调用方需持有 p.mu
+func (p *Pool) containsLocked(port int) bool {
+	for _, r := range p.ranges {
+		if port >= r.Start && port <= r.End {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int) (*Allocation, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -56,11 +87,16 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int) (
 		port = *preferredPort
 	} else {
 		// 复用该代理的历史端口（含已释放）：见 inps 断线重连后对外端口保持稳定，
-		// 避免 cleanup 释放 + 重连重分配导致端口漂移
+		// 避免 cleanup 释放 + 重连重分配导致端口漂移。
+		// 注意：历史端口必须仍在新池内（端口池改小后池外端口不再复用，强制回池内重新分配）
 		if last, err := p.store.GetLastPortByProxyID(proxyID); err == nil && !p.store.IsPortAllocated(last.Port) {
-			if err := p.checkSystemPort(last.Port); err == nil {
-				port = last.Port
-				fmt.Printf("[POOL] Restoring port %d for proxy %s\n", port, proxyID)
+			if p.containsLocked(last.Port) {
+				if err := p.checkSystemPort(last.Port); err == nil {
+					port = last.Port
+					fmt.Printf("[POOL] Restoring port %d for proxy %s\n", port, proxyID)
+				}
+			} else {
+				fmt.Printf("[POOL] Historical port %d for proxy %s outside current pool, re-allocating\n", last.Port, proxyID)
 			}
 		}
 		if port == 0 {

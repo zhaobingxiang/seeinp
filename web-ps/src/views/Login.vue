@@ -1,10 +1,11 @@
 ﻿<template>
-  <div class="login-container">
+  <div class="login-page">
     <div class="login-card">
-      <h1 class="login-title">seeinps 服务端</h1>
-      <p class="login-subtitle" v-if="!showInit">请使用 seeinpm 分配的账号登录</p>
-      <p class="login-subtitle" v-else>首次使用，请完成初始化</p>
-      
+      <div class="login-brand">
+        <div class="brand-name"><span>seeinps</span></div>
+      </div>
+      <p class="login-sub">{{ showInit ? '首次使用，请完成初始化' : '请使用 seeinpm 分配的账号登录' }}</p>
+
       <!-- Login Form -->
       <el-form v-if="!showInit" :model="loginForm" :rules="loginRules" ref="loginFormRef" label-width="0">
         <el-form-item prop="username">
@@ -17,7 +18,7 @@
           <el-button type="primary" size="large" style="width: 100%" :loading="loading" @click="handleLogin">登 录</el-button>
         </el-form-item>
       </el-form>
-      
+
       <!-- Init Form -->
       <el-form v-else :model="initForm" :rules="initRules" ref="initFormRef" label-width="0">
         <el-form-item prop="username">
@@ -36,12 +37,12 @@
           <el-button type="primary" size="large" style="width: 100%" :loading="loading" @click="handleInit">初 始 化</el-button>
         </el-form-item>
       </el-form>
-      
+
       <div class="login-footer" v-if="!showInit">
-        <el-link type="primary" @click="showInit = true">首次使用？点击初始化</el-link>
+        <el-button type="primary" link @click="showInit = true">首次使用？点击初始化</el-button>
       </div>
       <div class="login-footer" v-else>
-        <el-link type="primary" @click="showInit = false">已有账号？返回登录</el-link>
+        <el-button type="primary" link @click="showInit = false">已有账号？返回登录</el-button>
       </div>
     </div>
   </div>

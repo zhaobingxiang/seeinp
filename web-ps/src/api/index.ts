@@ -46,4 +46,13 @@ export const statusApi = {
   getStats: () => api.get('/stats')
 }
 
+export const auditApi = {
+  list: (params: { username?: string; action?: string; keyword?: string; start_time?: number; end_time?: number; page?: number; page_size?: number }) => api.get('/audit-logs', { params })
+}
+
+export const logApi = {
+  listFiles: () => api.get('/logs'),
+  content: (file: string, lines: number, keyword?: string, download?: boolean) => api.get('/logs/content', { params: { file, lines, keyword, download } })
+}
+
 export default api

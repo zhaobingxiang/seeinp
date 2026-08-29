@@ -1,18 +1,11 @@
 ﻿<template>
-  <div class="dashboard-container">
-    <!-- Page Header -->
-    <div class="page-header">
-      <h2>代理管理</h2>
-      <el-button @click="router.push('/ps/dashboard')">
-        <el-icon><ArrowLeft /></el-icon>
-        返回
-      </el-button>
-    </div>
-
-    <!-- Add Form -->
-    <div class="form-card">
-      <h3>{{ editingProxy ? '编辑代理' : '添加代理' }}</h3>
-      <el-form :model="form" :rules="rules" ref="formRef" label-width="100px" style="max-width: 520px">
+  <Layout>
+    <!-- 添加 / 编辑代理 -->
+    <div class="page-card" style="padding:20px;margin-bottom:20px">
+      <div class="card-header" style="margin-bottom:18px">
+        <span>{{ editingProxy ? '编辑代理' : '添加代理' }}</span>
+      </div>
+      <el-form :model="form" :rules="rules" ref="formRef" label-width="100px" style="max-width: 560px">
         <el-form-item label="代理名称" prop="id">
           <el-input v-model="form.id" :disabled="!!editingProxy" placeholder="如: my-ssh / ops-proxy" />
         </el-form-item>
@@ -59,9 +52,11 @@
       </el-form>
     </div>
 
-    <!-- Proxy List -->
-    <div class="form-card">
-      <h3>已有代理</h3>
+    <!-- 代理列表 -->
+    <div class="page-card" style="padding:20px">
+      <div class="card-header" style="margin-bottom:16px">
+        <span>已有代理</span>
+      </div>
 
       <div v-if="proxies.length === 0" class="empty-state">
         <el-empty description="暂无代理" />
@@ -78,7 +73,7 @@
         </el-table-column>
         <el-table-column label="本地地址" width="180">
           <template #default="{ row }">
-            <span v-if="row.type === 'tcp'">{{ row.localAddr }}:{{ row.localPort }}</span>
+            <span v-if="row.type === 'tcp'" style="font-family:var(--font-mono,monospace)">{{ row.localAddr }}:{{ row.localPort }}</span>
             <span v-else>{{ row.proxyUsername }}</span>
           </template>
         </el-table-column>
@@ -99,21 +94,19 @@
         </el-table-column>
       </el-table>
 
-      <el-alert v-if="hasOps" type="info" :closable="false" style="margin-top: 12px"
+      <el-alert v-if="hasOps" type="info" :closable="false" style="margin-top: 14px"
         title="运维代理使用方式：外网电脑使用 seeinpc，服务器地址填 see.timesee.cn，再填 运维ID + 代理账号 + 代理密码 即可连接" />
     </div>
-  </div>
+  </Layout>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
-import { ArrowLeft } from '@element-plus/icons-vue'
 import { proxyApi } from '@/api'
+import Layout from '@/components/Layout.vue'
 
-const router = useRouter()
 const formRef = ref<FormInstance>()
 const saving = ref(false)
 const editingProxy = ref<any>(null)
@@ -274,7 +267,7 @@ onMounted(() => {
 
 .form-tip {
   font-size: 12px;
-  color: #909399;
+  color: var(--app-text-tertiary);
   line-height: 1.5;
   margin-top: 4px;
 }

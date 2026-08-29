@@ -22,6 +22,13 @@ const (
 	TypeConfigPushResp = "CONFIG_PUSH_RESP"
 	TypeSessionRevoke  = "SESSION_REVOKE"
 	TypeProxyRevoke    = "PROXY_REVOKE"
+	// 日志混合架构（2026-08-29）：审计日志 B 端上报 A 端（AUDIT_SYNC）；
+	// A 端按需拉取 B 端运行日志（LOG_LIST_REQ/RESP、LOG_CONTENT_REQ/RESP）
+	TypeAuditSync        = "AUDIT_SYNC"
+	TypeLogListReq       = "LOG_LIST_REQ"
+	TypeLogListResp      = "LOG_LIST_RESP"
+	TypeLogContentReq    = "LOG_CONTENT_REQ"
+	TypeLogContentResp   = "LOG_CONTENT_RESP"
 )
 
 // Stream types for data channel
@@ -111,6 +118,47 @@ type ReleasePortData struct {
 type ProxyRevokeData struct {
 	ProxyID string `json:"proxyId"`
 	Reason  string `json:"reason"` // proxy_disabled
+}
+
+// AuditSyncItem 是 B 端（seeinps）上报的一条本地审计记录
+type AuditSyncItem struct {
+	Username  string `json:"username"`
+	Action    string `json:"action"`
+	Target    string `json:"target"`
+	Detail    string `json:"detail"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+// AuditSyncData 是 AUDIT_SYNC 的载荷（B 端 -> A 端批量上报）
+type AuditSyncData struct {
+	Items []AuditSyncItem `json:"items"`
+}
+
+// LogFileInfo 是日志文件元信息（名称/大小/修改时间）
+type LogFileInfo struct {
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	Modified int64  `json:"modified"`
+}
+
+// LogListReqData 是 LOG_LIST_REQ 的载荷（A 端 -> B 端，请求文件列表）
+type LogListReqData struct{}
+
+// LogListRespData 是 LOG_LIST_RESP 的载荷（B 端 -> A 端，返回文件列表）
+type LogListRespData struct {
+	Files []LogFileInfo `json:"files"`
+}
+
+// LogContentReqData 是 LOG_CONTENT_REQ 的载荷（A 端 -> B 端，请求文件尾部内容）
+type LogContentReqData struct {
+	File  string `json:"file"`
+	Lines int    `json:"lines"`
+}
+
+// LogContentRespData 是 LOG_CONTENT_RESP 的载荷（B 端 -> A 端，返回文件内容）
+type LogContentRespData struct {
+	File    string `json:"file"`
+	Content string `json:"content"`
 }
 
 // StreamHeader is the header at the beginning of each data stream

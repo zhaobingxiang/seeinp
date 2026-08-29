@@ -116,6 +116,19 @@
 | GET | /api/v1/proxies/:id/traffic | 流量时序（minute/hour/day 粒度） |
 | POST | /api/v1/proxies/:id/disconnect | 强制断开该代理全部连接 |
 
+#### 2.4.1 当前已实现子集【已实现】
+
+代理标识为 `(username, proxyId)`（seeinps 用户名 + seeinps 上配置的代理 ID），列表显示名为 `username.proxyId`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /api/v1/proxies | 所有连接过的代理列表。每项：`{username, proxyId, name, type, status(1启用/0禁用), online, port(在线时公网端口), lastOnlineAt, lastOfflineAt, bytesIn, bytesOut, rateIn, rateOut}`。流量为累计字节（入站=外部→内网，出站=内网→外部，seeinpm 转发处统计），rate 为在线代理 5s 采样速率（字节/秒，离线为 0） |
+| GET | /api/v1/proxies/{username}/{proxyId}/sessions | 该代理最近 10 次连接记录：`[{onlineAt, offlineAt(在线中为空), remoteAddr}]`；历史每代理最多保留 50 条 |
+| POST | /api/v1/proxies/{username}/{proxyId}/disable | 禁用代理：立即停公网监听并断开活动连接、释放端口、标记离线；在线 seeinps 收到 `PROXY_REVOKE` 后转入 30s 低速重试（被拒 1006）。被禁用代理不参与 7 天自动清理 |
+| POST | /api/v1/proxies/{username}/{proxyId}/enable | 启用代理；seeinps 周期重试 `ALLOC_PORT` 后自动上线（≤30s） |
+
+自动清理：每小时检查一次，删除离线超 7 天且未禁用的代理记录及其连接历史；代理重新连接（ALLOC_PORT）时自动重建记录。
+
 ### 2.5 统计与仪表板
 
 | 方法 | 路径 | 说明 |

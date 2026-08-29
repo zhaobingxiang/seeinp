@@ -1,60 +1,183 @@
 <template>
-  <div class="layout">
-    <el-container>
-      <el-aside width="200px" class="sidebar">
-        <div class="logo">seeinpm</div>
-        <el-menu :default-active="currentPath" router>
-          <el-menu-item index="/pm/dashboard"><el-icon><DataBoard /></el-icon><span>仪表盘</span></el-menu-item>
-          <el-menu-item index="/pm/users"><el-icon><User /></el-icon><span>用户管理</span></el-menu-item>
-          <el-menu-item index="/pm/ports"><el-icon><Connection /></el-icon><span>端口池</span></el-menu-item>
-        </el-menu>
-      </el-aside>
-      <el-container>
-        <el-header class="header"><span>seeinpm</span><el-button type="danger" @click="logout">退出登录</el-button></el-header>
-        <el-main>
-          <div class="stats">
-            <el-card class="stat-card"><div class="stat-value">{{ health.clients || 0 }}</div><div class="stat-label">客户端</div></el-card>
-            <el-card class="stat-card"><div class="stat-value">{{ health.ports?.used || 0 }} / {{ health.ports?.total || 0 }}</div><div class="stat-label">端口</div></el-card>
-            <el-card class="stat-card"><div class="stat-value">{{ health.version }}</div><div class="stat-label">版本</div></el-card>
+  <Layout>
+    <!-- 统计卡片 -->
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-value">{{ health.clients || 0 }}</div>
+        <div class="stat-label">在线客户端</div>
+        <div class="stat-sub">控制通道连接数</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">{{ onlineCount }}<span class="stat-total"> / {{ proxies.length }}</span></div>
+        <div class="stat-label">在线代理</div>
+        <div class="stat-sub">{{ enabledCount }} 个启用</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value traffic-value">{{ formatBytes(totalTraffic) }}</div>
+        <div class="stat-label">累计流量</div>
+        <div class="stat-sub">下行 {{ formatBytes(totalIn) }} · 上行 {{ formatBytes(totalOut) }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">{{ health.ports?.used || 0 }}<span class="stat-total"> / {{ health.ports?.total || 0 }}</span></div>
+        <div class="stat-label">端口使用</div>
+        <div class="stat-sub">端口池 {{ poolText }}</div>
+      </div>
+    </div>
+
+    <div class="dash-grid">
+      <!-- 实时流量 Top -->
+      <div class="page-card">
+        <div class="card-header" style="padding:14px 16px;border-bottom:1px solid var(--app-border-light)">
+          <span>实时流量 Top</span>
+          <span class="refresh-hint">自动刷新 {{ refreshInterval }}s</span>
+        </div>
+        <el-table :data="topProxies" v-loading="loadingProxies" style="width:100%">
+          <el-table-column prop="name" label="代理" min-width="150">
+            <template #default="{ row }"><span style="font-weight:500">{{ row.name }}</span></template>
+          </el-table-column>
+          <el-table-column label="状态" width="80">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.online && row.status === 1 ? 'success' : 'info'">
+                {{ row.online && row.status === 1 ? '在线' : '离线' }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="转发端口" width="100">
+            <template #default="{ row }">
+              <span style="font-family:var(--font-mono,monospace);color:var(--app-text-secondary)">{{ row.port || '-' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="实时速率" width="180">
+            <template #default="{ row }">
+              <div class="rate-cell">
+                <span class="rate-down">↓ {{ formatBytes(row.rateIn) }}/s</span>
+                <span class="rate-up">↑ {{ formatBytes(row.rateOut) }}/s</span>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="总流量" min-width="110">
+            <template #default="{ row }">{{ formatBytes((row.bytesIn || 0) + (row.bytesOut || 0)) }}</template>
+          </el-table-column>
+        </el-table>
+        <div v-if="topProxies.length === 0" class="empty-tip">暂无在线代理</div>
+      </div>
+
+      <!-- 最近动态 -->
+      <div class="page-card">
+        <div class="card-header" style="padding:14px 16px;border-bottom:1px solid var(--app-border-light)">
+          <span>最近动态</span>
+          <span class="link-all" @click="router.push('/pm/audit-logs')">全部 →</span>
+        </div>
+        <div class="feed-list">
+          <div v-for="it in feeds" :key="it.id" class="feed-item">
+            <span class="feed-time">{{ formatHM(it.createdAt) }}</span>
+            <span class="feed-text">{{ it.username }} {{ actionLabel(it.action) }}{{ it.target ? ' ' + it.target : '' }}</span>
           </div>
-          <el-card>
-            <template #header><span>在线客户端</span></template>
-            <el-table :data="clients" v-loading="loadingClients">
-              <el-table-column prop="username" label="用户名" />
-              <el-table-column prop="sessionId" label="会话"><template #default="{row}">{{ row.sessionId?.substring(0,8) }}...</template></el-table-column>
-              <el-table-column label="连接时间"><template #default="{row}">{{ formatTime(row.connected) }}</template></el-table-column>
-            </el-table>
-            <el-empty v-if="clients.length === 0" description="暂无在线客户端" />
-          </el-card>
-        </el-main>
-      </el-container>
-    </el-container>
-  </div>
+          <el-empty v-if="feeds.length === 0" description="暂无动态" :image-size="60" />
+        </div>
+      </div>
+    </div>
+  </Layout>
 </template>
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue"
-import { useRoute, useRouter } from "vue-router"
-import { healthApi, clientApi } from "@/api"
-import { DataBoard, User, Connection } from "@element-plus/icons-vue"
-const route = useRoute()
+import { ref, computed, onMounted, onUnmounted } from "vue"
+import { useRouter } from "vue-router"
+import { healthApi, proxyApi, auditApi, portApi } from "@/api"
+import Layout from "@/components/Layout.vue"
+
 const router = useRouter()
-const currentPath = computed(() => route.path)
+const refreshInterval = 10
+
 const health = ref<any>({})
-const clients = ref<any[]>([])
-const loadingClients = ref(true)
-const formatTime = (ts: number) => { if (!ts) return "-"; return new Date(ts * 1000).toLocaleString() }
-const loadData = async () => { try { const [h, c]: any[] = await Promise.all([healthApi.get(), clientApi.list()]); if (h) health.value = h; if (c?.data) clients.value = c.data } catch (e) { console.error(e) } finally { loadingClients.value = false } }
-const logout = () => { localStorage.removeItem("pm_token"); router.push("/pm/login") }
-onMounted(loadData)
+const proxies = ref<any[]>([])
+const feeds = ref<any[]>([])
+const poolText = ref("-")
+const loadingProxies = ref(false)
+let timer: any = null
+
+const onlineCount = computed(() => proxies.value.filter((p: any) => p.online && p.status === 1).length)
+const enabledCount = computed(() => proxies.value.filter((p: any) => p.status === 1).length)
+const totalIn = computed(() => proxies.value.reduce((s, p: any) => s + (p.bytesIn || 0), 0))
+const totalOut = computed(() => proxies.value.reduce((s, p: any) => s + (p.bytesOut || 0), 0))
+const totalTraffic = computed(() => totalIn.value + totalOut.value)
+const topProxies = computed(() =>
+  proxies.value
+    .filter((p: any) => p.online && p.status === 1)
+    .sort((a: any, b: any) => (b.rateIn + b.rateOut) - (a.rateIn + a.rateOut))
+    .slice(0, 5)
+)
+
+const formatBytes = (n?: number) => {
+  if (!n || n <= 0) return "0 B"
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  let i = 0, v = n
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
+  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + units[i]
+}
+const formatHM = (ts?: number) => {
+  if (!ts) return "-"
+  const d = new Date(ts * 1000)
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
+}
+
+const actions = [
+  { value: "login", label: "登录" },
+  { value: "login_failed", label: "登录失败" },
+  { value: "admin_init", label: "初始化管理账号" },
+  { value: "user_create", label: "创建用户" },
+  { value: "user_delete", label: "删除用户" },
+  { value: "user_disable", label: "禁用用户" },
+  { value: "user_enable", label: "启用用户" },
+  { value: "user_reset_code", label: "重置授权码" },
+  { value: "proxy_disable", label: "禁用代理" },
+  { value: "proxy_enable", label: "启用代理" },
+  { value: "port_pool_update", label: "修改端口池" },
+  { value: "auth_init", label: "初始化B端账号" },
+  { value: "auth_rebind", label: "重新绑定授权码" },
+  { value: "proxy_create", label: "创建代理" },
+  { value: "proxy_update", label: "修改代理" },
+  { value: "proxy_delete", label: "删除代理" }
+]
+const actionLabel = (a: string) => actions.find((x: any) => x.value === a)?.label || a
+
+const loadData = async () => {
+  loadingProxies.value = true
+  try {
+    const [h, pr, au, pp]: any[] = await Promise.all([
+      healthApi.get(),
+      proxyApi.list(),
+      auditApi.list({ page_size: 6 }),
+      portApi.getPool()
+    ])
+    if (h) health.value = h
+    if (pr?.data) proxies.value = pr.data
+    if (au?.data?.list) feeds.value = au.data.list
+    if (pp?.data?.ranges?.length) poolText.value = pp.data.ranges.map((r: any) => `${r.start}-${r.end}`).join("，")
+  } catch (e) { console.error(e) } finally { loadingProxies.value = false }
+}
+
+onMounted(() => { loadData(); timer = setInterval(loadData, refreshInterval * 1000) })
+onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>
 <style scoped>
-.layout { height: 100vh; }
-.sidebar { background: #001529; }
-.logo { color: white; font-size: 20px; font-weight: bold; padding: 20px; text-align: center; }
-.header { background: white; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }
-.stat-card { text-align: center; }
-.stat-value { font-size: 28px; font-weight: bold; color: #409EFF; }
-.stat-label { color: #909399; margin-top: 8px; }
-.el-menu { border-right: none; }
+.stat-total { font-size: 15px; color: var(--app-text-tertiary); font-weight: 400; }
+.traffic-value { font-size: 22px; }
+.stat-sub { margin-top: 2px; font-size: 12px; color: var(--app-text-tertiary); }
+
+.dash-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: 16px; align-items: start; }
+@media (max-width: 1100px) { .dash-grid { grid-template-columns: 1fr; } }
+
+.refresh-hint { font-size: 12px; color: var(--app-text-tertiary); font-weight: 400; }
+.rate-cell { display: flex; flex-direction: column; gap: 2px; font-family: var(--font-mono, monospace); font-size: 12px; }
+.rate-down { color: #2563eb; }
+.rate-up { color: #6b7280; }
+.empty-tip { padding: 28px 0; text-align: center; font-size: 13px; color: var(--app-text-tertiary); }
+
+.feed-list { padding: 6px 16px 12px; }
+.feed-item { display: flex; gap: 10px; align-items: baseline; padding: 9px 0; border-bottom: 0.5px solid var(--app-border-light); font-size: 12px; }
+.feed-item:last-child { border-bottom: none; }
+.feed-time { color: #2563eb; flex-shrink: 0; font-family: var(--font-mono, monospace); }
+.feed-text { color: var(--app-text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link-all { font-size: 12px; color: #2563eb; cursor: pointer; font-weight: 400; }
+.link-all:hover { color: var(--app-primary-hover); }
 </style>

@@ -39,7 +39,30 @@ export const userApi = {
 }
 
 export const portApi = {
-  getPool: () => api.get('/port-pool')
+  getPool: () => api.get('/port-pool'),
+  updatePool: (ranges: { start: number; end: number }[], action: string) => api.put('/port-pool', { ranges, action })
+}
+
+export const proxyApi = {
+  list: () => api.get('/proxies'),
+  sessions: (username: string, proxyId: string) => api.get(`/proxies/${encodeURIComponent(username)}/${encodeURIComponent(proxyId)}/sessions`),
+  disable: (username: string, proxyId: string) => api.post(`/proxies/${encodeURIComponent(username)}/${encodeURIComponent(proxyId)}/disable`),
+  enable: (username: string, proxyId: string) => api.post(`/proxies/${encodeURIComponent(username)}/${encodeURIComponent(proxyId)}/enable`)
+}
+
+export const auditApi = {
+  list: (params: { username?: string; action?: string; keyword?: string; source?: string; start_time?: number; end_time?: number; page?: number; page_size?: number }) => api.get('/audit-logs', { params })
+}
+
+export const logApi = {
+  listFiles: () => api.get('/logs'),
+  content: (file: string, lines: number, keyword?: string, download?: boolean) => api.get('/logs/content', { params: { file, lines, keyword, download } })
+}
+
+// 混合架构：经控制通道按需拉取在线 seeinps 的运行日志（不落 PM 存储）
+export const psLogApi = {
+  listFiles: (username: string) => api.get('/ps-logs', { params: { username } }),
+  content: (username: string, file: string, lines: number) => api.get('/ps-logs/content', { params: { username, file, lines } })
 }
 
 export const healthApi = {

@@ -13,14 +13,18 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/hashicorp/yamux"
 	"github.com/seeinp/seeinp/internal/auth"
 	"github.com/seeinp/seeinp/internal/config"
+	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/mux"
 	"github.com/seeinp/seeinp/internal/portpool"
 	"github.com/seeinp/seeinp/internal/protocol"
@@ -47,6 +51,22 @@ type Server struct {
 	publicConns      map[int]*PublicListener
 	publicConnsByProxy map[string]*PublicListener
 	publicMu         sync.RWMutex
+	// traffic 为代理流量内存计数器，key 为 username + "/" + proxyID
+	traffic          map[string]*proxyTraffic
+	trafficMu        sync.Mutex
+	lastProxyCleanup time.Time
+}
+
+// proxyTraffic 代理流量内存计数：in/out 为进程启动以来累计（含未落库部分），
+// flushedIn/flushedOut 为已写入 DB 的水位，rateIn/rateOut 为采样速率（字节/秒）。
+// DB 中的 bytes_in/bytes_out 为历史累计，接口返回总量 = DB值 + (内存累计 - 已落库水位)。
+type proxyTraffic struct {
+	in         atomic.Int64
+	out        atomic.Int64
+	flushedIn  atomic.Int64
+	flushedOut atomic.Int64
+	rateIn     atomic.Int64
+	rateOut    atomic.Int64
 }
 
 type Client struct {
@@ -54,10 +74,14 @@ type Client struct {
 	sessionID     string
 	connected     time.Time
 	lastPing      time.Time
+	remoteAddr    string
 	session       *yamux.Session
 	controlStream net.Conn
 	// ctrlWriteMu 保护控制流写入（心跳应答与 SESSION_REVOKE 推送可能并发）
 	ctrlWriteMu sync.Mutex
+	// pendingMu/pending 关联控制通道请求与响应（拉取 B 端日志等）
+	pendingMu sync.Mutex
+	pending   map[string]chan *protocol.Message
 }
 
 type Session struct {
@@ -72,6 +96,10 @@ type PublicListener struct {
 	Type    string
 	Ln      net.Listener
 	Client  *Client
+	tr      *proxyTraffic
+	// activeConns 跟踪该监听器上的活动转发连接（公网连接与 mux 流），禁用时强制断开
+	activeConns map[net.Conn]struct{}
+	connsMu     sync.Mutex
 }
 
 func NewServer(config *config.PMConfig) (*Server, error) {
@@ -86,9 +114,19 @@ func NewServer(config *config.PMConfig) (*Server, error) {
 		time.Duration(config.Auth.JWTRefreshExpire)*time.Second,
 	)
 
-	ranges := make([]portpool.Range, len(config.PortPool.Ranges))
-	for i, r := range config.PortPool.Ranges {
-		ranges[i] = portpool.Range{Start: r.Start, End: r.End}
+	// 端口池：toml 为首次初始种子；DB 中有历史配置则优先（web 配置持久化）
+	ranges := make([]portpool.Range, 0, len(config.PortPool.Ranges))
+	for _, r := range config.PortPool.Ranges {
+		ranges = append(ranges, portpool.Range{Start: r.Start, End: r.End})
+	}
+	if dbRanges, err := s.GetPortPoolConfig(); err == nil && len(dbRanges) > 0 {
+		ranges = ranges[:0]
+		for _, r := range dbRanges {
+			ranges = append(ranges, portpool.Range{Start: r.Start, End: r.End})
+		}
+		fmt.Printf("[PORT-POOL] Loaded config from DB: %v\n", dbRanges)
+	} else if err != nil {
+		fmt.Printf("[PORT-POOL] Read db config error (fallback to toml): %v\n", err)
 	}
 
 	return &Server{
@@ -100,6 +138,7 @@ func NewServer(config *config.PMConfig) (*Server, error) {
 		sessions:         make(map[string]*Session),
 		publicConns:      make(map[int]*PublicListener),
 		publicConnsByProxy: make(map[string]*PublicListener),
+		traffic:          make(map[string]*proxyTraffic),
 	}, nil
 }
 
@@ -133,6 +172,8 @@ func (s *Server) Start(ctx context.Context) error {
 	go s.startControlListener(ctx)
 	go s.startHTTPListener()
 	go s.startCleanupRoutine(ctx)
+	go s.trafficSampler(ctx)
+	go s.trafficFlusher(ctx)
 
 	fmt.Println("[seeinpm] Started - control :999, api :9998")
 
@@ -177,6 +218,16 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("/api/v1/clients", s.authMiddleware(s.handleClientsAPI))
 	mux.HandleFunc("/api/v1/auth/verify-code", s.handleVerifyCode)
 	mux.HandleFunc("/api/v1/port-pool", s.authMiddleware(s.handlePortPool))
+	mux.HandleFunc("GET /api/v1/proxies", s.authMiddleware(s.handleListProxies))
+	mux.HandleFunc("GET /api/v1/proxies/{username}/{proxyId}/sessions", s.authMiddleware(s.handleProxySessions))
+	mux.HandleFunc("POST /api/v1/proxies/{username}/{proxyId}/disable", s.authMiddleware(s.handleProxyDisable))
+	mux.HandleFunc("POST /api/v1/proxies/{username}/{proxyId}/enable", s.authMiddleware(s.handleProxyEnable))
+	mux.HandleFunc("GET /api/v1/audit-logs", s.authMiddleware(s.handleAuditLogs))
+	mux.HandleFunc("GET /api/v1/logs", s.authMiddleware(s.handleListLogFiles))
+	mux.HandleFunc("GET /api/v1/logs/content", s.authMiddleware(s.handleLogFileContent))
+	// 混合架构：A 端按需拉取在线 B 端（seeinps）运行日志（经控制通道转发）
+	mux.HandleFunc("GET /api/v1/ps-logs", s.authMiddleware(s.handlePSLogList))
+	mux.HandleFunc("GET /api/v1/ps-logs/content", s.authMiddleware(s.handlePSLogContent))
 
 	staticDir := "./web-pm/dist"
 	if _, err := os.Stat(staticDir); err == nil {
@@ -199,6 +250,11 @@ func (s *Server) startHTTPListener() {
 	}
 }
 
+type ctxKey string
+
+const operatorKey ctxKey = "operator"
+
+// authMiddleware 校验 JWT 并把操作者用户名放入 context，供审计埋点取用
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" ||
@@ -218,15 +274,51 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if _, err := s.jwt.ValidateToken(token); err != nil {
+		claims, err := s.jwt.ValidateToken(token)
+		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			fmt.Fprintf(w, `{"code":1003,"message":"invalid token"}`)
 			return
 		}
 
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), operatorKey, claims.Username)))
 	}
+}
+
+// operatorFrom 从 context 取当前操作者（审计埋点用）
+func operatorFrom(r *http.Request) string {
+	if v, ok := r.Context().Value(operatorKey).(string); ok {
+		return v
+	}
+	return "unknown"
+}
+
+// audit 写一条操作审计记录（自动附加来源 IP）；失败只打日志不影响主流程
+func (s *Server) audit(r *http.Request, action, target, detail string) {
+	if detail != "" {
+		detail += "; "
+	}
+	detail += "ip=" + clientIP(r)
+	if err := s.store.InsertAuditLog(operatorFrom(r), action, target, detail); err != nil {
+		log.Printf("[AUDIT] insert error: %v", err)
+	}
+}
+
+// auditLogin 登录成败审计（无 JWT，操作者取自请求体）
+func (s *Server) auditLogin(username, action string, r *http.Request) {
+	if err := s.store.InsertAuditLog(username, action, "", "ip="+clientIP(r)); err != nil {
+		log.Printf("[AUDIT] insert error: %v", err)
+	}
+}
+
+// clientIP 从请求取客户端 IP（去掉端口）
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (s *Server) startCleanupRoutine(ctx context.Context) {
@@ -253,11 +345,40 @@ func (s *Server) cleanupStaleAllocations() {
 	for _, alloc := range stale {
 		s.stopPublicListener(alloc.Port)
 		s.portPool.Release(alloc.ProxyID)
+		s.flushTraffic(alloc.UserID, alloc.ProxyID)
+		if err := s.store.MarkProxyOffline(alloc.UserID, alloc.ProxyID); err != nil {
+			log.Printf("[CLEANUP] Mark proxy offline error: %v", err)
+		}
 		fmt.Printf("[CLEANUP] Released port %d for offline user %s\n", alloc.Port, alloc.UserID)
 	}
 
 	if len(stale) > 0 {
 		fmt.Printf("[CLEANUP] Cleaned up %d stale allocations\n", len(stale))
+	}
+
+	// 代理记录清理每小时执行一次：删除离线超 7 天且未禁用的代理（含会话历史），
+	// 并修剪每个代理的会话记录到最近 50 条。手动禁用的代理永不自动清理。
+	// 同时清理 90 天前的操作审计日志。
+	if time.Since(s.lastProxyCleanup) > time.Hour {
+		s.lastProxyCleanup = time.Now()
+		cutoff := time.Now().Add(-7 * 24 * time.Hour).Unix()
+		if n, err := s.store.CleanupOfflineProxies(cutoff); err != nil {
+			log.Printf("[CLEANUP] Cleanup offline proxies error: %v", err)
+		} else if n > 0 {
+			fmt.Printf("[CLEANUP] Removed %d proxies offline over 7 days\n", n)
+		}
+		if proxies, err := s.store.ListProxies(); err == nil {
+			for _, p := range proxies {
+				if err := s.store.TrimProxySessions(p.Username, p.ProxyID, 50); err != nil {
+					log.Printf("[CLEANUP] Trim sessions error: %v", err)
+				}
+			}
+		}
+		if n, err := s.store.CleanupAuditLogs(time.Now().Add(-90 * 24 * time.Hour).Unix()); err != nil {
+			log.Printf("[CLEANUP] Cleanup audit logs error: %v", err)
+		} else if n > 0 {
+			fmt.Printf("[CLEANUP] Removed %d audit logs over 90 days\n", n)
+		}
 	}
 }
 
@@ -269,11 +390,13 @@ func (s *Server) startPublicListener(port int, proxyID, proxyType string, client
 	}
 
 	pl := &PublicListener{
-		Port:    port,
-		ProxyID: proxyID,
-		Type:    proxyType,
-		Ln:      ln,
-		Client:  client,
+		Port:        port,
+		ProxyID:     proxyID,
+		Type:        proxyType,
+		Ln:          ln,
+		Client:      client,
+		tr:          s.trafficFor(client.username, proxyID),
+		activeConns: make(map[net.Conn]struct{}),
 	}
 
 	s.publicMu.Lock()
@@ -311,6 +434,46 @@ func (s *Server) acceptPublicConnections(pl *PublicListener) {
 	}
 }
 
+// countingConn 统计从底层连接读取的字节数（onRead 每次 Read 后回调）
+type countingConn struct {
+	net.Conn
+	onRead func(int)
+}
+
+func (c *countingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 && c.onRead != nil {
+		c.onRead(n)
+	}
+	return n, err
+}
+
+func (pl *PublicListener) trackConns(conns ...net.Conn) {
+	pl.connsMu.Lock()
+	for _, c := range conns {
+		pl.activeConns[c] = struct{}{}
+	}
+	pl.connsMu.Unlock()
+}
+
+func (pl *PublicListener) untrackConns(conns ...net.Conn) {
+	pl.connsMu.Lock()
+	for _, c := range conns {
+		delete(pl.activeConns, c)
+	}
+	pl.connsMu.Unlock()
+}
+
+// killActiveConns 强制关闭该监听器上的全部活动转发连接（禁用代理时调用）
+func (pl *PublicListener) killActiveConns() {
+	pl.connsMu.Lock()
+	defer pl.connsMu.Unlock()
+	for c := range pl.activeConns {
+		c.Close()
+	}
+	pl.activeConns = make(map[net.Conn]struct{})
+}
+
 func (s *Server) handlePublicConnection(pl *PublicListener, conn net.Conn) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(connIdleTimeout))
@@ -323,6 +486,9 @@ func (s *Server) handlePublicConnection(pl *PublicListener, conn net.Conn) {
 		return
 	}
 	defer stream.Close()
+
+	pl.trackConns(conn, stream)
+	defer pl.untrackConns(conn, stream)
 
 	// 流头: stype(1B) + proxyIdLen(1B) + proxyId，读方按长度精确解析，避免与载荷粘连
 	stype := protocol.StreamTypeTCP
@@ -339,19 +505,119 @@ func (s *Server) handlePublicConnection(pl *PublicListener, conn net.Conn) {
 		return
 	}
 
+	// 流量统计：入站 = 外部客户端 -> 内网（从公网连接读到的字节）；
+	// 出站 = 内网 -> 外部（从 mux 流读到的字节）
+	inConn := &countingConn{Conn: conn, onRead: func(n int) { pl.tr.in.Add(int64(n)) }}
+	outStream := &countingConn{Conn: stream, onRead: func(n int) { pl.tr.out.Add(int64(n)) }}
+
 	done := make(chan struct{}, 2)
 	go func() {
 		stream.SetReadDeadline(time.Now().Add(connReadTimeout))
-		io.Copy(stream, conn)
+		io.Copy(stream, inConn)
 		done <- struct{}{}
 	}()
 	go func() {
 		conn.SetReadDeadline(time.Now().Add(connReadTimeout))
-		io.Copy(conn, stream)
+		io.Copy(conn, outStream)
 		done <- struct{}{}
 	}()
 	<-done
 	<-done
+}
+
+// trafficFor 获取（或创建）指定代理的流量计数器
+func (s *Server) trafficFor(username, proxyID string) *proxyTraffic {
+	key := username + "/" + proxyID
+	s.trafficMu.Lock()
+	defer s.trafficMu.Unlock()
+	tr, ok := s.traffic[key]
+	if !ok {
+		tr = &proxyTraffic{}
+		s.traffic[key] = tr
+	}
+	return tr
+}
+
+// flushTraffic 将指定代理的未落库流量增量写入 DB（离线/定时/关停时调用）
+func (s *Server) flushTraffic(username, proxyID string) {
+	key := username + "/" + proxyID
+	s.trafficMu.Lock()
+	tr, ok := s.traffic[key]
+	s.trafficMu.Unlock()
+	if !ok {
+		return
+	}
+	in := tr.in.Load()
+	out := tr.out.Load()
+	dIn := in - tr.flushedIn.Load()
+	dOut := out - tr.flushedOut.Load()
+	if dIn <= 0 && dOut <= 0 {
+		return
+	}
+	if err := s.store.AddProxyTraffic(username, proxyID, dIn, dOut); err != nil {
+		log.Printf("[TRAFFIC] Flush %s error: %v", key, err)
+		return
+	}
+	tr.flushedIn.Store(in)
+	tr.flushedOut.Store(out)
+}
+
+// flushUserTraffic 落库某用户全部代理的流量
+func (s *Server) flushUserTraffic(username string) {
+	if list, err := s.store.ListProxies(); err == nil {
+		for _, p := range list {
+			if p.Username == username {
+				s.flushTraffic(p.Username, p.ProxyID)
+			}
+		}
+	}
+}
+
+// flushAllTraffic 落库全部代理流量（进程关停时调用）
+func (s *Server) flushAllTraffic() {
+	if list, err := s.store.ListProxies(); err == nil {
+		for _, p := range list {
+			s.flushTraffic(p.Username, p.ProxyID)
+		}
+	}
+}
+
+// trafficSampler 每 5s 采样一次计数器增量，计算实时速率（字节/秒）
+func (s *Server) trafficSampler(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	prev := make(map[string][2]int64)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.trafficMu.Lock()
+			for key, tr := range s.traffic {
+				in := tr.in.Load()
+				out := tr.out.Load()
+				p := prev[key]
+				tr.rateIn.Store((in - p[0]) / 5)
+				tr.rateOut.Store((out - p[1]) / 5)
+				prev[key] = [2]int64{in, out}
+			}
+			s.trafficMu.Unlock()
+		}
+	}
+}
+
+// trafficFlusher 每 60s 将全部代理的未落库流量增量写入 DB，崩溃最多丢失 60s 数据
+func (s *Server) trafficFlusher(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.flushAllTraffic()
+		}
+	}
 }
 
 // HTTP handlers
@@ -401,6 +667,7 @@ func (s *Server) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"code":5000,"message":"%s"}`, err.Error())
 		return
 	}
+	s.auditLogin(req.Username, "admin_init", r)
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
 
@@ -422,17 +689,20 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.GetAdminUser(req.Username)
 	if err != nil {
+		s.auditLogin(req.Username, "login_failed", r)
 		w.WriteHeader(http.StatusUnauthorized)
 		fmt.Fprintf(w, `{"code":1001,"message":"invalid credentials"}`)
 		return
 	}
 	if !auth.CheckPassword(req.Password, user.PasswordHash) {
+		s.auditLogin(req.Username, "login_failed", r)
 		w.WriteHeader(http.StatusUnauthorized)
 		fmt.Fprintf(w, `{"code":1001,"message":"invalid credentials"}`)
 		return
 	}
 	accessToken, _ := s.jwt.GenerateAccessToken(req.Username, "admin")
 	refreshToken, _ := s.jwt.GenerateRefreshToken(req.Username, "admin")
+	s.auditLogin(req.Username, "login", r)
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"access_token":"%s","refresh_token":"%s"}}`, accessToken, refreshToken)
 }
 
@@ -499,6 +769,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"code":3001,"message":"username already exists"}`)
 		return
 	}
+	s.audit(r, "user_create", req.Username, fmt.Sprintf("remark=%s", req.Remark))
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"username":"%s","authCode":"%s","remark":"%s"}}`, req.Username, code, req.Remark)
 }
 
@@ -512,6 +783,7 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+	s.audit(r, "user_delete", username, "")
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
 
@@ -538,6 +810,7 @@ func (s *Server) handleUserDisable(w http.ResponseWriter, r *http.Request) {
 		s.kickClient(username, "user_disabled")
 	}
 	fmt.Printf("[USER] %s disabled (disconnectNow=%v)\n", username, req.DisconnectNow)
+	s.audit(r, "user_disable", username, fmt.Sprintf("disconnectNow=%v", req.DisconnectNow))
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
 
@@ -556,6 +829,7 @@ func (s *Server) handleUserEnable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Printf("[USER] %s enabled\n", username)
+	s.audit(r, "user_enable", username, "status=1")
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
 
@@ -581,6 +855,7 @@ func (s *Server) handleUserResetCode(w http.ResponseWriter, r *http.Request) {
 	}
 	s.kickClient(username, "auth_code_reset")
 	fmt.Printf("[USER] %s auth code reset\n", username)
+	s.audit(r, "user_reset_code", username, "新授权码已下发，旧码吊销，在线 seeinps 已断开等待重新绑定")
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"username":"%s","authCode":"%s"}}`, username, code)
 }
 
@@ -642,8 +917,551 @@ func (s *Server) handleClientsAPI(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePortPool(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodPut {
+		s.handlePortPoolUpdate(w, r)
+		return
+	}
 	total, used := s.portPool.GetStats()
-	fmt.Fprintf(w, `{"code":0,"data":{"total":%d,"used":%d}}`, total, used)
+	cur := s.portPool.GetRanges()
+	ranges := make([]store.PortRange, 0, len(cur))
+	for _, rg := range cur {
+		ranges = append(ranges, store.PortRange{Start: rg.Start, End: rg.End})
+	}
+	// 已分配端口明细（含池外标记）
+	allocs, _ := s.store.GetAllocatedPorts()
+	type allocResp struct {
+		Username string `json:"username"`
+		ProxyID  string `json:"proxyId"`
+		Port     int    `json:"port"`
+		Type     string `json:"type"`
+		InPool   bool   `json:"inPool"`
+	}
+	allocList := make([]allocResp, 0, len(allocs))
+	for _, a := range allocs {
+		allocList = append(allocList, allocResp{Username: a.UserID, ProxyID: a.ProxyID, Port: a.Port, Type: a.ProxyType, InPool: s.portPool.Contains(a.Port)})
+	}
+	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": map[string]interface{}{
+		"ranges": ranges, "total": total, "used": used, "allocations": allocList,
+	}})
+	w.Write(data)
+}
+
+// handlePortPoolUpdate PUT /api/v1/port-pool：保存新范围并处理池外分配
+// body: {"ranges":[{"start":..,"end":..}], "action":"recycle"|"keep"}
+//   - recycle（默认）：池外在线代理踢线重连（30s 内自动回池内），池外分配记录释放
+//   - keep：不踢线，仅提示哪些代理在池外（新分配只用池内）
+func (s *Server) handlePortPoolUpdate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var req struct {
+		Ranges []store.PortRange `json:"ranges"`
+		Action string            `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2001,"message":"invalid request"}`)
+		return
+	}
+	if req.Action == "" {
+		req.Action = "recycle"
+	}
+	if req.Action != "recycle" && req.Action != "keep" {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":"action must be recycle or keep"}`)
+		return
+	}
+	merged, err := normalizeRanges(req.Ranges)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
+		return
+	}
+
+	// 找出新池外的活跃分配
+	allocs, _ := s.store.GetAllocatedPorts()
+	type outsideItem struct{ username, proxyID, ptype string; port int }
+	var outside []outsideItem
+	for _, a := range allocs {
+		if !portInRanges(a.Port, merged) {
+			outside = append(outside, outsideItem{a.UserID, a.ProxyID, a.ProxyType, a.Port})
+		}
+	}
+
+	// 持久化 + 热生效
+	if err := s.store.SavePortPoolConfig(merged); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"code":5000,"message":"save config failed"}`)
+		return
+	}
+	newRanges := make([]portpool.Range, len(merged))
+	for i, rg := range merged {
+		newRanges[i] = portpool.Range{Start: rg.Start, End: rg.End}
+	}
+	s.portPool.SetRanges(newRanges)
+
+	recycled := make([]map[string]interface{}, 0, len(outside))
+	kept := make([]map[string]interface{}, 0, len(outside))
+	// 记录旧范围用于审计对比
+	oldRanges := s.portPool.GetRanges()
+	if len(outside) > 0 && req.Action == "recycle" {
+		for _, it := range outside {
+			// 在线代理踢线重连（kickClient 会停监听+释放端口+标记离线，重连后按池内重新分配）；
+			// 离线代理仅清分配记录，下次上线同样走池内
+			if _, active := s.isClientActive(it.username); active {
+				s.kickClient(it.username, "port_pool_shrunk")
+			} else {
+				_ = s.store.ReleasePort(it.proxyID)
+			}
+			recycled = append(recycled, map[string]interface{}{"username": it.username, "proxyId": it.proxyID, "port": it.port})
+		}
+	} else {
+		for _, it := range outside {
+			kept = append(kept, map[string]interface{}{"username": it.username, "proxyId": it.proxyID, "port": it.port})
+		}
+	}
+	s.audit(r, "port_pool_update", fmt.Sprintf("%v", merged), fmt.Sprintf("old=%v new=%v action=%s outside=%d recycled=%d", oldRanges, merged, req.Action, len(outside), len(recycled)))
+
+	total, used := s.portPool.GetStats()
+	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": map[string]interface{}{
+		"ranges": merged, "total": total, "used": used, "recycled": recycled, "kept": kept,
+	}})
+	w.Write(data)
+}
+
+// normalizeRanges 校验端口池范围并自动合并重叠/相邻段
+func normalizeRanges(input []store.PortRange) ([]store.PortRange, error) {
+	if len(input) == 0 {
+		return nil, fmt.Errorf("端口池至少需要一段范围")
+	}
+	for _, rg := range input {
+		if rg.Start < 1 || rg.End > 65535 || rg.Start > rg.End {
+			return nil, fmt.Errorf("非法范围 %d-%d（需满足 1 <= start <= end <= 65535）", rg.Start, rg.End)
+		}
+	}
+	sorted := append([]store.PortRange(nil), input...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Start != sorted[j].Start {
+			return sorted[i].Start < sorted[j].Start
+		}
+		return sorted[i].End < sorted[j].End
+	})
+	merged := []store.PortRange{sorted[0]}
+	for _, rg := range sorted[1:] {
+		last := &merged[len(merged)-1]
+		if rg.Start <= last.End+1 { // 重叠或相邻 → 合并
+			if rg.End > last.End {
+				last.End = rg.End
+			}
+		} else {
+			merged = append(merged, rg)
+		}
+	}
+	return merged, nil
+}
+
+// portInRanges 判断端口是否在给定范围集合内
+func portInRanges(port int, ranges []store.PortRange) bool {
+	for _, rg := range ranges {
+		if port >= rg.Start && port <= rg.End {
+			return true
+		}
+	}
+	return false
+}
+
+// handleListProxies 代理管理列表：所有连接过的代理（含离线/禁用），
+// 附累计流量（DB 累计 + 未落库增量）与实时速率（在线代理）
+func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	proxies, err := s.store.ListProxies()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"code":5000,"message":"query failed"}`)
+		return
+	}
+	type proxyResp struct {
+		Username      string `json:"username"`
+		ProxyID       string `json:"proxyId"`
+		Name          string `json:"name"` // 显示名：seeinps用户名.代理ID
+		Type          string `json:"type"`
+		Status        int    `json:"status"` // 1 启用 / 0 禁用
+		Online        bool   `json:"online"`
+		Port          int    `json:"port,omitempty"`
+		LastOnlineAt  *int64 `json:"lastOnlineAt,omitempty"`
+		LastOfflineAt *int64 `json:"lastOfflineAt,omitempty"`
+		BytesIn       int64  `json:"bytesIn"`
+		BytesOut      int64  `json:"bytesOut"`
+		RateIn        int64  `json:"rateIn"`
+		RateOut       int64  `json:"rateOut"`
+	}
+	list := make([]proxyResp, 0, len(proxies))
+	for _, p := range proxies {
+		resp := proxyResp{
+			Username: p.Username, ProxyID: p.ProxyID,
+			Name: p.Username + "." + p.ProxyID, Type: p.ProxyType,
+			Status: p.Status, Online: p.Online,
+			LastOnlineAt: p.LastOnlineAt, LastOfflineAt: p.LastOfflineAt,
+			BytesIn: p.BytesIn, BytesOut: p.BytesOut,
+		}
+		if p.Online {
+			s.publicMu.RLock()
+			if pl, ok := s.publicConnsByProxy[p.ProxyID]; ok && pl.Client != nil && pl.Client.username == p.Username {
+				resp.Port = pl.Port
+			}
+			s.publicMu.RUnlock()
+		}
+		tr := s.trafficFor(p.Username, p.ProxyID)
+		resp.BytesIn += tr.in.Load() - tr.flushedIn.Load()
+		resp.BytesOut += tr.out.Load() - tr.flushedOut.Load()
+		if p.Online {
+			resp.RateIn = tr.rateIn.Load()
+			resp.RateOut = tr.rateOut.Load()
+		}
+		list = append(list, resp)
+	}
+	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": list})
+	w.Write(data)
+}
+
+// handleProxySessions 返回代理最近 10 次连接/离线时间
+func (s *Server) handleProxySessions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	username := r.PathValue("username")
+	proxyID := r.PathValue("proxyId")
+	if _, err := s.store.GetProxy(username, proxyID); err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `{"code":2004,"message":"proxy not found"}`)
+		return
+	}
+	sessions, err := s.store.GetProxySessions(username, proxyID, 10)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"code":5000,"message":"query failed"}`)
+		return
+	}
+	type sessionResp struct {
+		OnlineAt   int64  `json:"onlineAt"`
+		OfflineAt  *int64 `json:"offlineAt,omitempty"`
+		RemoteAddr string `json:"remoteAddr"`
+	}
+	list := make([]sessionResp, 0, len(sessions))
+	for _, ps := range sessions {
+		list = append(list, sessionResp{OnlineAt: ps.OnlineAt, OfflineAt: ps.OfflineAt, RemoteAddr: ps.RemoteAddr})
+	}
+	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": list})
+	w.Write(data)
+}
+
+// handleProxyDisable 禁用代理：置状态、停公网监听并断开活动连接、释放端口、
+// 标记离线，在线 seeinps 推送 PROXY_REVOKE 使其转入低速重试（启用后自动恢复）。
+// 禁用的代理不参与 7 天自动清理。
+func (s *Server) handleProxyDisable(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	username := r.PathValue("username")
+	proxyID := r.PathValue("proxyId")
+	if _, err := s.store.GetProxy(username, proxyID); err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `{"code":2004,"message":"proxy not found"}`)
+		return
+	}
+	if _, err := s.store.SetProxyStatus(username, proxyID, 0); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"code":5000,"message":"update failed"}`)
+		return
+	}
+	s.publicMu.RLock()
+	pl, online := s.publicConnsByProxy[proxyID]
+	s.publicMu.RUnlock()
+	if online && pl.Client != nil && pl.Client.username == username {
+		s.stopPublicListener(pl.Port)
+		pl.killActiveConns()
+		s.portPool.Release(proxyID)
+		// 通知 seeinps 该代理已被禁用，使其清除转发端口并转入重试
+		pl.Client.writeControl(protocol.NewMessage(protocol.TypeProxyRevoke, &protocol.ProxyRevokeData{ProxyID: proxyID, Reason: "proxy_disabled"}))
+	}
+	s.flushTraffic(username, proxyID)
+	if err := s.store.MarkProxyOffline(username, proxyID); err != nil {
+		log.Printf("[PROXY] Mark offline error: %v", err)
+	}
+	fmt.Printf("[PROXY] %s.%s disabled\n", username, proxyID)
+	s.audit(r, "proxy_disable", username+"."+proxyID, "status=0; 已断开连接并释放端口")
+	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
+}
+
+// handleProxyEnable 启用代理：恢复状态；seeinps 周期重试 ALLOC_PORT 后自动上线
+func (s *Server) handleProxyEnable(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	username := r.PathValue("username")
+	proxyID := r.PathValue("proxyId")
+	found, err := s.store.SetProxyStatus(username, proxyID, 1)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"code":5000,"message":"update failed"}`)
+		return
+	}
+	if !found {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `{"code":2004,"message":"proxy not found"}`)
+		return
+	}
+	fmt.Printf("[PROXY] %s.%s enabled\n", username, proxyID)
+	s.audit(r, "proxy_enable", username+"."+proxyID, "status=1; 等待 seeinps 重试分配端口后自动上线")
+	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
+}
+
+// handleAuditLogs 分页查询操作审计日志（?username=&action=&page=&page_size=）
+func (s *Server) handleAuditLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	pageSize, _ := strconv.Atoi(q.Get("page_size"))
+	start, _ := strconv.ParseInt(q.Get("start_time"), 10, 64)
+	end, _ := strconv.ParseInt(q.Get("end_time"), 10, 64)
+	list, total, err := s.store.ListAuditLogs(store.AuditFilter{
+		Username:  q.Get("username"),
+		Action:    q.Get("action"),
+		Keyword:   q.Get("keyword"),
+		Source:    q.Get("source"), // pm / ps / 空=全部
+		StartTime: start,
+		EndTime:   end,
+		Page:      page,
+		PageSize:  pageSize,
+	})
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"code":5000,"message":"query failed"}`)
+		return
+	}
+	type auditResp struct {
+		ID        int64  `json:"id"`
+		Username  string `json:"username"`
+		Action    string `json:"action"`
+		Target    string `json:"target"`
+		Detail    string `json:"detail"`
+		CreatedAt int64  `json:"createdAt"`
+		Source    string `json:"source"`
+	}
+	items := make([]auditResp, 0, len(list))
+	for _, a := range list {
+		items = append(items, auditResp{ID: a.ID, Username: a.Username, Action: a.Action, Target: a.Target, Detail: a.Detail, CreatedAt: a.CreatedAt, Source: a.Source})
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 200 {
+		pageSize = 20
+	}
+	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": map[string]interface{}{
+		"list": items, "total": total, "page": page, "pageSize": pageSize,
+	}})
+	w.Write(data)
+}
+
+// logsDir 运行日志目录（相对 CWD，与部署布局一致）
+const logsDir = "logs"
+
+// handleListLogFiles 列出 logs 目录下的 .log 文件（名称/大小/修改时间）
+func (s *Server) handleListLogFiles(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	entries, err := os.ReadDir(logsDir)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"code":5000,"message":"read logs dir failed"}`)
+		return
+	}
+	type logFile struct {
+		Name     string `json:"name"`
+		Size     int64  `json:"size"`
+		Modified int64  `json:"modified"`
+	}
+	list := make([]logFile, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		list = append(list, logFile{Name: e.Name(), Size: info.Size(), Modified: info.ModTime().Unix()})
+	}
+	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": list})
+	w.Write(data)
+}
+
+// tailLines 读文件尾部至多 maxLines 行（大文件只读末尾 tailBytes 以避免整读）
+func tailLines(path string, maxLines int, tailBytes int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	size := info.Size()
+	offset := int64(0)
+	if size > tailBytes {
+		offset = size - tailBytes
+	}
+	buf := make([]byte, size-offset)
+	if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
+		return "", err
+	}
+	content := string(buf)
+	// 若非从文件头读起，丢弃首行（可能是半行）
+	if offset > 0 {
+		if idx := strings.Index(content, "\n"); idx >= 0 {
+			content = content[idx+1:]
+		}
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+// handleLogFileContent 尾部读取运行日志（?file=seeinpm.log&lines=500&keyword=&download=1）
+func (s *Server) handleLogFileContent(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	q := r.URL.Query()
+	name := q.Get("file")
+	// 只允许 logs 目录下的纯 .log 文件名，防目录穿越
+	if name == "" || name != filepath.Base(name) || !strings.HasSuffix(name, ".log") || strings.Contains(name, "..") {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2000,"message":"invalid file name"}`)
+		return
+	}
+	lines, _ := strconv.Atoi(q.Get("lines"))
+	if lines < 1 {
+		lines = 200
+	}
+	if lines > 2000 {
+		lines = 2000
+	}
+	keyword := q.Get("keyword")
+	download := q.Get("download") == "1"
+	path := filepath.Join(logsDir, name)
+	if download {
+		info, err := os.Stat(path)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprintf(w, `{"code":2004,"message":"file not found"}`)
+			return
+		}
+		if info.Size() > 50*1024*1024 {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"code":2000,"message":"file too large"}`)
+			return
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"code":5000,"message":"read failed"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+		w.Write(b)
+		return
+	}
+	content, err := tailLines(path, lines, 2*1024*1024)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `{"code":2004,"message":"file not found"}`)
+		return
+	}
+	if keyword != "" {
+		rows := strings.Split(content, "\n")
+		kept := make([]string, 0, len(rows))
+		for _, ln := range rows {
+			if strings.Contains(ln, keyword) {
+				kept = append(kept, ln)
+			}
+		}
+		content = strings.Join(kept, "\n")
+	}
+	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": map[string]string{"file": name, "content": content}})
+	w.Write(data)
+}
+
+// getOnlineClient 按 username 取在线 B 端连接
+func (s *Server) getOnlineClient(username string) (*Client, error) {
+	c, active := s.isClientActive(username)
+	if !active {
+		return nil, fmt.Errorf("seeinps %s is not online", username)
+	}
+	return c, nil
+}
+
+// handlePSLogList 经控制通道拉取指定 B 端（seeinps）的运行日志文件列表（?username=user3）
+func (s *Server) handlePSLogList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	username := r.URL.Query().Get("username")
+	client, err := s.getOnlineClient(username)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"code":5002,"message":%q}`, err.Error())
+		return
+	}
+	req := protocol.NewMessage(protocol.TypeLogListReq, &protocol.LogListReqData{})
+	resp, err := s.clientRequest(client, req, 10*time.Second)
+	if err != nil {
+		w.WriteHeader(http.StatusGatewayTimeout)
+		fmt.Fprintf(w, `{"code":5003,"message":%q}`, err.Error())
+		return
+	}
+	if resp.Code == nil || *resp.Code != protocol.CodeOK {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"code":5002,"message":"seeinps returned error"}`)
+		return
+	}
+	b, _ := json.Marshal(resp.Data)
+	d := &protocol.LogListRespData{}
+	json.Unmarshal(b, d)
+	if d.Files == nil {
+		d.Files = []protocol.LogFileInfo{}
+	}
+	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": d.Files})
+	w.Write(data)
+}
+
+// handlePSLogContent 经控制通道拉取指定 B 端（seeinps）的运行日志内容（?username=&file=&lines=）
+func (s *Server) handlePSLogContent(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	q := r.URL.Query()
+	username := q.Get("username")
+	client, err := s.getOnlineClient(username)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"code":5002,"message":%q}`, err.Error())
+		return
+	}
+	lines, _ := strconv.Atoi(q.Get("lines"))
+	if lines < 1 {
+		lines = 200
+	}
+	if lines > 2000 {
+		lines = 2000
+	}
+	req := protocol.NewMessage(protocol.TypeLogContentReq, &protocol.LogContentReqData{File: q.Get("file"), Lines: lines})
+	resp, err := s.clientRequest(client, req, 10*time.Second)
+	if err != nil {
+		w.WriteHeader(http.StatusGatewayTimeout)
+		fmt.Fprintf(w, `{"code":5003,"message":%q}`, err.Error())
+		return
+	}
+	if resp.Code == nil || *resp.Code != protocol.CodeOK {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"code":5002,"message":"seeinps returned error"}`)
+		return
+	}
+	b, _ := json.Marshal(resp.Data)
+	d := &protocol.LogContentRespData{}
+	json.Unmarshal(b, d)
+	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": map[string]string{"file": d.File, "content": d.Content}})
+	w.Write(data)
 }
 
 func extractToken(r *http.Request) string {
@@ -776,8 +1594,10 @@ func (s *Server) handleRegister(stream net.Conn, msg *protocol.Message, session 
 		sessionID:     sessionID,
 		connected:     time.Now(),
 		lastPing:      time.Now(),
+		remoteAddr:    session.RemoteAddr().String(),
 		session:       session,
 		controlStream: stream,
+		pending:       make(map[string]chan *protocol.Message),
 	}
 
 	s.clientsMu.Lock()
@@ -816,23 +1636,88 @@ func (s *Server) handleHeartbeat(stream net.Conn, client *Client) {
 			s.handleAllocPort(msg, client)
 		case protocol.TypeReleasePort:
 			s.handleReleasePort(msg, client)
+		case protocol.TypeAuditSync:
+			// 混合架构：B 端上报审计记录，按 username 区分来源写入统一 audit_logs
+			s.handleAuditSync(msg, client)
+		case protocol.TypeLogListResp, protocol.TypeLogContentResp:
+			// A 端发起的日志拉取响应，转交等待协程
+			client.pendingMu.Lock()
+			ch, ok := client.pending[msg.ID]
+			if ok {
+				delete(client.pending, msg.ID)
+			}
+			client.pendingMu.Unlock()
+			if ok {
+				ch <- msg
+			}
 		default:
 			client.writeControl(protocol.NewResponse(msg, protocol.CodeUnsupportedType, nil))
 		}
 	}
 }
 
+// handleAuditSync 处理 B 端（seeinps）上报的审计记录：写入统一 audit_logs（source='ps'）
+func (s *Server) handleAuditSync(msg *protocol.Message, client *Client) {
+	b, _ := json.Marshal(msg.Data)
+	d := &protocol.AuditSyncData{}
+	if err := json.Unmarshal(b, d); err != nil || len(d.Items) == 0 {
+		return
+	}
+	for _, it := range d.Items {
+		username := it.Username
+		if username == "" {
+			username = client.username
+		}
+		createdAt := it.CreatedAt
+		if createdAt <= 0 {
+			createdAt = time.Now().Unix()
+		}
+		if err := s.store.InsertAuditLogFromPS(username, it.Action, it.Target, it.Detail, createdAt); err != nil {
+			log.Printf("[AUDIT] ps-sync insert error: %v", err)
+		}
+	}
+}
+
+// clientRequest 通过控制通道向在线 B 端发送请求并等待响应（10s 超时）
+func (s *Server) clientRequest(client *Client, msg *protocol.Message, timeout time.Duration) (*protocol.Message, error) {
+	ch := make(chan *protocol.Message, 1)
+	client.pendingMu.Lock()
+	client.pending[msg.ID] = ch
+	client.pendingMu.Unlock()
+	defer func() {
+		client.pendingMu.Lock()
+		delete(client.pending, msg.ID)
+		client.pendingMu.Unlock()
+	}()
+	if err := client.writeControl(msg); err != nil {
+		return nil, err
+	}
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("request %s timeout", msg.Type)
+	}
+}
+
 // writeControl 带锁写控制流：心跳应答/端口响应与 SESSION_REVOKE 推送共用一把锁防帧交错
-func (c *Client) writeControl(msg *protocol.Message) {
+func (c *Client) writeControl(msg *protocol.Message) error {
 	c.ctrlWriteMu.Lock()
 	defer c.ctrlWriteMu.Unlock()
-	protocol.NewCodec().WriteMessage(c.controlStream, msg)
+	return protocol.NewCodec().WriteMessage(c.controlStream, msg)
 }
 
 func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 	dataBytes, _ := json.Marshal(msg.Data)
 	d := &protocol.AllocPortData{}
 	json.Unmarshal(dataBytes, d)
+
+	// 代理被禁用：拒绝分配（1006），seeinps 转入低速重试，启用后自动恢复
+	if p, err := s.store.GetProxy(client.username, d.ProxyID); err == nil && p.Status != 1 {
+		fmt.Printf("[ALLOC] proxy=%s rejected: disabled (user=%s)\n", d.ProxyID, client.username)
+		client.writeControl(protocol.NewResponse(msg, protocol.CodeProxyDisabled, nil))
+		return
+	}
 
 	s.publicMu.RLock()
 	if oldPL, ok := s.publicConnsByProxy[d.ProxyID]; ok {
@@ -856,6 +1741,14 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 		return
 	}
 
+	// 代理上线登记：创建/更新代理记录并开启一条会话（重连复用时不重复开会话）
+	if _, err := s.store.MarkProxyOnline(client.username, d.ProxyID, d.Type, client.remoteAddr); err != nil {
+		log.Printf("[ALLOC] Mark proxy online error: %v", err)
+	}
+	if err := s.store.TrimProxySessions(client.username, d.ProxyID, 50); err != nil {
+		log.Printf("[ALLOC] Trim sessions error: %v", err)
+	}
+
 	fmt.Printf("[ALLOC] proxy=%s type=%s -> port=%d (user=%s)\n", d.ProxyID, d.Type, alloc.Port, client.username)
 	client.writeControl(protocol.NewResponse(msg, protocol.CodeOK, &protocol.AllocPortRespData{ProxyID: d.ProxyID, Port: alloc.Port}))
 }
@@ -869,6 +1762,10 @@ func (s *Server) handleReleasePort(msg *protocol.Message, client *Client) {
 		s.stopPublicListener(alloc.Port)
 	}
 	s.portPool.Release(d.ProxyID)
+	s.flushTraffic(client.username, d.ProxyID)
+	if err := s.store.MarkProxyOffline(client.username, d.ProxyID); err != nil {
+		log.Printf("[RELEASE] Mark proxy offline error: %v", err)
+	}
 	fmt.Printf("[RELEASE] proxy=%s\n", d.ProxyID)
 	client.writeControl(protocol.NewResponse(msg, protocol.CodeOK, nil))
 }
@@ -905,6 +1802,10 @@ func (s *Server) releaseUserPorts(username string) {
 	for _, a := range allocs {
 		s.stopPublicListener(a.Port)
 		s.portPool.Release(a.ProxyID)
+		s.flushTraffic(a.UserID, a.ProxyID)
+		if err := s.store.MarkProxyOffline(a.UserID, a.ProxyID); err != nil {
+			log.Printf("[USER] Mark proxy offline error: %v", err)
+		}
 	}
 }
 
@@ -912,18 +1813,29 @@ func (s *Server) releaseUserPorts(username string) {
 // 防止被顶掉的旧连接延迟退出时误删同用户新注册的 client
 func (s *Server) removeClientIfCurrent(c *Client) {
 	s.clientsMu.Lock()
-	defer s.clientsMu.Unlock()
+	removed := false
 	if cur, ok := s.clients[c.username]; ok && cur == c {
 		delete(s.clients, c.username)
 		s.sessionsMu.Lock()
 		delete(s.sessions, c.sessionID)
 		s.sessionsMu.Unlock()
+		removed = true
+	}
+	s.clientsMu.Unlock()
+	if removed {
+		// seeinps 断开：其全部代理转为离线并关闭会话，流量落库
+		s.flushUserTraffic(c.username)
+		if err := s.store.MarkUserProxiesOffline(c.username); err != nil {
+			log.Printf("[CTRL] Mark user proxies offline error: %v", err)
+		}
 		fmt.Printf("[-] Client disconnected: %s\n", c.username)
 	}
 }
 
 func (s *Server) shutdown() {
 	fmt.Println("[seeinpm] Shutting down...")
+
+	s.flushAllTraffic()
 
 	s.publicMu.Lock()
 	for port, pl := range s.publicConns {
@@ -965,6 +1877,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
 		os.Exit(1)
 	}
+
+	// 运行日志：级别过滤 + 行首时间戳 + 按天/大小轮转（conf [logging] level/max_size/max_backups 生效）
+	logx.Install(cfg.Logging.Path, "seeinpm", cfg.Logging.Level, cfg.Logging.MaxSize, cfg.Logging.MaxBackups)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

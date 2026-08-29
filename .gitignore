@@ -67,3 +67,56 @@ web-ps/dist/
 
 # Go build cache
 .gocache/
+
+# WorkBuddy workspace metadata
+.workbuddy/
+
+# Root-level ad-hoc dev/deploy/debug scripts (project keeps these under scripts/)
+/check_*.py
+/deploy*.py
+/fix_*.py
+/test_*.py
+/debug_*.py
+/verify_*.py
+/force_*.py
+/restart_*.py
+/stop*.py
+/run_*.py
+/start_*.py
+/redeploy_*.py
+/fresh_deploy*.py
+/final_test.py
+/echo_server.py
+/upload_test.py
+/write_store.py
+/add_*.py
+/list_files.py
+/cleanup.py
+/clean_ps_web.py
+/clear_session*.py
+/create_deploy_package.py
+/create_seeinps_api.py
+/detailed_review.py
+/find_config.py
+/find_echo.py
+/improve_shutdown.py
+/rebind_seeinps.py
+/recreate_echo.py
+/remove_import.py
+/test_dashboard_e2e.py
+/update_config.py
+/update_seeinps.py
+
+# Root-level built binaries / archives
+/seeinpm
+/seeinps
+/seeinpc
+/seeinps-deployer
+/*-linux-amd64
+*.zip
+deploy_tmp/
+deploy_out.txt
+
+# E2E runtime data & DB backups
+test/e2e/runtime/*/data/*.bak*
+test/e2e/runtime/ps/data/

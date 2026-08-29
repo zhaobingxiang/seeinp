@@ -60,6 +60,15 @@ func (s *PSStore) migrate() error {
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS local_audit_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT NOT NULL,
+			action TEXT NOT NULL,
+			target TEXT NOT NULL DEFAULT '',
+			detail TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_ps_audit_created ON local_audit_logs(created_at DESC)`,
 	}
 	for _, q := range queries {
 		if _, err := s.db.Exec(q); err != nil {
@@ -235,4 +244,93 @@ func (s *PSStore) UpdateLocalAuthCode(code string) error {
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// ==================== 本地操作审计日志（local_audit_logs） ====================
+
+// PSAuditLog seeinps B端操作审计记录；Detail 只存非敏感摘要
+type PSAuditLog struct {
+	ID        int64
+	Username  string
+	Action    string
+	Target    string
+	Detail    string
+	CreatedAt int64
+}
+
+func (s *PSStore) InsertAuditLog(username, action, target, detail string) error {
+	_, err := s.db.Exec("INSERT INTO local_audit_logs (username, action, target, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+		username, action, target, detail, time.Now().Unix())
+	return err
+}
+
+// PSAuditFilter 本地审计日志查询条件
+type PSAuditFilter struct {
+	Username  string
+	Action    string
+	Keyword   string // 模糊匹配 username/action/target/detail
+	StartTime int64  // Unix 秒，0=不限
+	EndTime   int64  // Unix 秒，0=不限
+	Page      int
+	PageSize  int
+}
+
+func (s *PSStore) ListAuditLogs(f PSAuditFilter) ([]*PSAuditLog, int64, error) {
+	if f.Page < 1 {
+		f.Page = 1
+	}
+	if f.PageSize < 1 || f.PageSize > 200 {
+		f.PageSize = 20
+	}
+	where := " WHERE 1=1"
+	args := []interface{}{}
+	if f.Username != "" {
+		where += " AND username = ?"
+		args = append(args, f.Username)
+	}
+	if f.Action != "" {
+		where += " AND action = ?"
+		args = append(args, f.Action)
+	}
+	if f.Keyword != "" {
+		where += " AND (username LIKE ? OR action LIKE ? OR target LIKE ? OR detail LIKE ?)"
+		kw := "%" + f.Keyword + "%"
+		args = append(args, kw, kw, kw, kw)
+	}
+	if f.StartTime > 0 {
+		where += " AND created_at >= ?"
+		args = append(args, f.StartTime)
+	}
+	if f.EndTime > 0 {
+		where += " AND created_at <= ?"
+		args = append(args, f.EndTime)
+	}
+	var total int64
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM local_audit_logs"+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	query := "SELECT id, username, action, target, COALESCE(detail,''), created_at FROM local_audit_logs" + where + " ORDER BY id DESC LIMIT ? OFFSET ?"
+	args = append(args, f.PageSize, (f.Page-1)*f.PageSize)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var list []*PSAuditLog
+	for rows.Next() {
+		a := &PSAuditLog{}
+		if err := rows.Scan(&a.ID, &a.Username, &a.Action, &a.Target, &a.Detail, &a.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		list = append(list, a)
+	}
+	return list, total, rows.Err()
+}
+
+func (s *PSStore) CleanupAuditLogs(cutoff int64) (int64, error) {
+	res, err := s.db.Exec("DELETE FROM local_audit_logs WHERE created_at < ?", cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

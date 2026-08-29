@@ -21,6 +21,7 @@ import (
 	"github.com/hashicorp/yamux"
 	"github.com/seeinp/seeinp/internal/auth"
 	"github.com/seeinp/seeinp/internal/config"
+	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/mux"
 	"github.com/seeinp/seeinp/internal/protocol"
 	"github.com/seeinp/seeinp/internal/store"
@@ -37,6 +38,8 @@ type Client struct {
 	sessionID string
 	// revoked: 授权码被重置（停止重连，等待 B端重新绑定）；用户禁用走低速重试等管理员启用
 	revoked atomic.Bool
+	// lastPing: 最近一次心跳成功时间（unix 秒），供 B端仪表盘展示
+	lastPing atomic.Int64
 
 	// rootCtx 为 main 的生命周期 ctx；controlEpoch 用于重绑后重启控制循环并让旧循环退出
 	rootCtx       context.Context
@@ -112,9 +115,13 @@ type controlLink struct {
 	pending   map[string]chan *protocol.Message
 	done      chan struct{}
 	closeOnce sync.Once
+	// client 指向所属 Client（日志拉取等回调用），由 connectOnce 赋值
+	client *Client
 	// onRevoke 收到 SESSION_REVOKE 时回调（参数为 reason）；
 	// auth_code_reset 停止重连等 B端重绑，user_disabled 断开后低速重试
 	onRevoke func(reason string)
+	// onProxyRevoke 收到 PROXY_REVOKE 时回调（代理被 seeinpm 禁用）：清除转发端口转入重试
+	onProxyRevoke func(proxyID, reason string)
 }
 
 func newControlLink(stream net.Conn) *controlLink {
@@ -183,6 +190,36 @@ func (l *controlLink) readLoop() {
 			l.close()
 			return
 		}
+		// 代理被 seeinpm 禁用：清除该代理的转发端口，由 resyncLoop 低速重试
+		if msg.Type == protocol.TypeProxyRevoke {
+			proxyID, reason := "", ""
+			if m, ok := msg.Data.(map[string]interface{}); ok {
+				if v, ok := m["proxyId"].(string); ok {
+					proxyID = v
+				}
+				if v, ok := m["reason"].(string); ok {
+					reason = v
+				}
+			}
+			fmt.Printf("[CTRL] PROXY_REVOKE received (proxy=%s, reason=%s)\n", proxyID, reason)
+			if l.onProxyRevoke != nil {
+				l.onProxyRevoke(proxyID, reason)
+			}
+			continue
+		}
+		// A 端按需拉取 B 端运行日志（混合架构：运行日志留本地，PM 侧经控制通道读取）
+		if msg.Type == protocol.TypeLogListReq {
+			if c := l.client; c != nil {
+				l.send(c.handleLogListReq(msg))
+			}
+			continue
+		}
+		if msg.Type == protocol.TypeLogContentReq {
+			if c := l.client; c != nil {
+				l.send(c.handleLogContentReq(msg))
+			}
+			continue
+		}
 		l.pendingMu.Lock()
 		ch, ok := l.pending[msg.ID]
 		l.pendingMu.Unlock()
@@ -223,6 +260,8 @@ func (c *Client) setLink(l *controlLink, sessionID string) {
 	c.link = l
 	c.sessionID = sessionID
 	c.linkMu.Unlock()
+	// 连接建立即视为一次成功心跳，后续由 heartbeatLoop 每 10s 刷新
+	c.lastPing.Store(time.Now().Unix())
 }
 
 func (c *Client) clearLink(l *controlLink) {
@@ -354,11 +393,20 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	}
 
 	link := newControlLink(controlStream)
+	link.client = c
 	// 授权码重置为终态；用户禁用断开后下一轮注册收 1003 转入低速重试
 	link.onRevoke = func(reason string) {
 		if reason == "auth_code_reset" {
 			c.revoked.Store(true)
 		}
+	}
+	// 代理被 seeinpm 禁用：清除内存中的转发端口，resyncLoop 会周期重试（启用后自动恢复）
+	link.onProxyRevoke = func(proxyID, reason string) {
+		c.proxiesMu.Lock()
+		if p, ok := c.proxies[proxyID]; ok {
+			p.ForwardPort = 0
+		}
+		c.proxiesMu.Unlock()
 	}
 	go link.readLoop()
 	go c.acceptDataStreams(session)
@@ -369,6 +417,7 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	}()
 
 	c.syncProxies(link)
+	go c.resyncLoop(ctx, link)
 	return c.heartbeatLoop(ctx, link)
 }
 
@@ -456,6 +505,34 @@ func (c *Client) syncProxies(link *controlLink) {
 	}
 }
 
+// resyncLoop 周期重试未分配到端口的代理（初次失败/被禁用后），连接断开即退出
+func (c *Client) resyncLoop(ctx context.Context, link *controlLink) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-link.done:
+			return
+		case <-ticker.C:
+			c.proxiesMu.RLock()
+			var pending []*Proxy
+			for _, p := range c.proxies {
+				if p.ForwardPort <= 0 {
+					pending = append(pending, p)
+				}
+			}
+			c.proxiesMu.RUnlock()
+			for _, p := range pending {
+				if _, err := c.allocProxy(link, p); err != nil {
+					fmt.Printf("[RESYNC] %s alloc failed: %v\n", p.ID, err)
+				}
+			}
+		}
+	}
+}
+
 func (c *Client) allocProxy(link *controlLink, p *Proxy) (int, error) {
 	msg := protocol.NewMessage(protocol.TypeAllocPort, &protocol.AllocPortData{ProxyID: p.ID, Type: p.Type})
 	resp, err := link.request(msg, 10*time.Second)
@@ -466,6 +543,14 @@ func (c *Client) allocProxy(link *controlLink, p *Proxy) (int, error) {
 		code := 0
 		if resp.Code != nil {
 			code = int(*resp.Code)
+		}
+		// 分配失败：清除转发端口标记，交给 resyncLoop 周期重试
+		c.proxiesMu.Lock()
+		p.ForwardPort = 0
+		c.proxiesMu.Unlock()
+		// 1006：代理被 seeinpm 禁用，低速重试，管理员启用后自动恢复
+		if code == int(protocol.CodeProxyDisabled) {
+			return 0, fmt.Errorf("ALLOC_PORT rejected: proxy disabled on seeinpm (code=1006)")
 		}
 		return 0, fmt.Errorf("ALLOC_PORT code=%d", code)
 	}
@@ -510,6 +595,7 @@ func (c *Client) heartbeatLoop(ctx context.Context, link *controlLink) error {
 				link.close()
 				return fmt.Errorf("heartbeat: %w", err)
 			}
+			c.lastPing.Store(time.Now().Unix())
 		case <-link.done:
 			return fmt.Errorf("control link closed")
 		}
@@ -582,6 +668,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	// 运行日志：级别过滤 + 行首时间戳 + 按天/大小轮转（conf [logging] level/max_size/max_backups 生效）
+	logx.Install(cfg.Logging.Path, "seeinps", cfg.Logging.Level, cfg.Logging.MaxSize, cfg.Logging.MaxBackups)
 	psStore, err := store.NewPS("data/seeinps.db")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -617,5 +705,24 @@ func main() {
 
 	// 控制循环终止（授权码被重置等）不退出进程：B端 web 保持可用，等待重绑授权码
 	client.StartControlLoop()
+
+	// 每小时清理 90 天前的本地审计日志
+	go func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n, err := psStore.CleanupAuditLogs(time.Now().Add(-90 * 24 * time.Hour).Unix()); err != nil {
+					fmt.Printf("[CLEANUP] audit logs: %v\n", err)
+				} else if n > 0 {
+					fmt.Printf("[CLEANUP] Removed %d audit logs over 90 days\n", n)
+				}
+			}
+		}
+	}()
+
 	<-ctx.Done()
 }

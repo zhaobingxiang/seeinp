@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -8,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/seeinp/seeinp/internal/auth"
+	"github.com/seeinp/seeinp/internal/protocol"
 	"github.com/seeinp/seeinp/internal/store"
 	"github.com/seeinp/seeinp/internal/version"
 )
@@ -85,6 +88,9 @@ func (c *Client) startLocalServer() error {
 	mux.HandleFunc("DELETE /api/v1/proxies/{id}", c.requireAuth(c.handleProxyDelete))
 	mux.HandleFunc("GET /api/v1/status", c.requireAuth(c.handleStatus))
 	mux.HandleFunc("GET /api/v1/stats", c.requireAuth(c.handleStats))
+	mux.HandleFunc("GET /api/v1/audit-logs", c.requireAuth(c.handleAuditLogs))
+	mux.HandleFunc("GET /api/v1/logs", c.requireAuth(c.handleListLogFiles))
+	mux.HandleFunc("GET /api/v1/logs/content", c.requireAuth(c.handleLogFileContent))
 
 	for _, dir := range []string{"web", "web-ps/dist", "/root/seeinp/web"} {
 		if _, err := os.Stat(dir); err == nil {
@@ -122,6 +128,11 @@ func (c *Client) serveWeb(mux *http.ServeMux, webDir string) {
 	fmt.Printf("[B端] Serving web from %s\n", webDir)
 }
 
+type ctxKey string
+
+const operatorKey ctxKey = "operator"
+
+// requireAuth 校验 JWT 并把操作者用户名放入 context，供审计埋点取用
 func (c *Client) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -129,12 +140,70 @@ func (c *Client) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, 1003, "未登录")
 			return
 		}
-		if _, err := c.jwt.ValidateToken(token); err != nil {
+		claims, err := c.jwt.ValidateToken(token)
+		if err != nil {
 			writeErr(w, http.StatusUnauthorized, 1003, "登录已过期，请重新登录")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), operatorKey, claims.Username)))
 	}
+}
+
+// operatorFrom 从 context 取当前操作者（审计埋点用）
+func operatorFrom(r *http.Request) string {
+	if v, ok := r.Context().Value(operatorKey).(string); ok {
+		return v
+	}
+	return "unknown"
+}
+
+// audit 写一条本地操作审计记录（自动附加来源 IP）并上报 seeinpm（混合架构）；
+// 失败只打日志不影响主流程
+func (c *Client) audit(r *http.Request, action, target, detail string) {
+	ip := clientIP(r)
+	if detail != "" {
+		detail += "; "
+	}
+	detail += "ip=" + ip
+	c.auditRecord(operatorFrom(r), action, target, detail, time.Now().Unix())
+}
+
+// auditPlain 无 JWT 场景（登录/初始化）的审计记录，操作者取自请求参数（detail 需自带 ip=）
+func (c *Client) auditPlain(username, action, detail string, r *http.Request) {
+	c.auditRecord(username, action, "", detail, time.Now().Unix())
+}
+
+// clientIP 从请求取客户端 IP（去掉端口）
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// auditRecord 落库本地审计并异步上报 seeinpm（AUDIT_SYNC）
+func (c *Client) auditRecord(username, action, target, detail string, createdAt int64) {
+	if err := c.store.InsertAuditLog(username, action, target, detail); err != nil {
+		fmt.Printf("[AUDIT] insert error: %v\n", err)
+	}
+	// 混合架构：本地已落库，控制连接可用时异步上报，失败不影响主流程（PM 端可按 username 区分来源）
+	go func() {
+		if link := c.getLink(); link != nil {
+			msg := protocol.NewMessage(protocol.TypeAuditSync, &protocol.AuditSyncData{
+				Items: []protocol.AuditSyncItem{{
+					Username:  username,
+					Action:    action,
+					Target:    target,
+					Detail:    detail,
+					CreatedAt: createdAt,
+				}},
+			})
+			if err := link.send(msg); err != nil {
+				fmt.Printf("[AUDIT] sync to seeinpm error: %v\n", err)
+			}
+		}
+	}()
 }
 
 func (c *Client) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -195,6 +264,7 @@ func (c *Client) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Printf("[INIT] Local user initialized: %s\n", req.Username)
+	c.auditPlain(req.Username, "auth_init", "ip="+r.RemoteAddr, r)
 	token, _ := c.jwt.GenerateAccessToken(req.Username, "ps")
 	// 授权码可能是在离线/被吊销状态下更新的：立即重启控制循环用新凭证注册
 	c.restartControl()
@@ -224,6 +294,7 @@ func (c *Client) handleAuthRebind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Println("[REBIND] Auth code updated via web console; restarting control loop")
+	c.audit(r, "auth_rebind", "", "ip="+r.RemoteAddr)
 	c.restartControl()
 	writeOK(w, map[string]interface{}{"restarted": true})
 }
@@ -243,6 +314,7 @@ func (c *Client) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Username != u.Username || !auth.CheckPassword(req.Password, u.PasswordHash) {
+		c.auditPlain(req.Username, "login_failed", "ip="+r.RemoteAddr, r)
 		writeErr(w, http.StatusUnauthorized, 1001, "用户名或密码错误")
 		return
 	}
@@ -251,6 +323,7 @@ func (c *Client) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, 5000, "生成令牌失败")
 		return
 	}
+	c.auditPlain(u.Username, "login", "ip="+r.RemoteAddr, r)
 	writeOK(w, map[string]interface{}{"token": token})
 }
 
@@ -487,6 +560,7 @@ func (c *Client) handleProxyCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	c.audit(r, "proxy_create", req.ID, fmt.Sprintf("%s -> %s:%d", req.Type, req.LocalAddr, req.LocalPort))
 	writeOK(w, proxyJSON(p))
 }
 
@@ -547,6 +621,7 @@ func (c *Client) handleProxyUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, 5000, "更新代理失败")
 		return
 	}
+	c.audit(r, "proxy_update", id, fmt.Sprintf("from %s:%d to %s:%d", old.LocalAddr, old.LocalPort, req.LocalAddr, req.LocalPort))
 	writeOK(w, proxyJSON(p))
 }
 
@@ -571,6 +646,11 @@ func (c *Client) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Printf("[PROXY] Deleted: %s\n", id)
+	detail := ""
+	if p.ForwardPort > 0 {
+		detail = fmt.Sprintf("type=%s forward_port=%d", p.Type, p.ForwardPort)
+	}
+	c.audit(r, "proxy_delete", id, detail)
 	writeOK(w, nil)
 }
 
@@ -590,6 +670,8 @@ func (c *Client) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"status":        status,
 		"sessionId":     sessionID,
 		"username":      username,
+		"serverAddr":    c.config.Server.ServerAddr,
+		"lastPing":      c.lastPing.Load(),
 		"authCodeReset": c.revoked.Load(),
 	})
 }
@@ -599,4 +681,192 @@ func (c *Client) handleStats(w http.ResponseWriter, r *http.Request) {
 	n := len(c.proxies)
 	c.proxiesMu.RUnlock()
 	writeOK(w, map[string]interface{}{"connections": 0, "traffic": 0, "proxies": n})
+}
+
+// handleAuditLogs 分页查询本地操作审计日志（?username=&action=&keyword=&start_time=&end_time=&page=&page_size=）
+func (c *Client) handleAuditLogs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	pageSize, _ := strconv.Atoi(q.Get("page_size"))
+	start, _ := strconv.ParseInt(q.Get("start_time"), 10, 64)
+	end, _ := strconv.ParseInt(q.Get("end_time"), 10, 64)
+	list, total, err := c.store.ListAuditLogs(store.PSAuditFilter{
+		Username:  q.Get("username"),
+		Action:    q.Get("action"),
+		Keyword:   q.Get("keyword"),
+		StartTime: start,
+		EndTime:   end,
+		Page:      page,
+		PageSize:  pageSize,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, 5000, "查询审计日志失败")
+		return
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 200 {
+		pageSize = 20
+	}
+	type auditResp struct {
+		ID        int64  `json:"id"`
+		Username  string `json:"username"`
+		Action    string `json:"action"`
+		Target    string `json:"target"`
+		Detail    string `json:"detail"`
+		CreatedAt int64  `json:"createdAt"`
+	}
+	items := make([]auditResp, 0, len(list))
+	for _, a := range list {
+		items = append(items, auditResp{ID: a.ID, Username: a.Username, Action: a.Action, Target: a.Target, Detail: a.Detail, CreatedAt: a.CreatedAt})
+	}
+	writeOK(w, map[string]interface{}{"list": items, "total": total, "page": page, "pageSize": pageSize})
+}
+
+const psLogsDir = "logs"
+
+// psListLogFiles 列出 logs 目录下的 .log 文件
+func (c *Client) psListLogFiles() ([]protocol.LogFileInfo, error) {
+	entries, err := os.ReadDir(psLogsDir)
+	if err != nil {
+		return nil, err
+	}
+	list := make([]protocol.LogFileInfo, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		list = append(list, protocol.LogFileInfo{Name: e.Name(), Size: info.Size(), Modified: info.ModTime().Unix()})
+	}
+	return list, nil
+}
+
+// handleListLogFiles 列出 logs 目录下的 .log 文件
+func (c *Client) handleListLogFiles(w http.ResponseWriter, r *http.Request) {
+	list, err := c.psListLogFiles()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, 5000, "读取日志目录失败")
+		return
+	}
+	writeOK(w, list)
+}
+
+// tailLines 读文件尾部至多 maxLines 行（大文件只读末尾 2MB 避免整读）
+func tailLines(path string, maxLines int, tailBytes int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	size := info.Size()
+	offset := int64(0)
+	if size > tailBytes {
+		offset = size - tailBytes
+	}
+	buf := make([]byte, size-offset)
+	if _, err := f.ReadAt(buf, offset); err != nil && err.Error() != "EOF" {
+		return "", err
+	}
+	content := string(buf)
+	if offset > 0 {
+		if idx := strings.Index(content, "\n"); idx >= 0 {
+			content = content[idx+1:]
+		}
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+// psReadLogContent 读取日志文件内容：keyword 非空时只返回匹配行；download=true 返回全文（限制 50MB）
+func (c *Client) psReadLogContent(name string, lines int, keyword string, download bool) (string, error) {
+	// 只允许 logs 目录下的纯 .log 文件名，防目录穿越
+	if name == "" || name != filepath.Base(name) || !strings.HasSuffix(name, ".log") || strings.Contains(name, "..") {
+		return "", fmt.Errorf("非法文件名")
+	}
+	if lines < 1 {
+		lines = 200
+	}
+	if lines > 2000 {
+		lines = 2000
+	}
+	if download {
+		info, err := os.Stat(filepath.Join(psLogsDir, name))
+		if err != nil {
+			return "", err
+		}
+		if info.Size() > 50*1024*1024 {
+			return "", fmt.Errorf("文件过大，不支持整文件下载")
+		}
+		b, err := os.ReadFile(filepath.Join(psLogsDir, name))
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	content, err := tailLines(filepath.Join(psLogsDir, name), lines, 2*1024*1024)
+	if err != nil {
+		return "", err
+	}
+	if keyword != "" {
+		rows := strings.Split(content, "\n")
+		kept := make([]string, 0, len(rows))
+		for _, ln := range rows {
+			if strings.Contains(ln, keyword) {
+				kept = append(kept, ln)
+			}
+		}
+		content = strings.Join(kept, "\n")
+	}
+	return content, nil
+}
+
+// handleLogFileContent 尾部读取运行日志（?file=seeinps.log&lines=500&keyword=&download=1）
+func (c *Client) handleLogFileContent(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	name := q.Get("file")
+	lines, _ := strconv.Atoi(q.Get("lines"))
+	content, err := c.psReadLogContent(name, lines, q.Get("keyword"), q.Get("download") == "1")
+	if err != nil {
+		writeErr(w, http.StatusNotFound, 2004, "文件不存在或参数非法")
+		return
+	}
+	writeOK(w, map[string]string{"file": name, "content": content})
+}
+
+// handleLogListReq 控制通道：A 端请求 B 端日志文件列表（LOG_LIST_REQ -> LOG_LIST_RESP）
+func (c *Client) handleLogListReq(msg *protocol.Message) *protocol.Message {
+	files, err := c.psListLogFiles()
+	code := int(protocol.CodeOK)
+	if err != nil {
+		code = int(protocol.CodeInternal)
+	}
+	// 注意：显式用 LOG_LIST_RESP 类型（NewResponse 会生成 REQ_RESP 后缀，与 A 端期待不符）
+	return &protocol.Message{Type: protocol.TypeLogListResp, ID: msg.ID, Ts: time.Now().Unix(),
+		Code: &code, Data: &protocol.LogListRespData{Files: files}}
+}
+
+// handleLogContentReq 控制通道：A 端请求 B 端日志文件内容（LOG_CONTENT_REQ -> LOG_CONTENT_RESP）
+func (c *Client) handleLogContentReq(msg *protocol.Message) *protocol.Message {
+	b, _ := json.Marshal(msg.Data)
+	req := &protocol.LogContentReqData{}
+	json.Unmarshal(b, req)
+	content, err := c.psReadLogContent(req.File, req.Lines, "", false)
+	code := int(protocol.CodeOK)
+	if err != nil {
+		code = int(protocol.CodeBadRequest)
+	}
+	return &protocol.Message{Type: protocol.TypeLogContentResp, ID: msg.ID, Ts: time.Now().Unix(),
+		Code: &code, Data: &protocol.LogContentRespData{File: req.File, Content: content}}
 }
