@@ -706,6 +706,14 @@ func main() {
 		os.Exit(1)
 	}
 	// 运行日志：级别过滤 + 行首时间戳 + 按天/大小轮转（conf [logging] level/max_size/max_backups 生效）
+	// 单实例锁：重复启动会互踢（1002）并抢占 B 端端口，直接拒绝第二个实例
+	instanceLock, err := acquireInstanceLock("data/seeinps.lock")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: another seeinps instance is running (%v), exiting\n", err)
+		os.Exit(1)
+	}
+	defer instanceLock.Close()
+
 	logx.Install(cfg.Logging.Path, "seeinps", cfg.Logging.Level, cfg.Logging.MaxSize, cfg.Logging.MaxBackups)
 	psStore, err := store.NewPS("data/seeinps.db")
 	if err != nil {
@@ -734,6 +742,8 @@ func main() {
 	}
 	client.migrateLegacyLocalUser()
 
+	// B 端绑定失败（如端口被占）不退出进程：代理与控制通道不受影响，
+	// startLocalServer 内部每 5s 重试绑定，端口释放后管理页自动恢复
 	go func() {
 		if err := client.startLocalServer(); err != nil {
 			fmt.Printf("[B端] local server error: %v\n", err)

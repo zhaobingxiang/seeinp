@@ -107,17 +107,28 @@ func (c *Client) startLocalServer() error {
 	fmt.Printf("[B端] Serving embedded web (version %s)\n", version.Version)
 
 	addr := c.config.Local.BendAddr
-	fmt.Printf("[B端] Listening on %s\n", addr)
 
 	server := &http.Server{
-		Addr:         addr,
+		Addr:    addr,
 		// gzip：前端产物与 API 响应压缩（窄带链路下体积 -60% 以上）
-		Handler:      gzhttp.Handler(mux),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Handler: gzhttp.Handler(mux),
+		// 超时按慢链路适配：B 端要承载 200MB 升级包上传（Read）与文件/日志下载（Write）
+		ReadTimeout:  30 * time.Minute,
+		WriteTimeout: 10 * time.Minute,
+		IdleTimeout:  120 * time.Second,
 	}
-	return server.ListenAndServe()
+
+	// 绑定失败（如端口被残留实例占用）不退出进程：代理与控制通道不受影响，
+	// 每 5s 重试绑定，端口释放后管理页自动恢复
+	for {
+		fmt.Printf("[B端] Listening on %s\n", addr)
+		err := server.ListenAndServe()
+		if err == http.ErrServerClosed {
+			return err
+		}
+		fmt.Printf("[B端] Listen failed: %v, retry in 5s\n", err)
+		time.Sleep(5 * time.Second)
+	}
 }
 
 type ctxKey string

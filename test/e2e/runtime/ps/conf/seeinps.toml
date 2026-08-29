@@ -5,7 +5,7 @@ server_addr = "127.0.0.1:999"
 
 [auth]
 username = "user1"
-auth_code = "seeinp_b0a258d4b0cd5b431b26ca7365cd0bd31eed500e6a90d2040afc602a3128418d"
+auth_code = "seeinp_dcfded3f5f4c04f9ea6120459897805e82a4e745f76ede5a256e9c5aeef00f6b"
 
 [tls]
 enabled = true
