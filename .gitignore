@@ -129,3 +129,4 @@ internal/webui/ps/files/*
 
 # e2e runtime release packages
 test/e2e/runtime/pm/data/releases/
+patch_frontend.py

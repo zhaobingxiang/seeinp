@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/seeinp/seeinp/internal/protocol"
+	versionpkg "github.com/seeinp/seeinp/internal/version"
 )
 
 // selfUpgrade B 端自主升级状态（自上传 / 从 seeinpm 拉取，内存态）。
@@ -126,14 +127,25 @@ func (c *Client) handleSelfUpgrade(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	version = strings.TrimSpace(version)
-	if !selfVersionRe.MatchString(version) {
-		os.Remove(upgradeTmpPath)
-		writeErr(w, http.StatusBadRequest, 2002, "版本号格式应为五段数字，如 1.0.26.0830.01")
-		return
-	}
 	if size <= 0 || size > maxUpgradeSize {
 		os.Remove(upgradeTmpPath)
 		writeErr(w, http.StatusBadRequest, 2000, "安装包为空或超过 200MB 限制")
+		return
+	}
+	// 自动识别包内版本（构建时注入 seeinp-version: 标识）；手填了则校验一致
+	detected, derr := versionpkg.ExtractVersionFromFile(upgradeTmpPath)
+	if derr == nil && detected != "" {
+		if version == "" {
+			version = detected
+		} else if version != detected {
+			os.Remove(upgradeTmpPath)
+			writeErr(w, http.StatusBadRequest, 2002,
+				fmt.Sprintf("包内版本为 %s，与填写的 %s 不一致，请修正后重试", detected, version))
+			return
+		}
+	} else if version == "" {
+		os.Remove(upgradeTmpPath)
+		writeErr(w, http.StatusBadRequest, 2002, "无法识别包内版本，请使用 scripts/build.sh 构建或手动填写版本号")
 		return
 	}
 

@@ -15,7 +15,7 @@ TARGETS=${2:-all}
 GOARCH=${ARCH:-amd64}
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS="-X github.com/seeinp/seeinp/internal/version.Version=${VERSION} -X github.com/seeinp/seeinp/internal/version.Commit=${COMMIT} -X github.com/seeinp/seeinp/internal/version.BuildTime=${BUILD_TIME}"
+LDFLAGS="-X github.com/seeinp/seeinp/internal/version.Version=${VERSION} -X github.com/seeinp/seeinp/internal/version.Banner=seeinp-version:${VERSION} -X github.com/seeinp/seeinp/internal/version.Commit=${COMMIT} -X github.com/seeinp/seeinp/internal/version.BuildTime=${BUILD_TIME}"
 
 build_frontend() {
   echo ">> 构建前端并嵌入二进制（web-pm / web-ps）"

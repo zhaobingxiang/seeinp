@@ -111,8 +111,8 @@
           <div class="form-tip">必须与目标 seeinps 节点的操作系统和架构一致，否则升级时会被拒绝</div>
         </el-form-item>
         <el-form-item label="版本号" prop="version">
-          <el-input v-model="uploadForm.version" placeholder="如 1.0.26.0829.01" />
-          <div class="form-tip">五段数字：大版本.大版本.年.月日.当日序号，如 1.0.26.0829.01 表示 2026-08-29 当天第 1 个版本；同一版本号可分别上传多个平台的包</div>
+          <el-input v-model="uploadForm.version" placeholder="留空自动识别包内版本" />
+          <div class="form-tip">五段数字（大版本.大版本.年.月日.当日序号），留空将自动从包内识别；填写了则校验与包内一致；同一版本号可分别上传多个平台的包</div>
         </el-form-item>
         <el-form-item label="更新说明" prop="note">
           <el-input v-model="uploadForm.note" type="textarea" :rows="3" placeholder="本次版本更新的内容摘要（可选）" />
@@ -161,11 +161,13 @@
           <span style="font-family:var(--font-mono,monospace)">{{ upgradeTargetVersion }}</span>
         </div>
         <el-progress :percentage="upgradePercent"
-          :status="upgradeFailed ? 'exception' : (upgradeStage === 'verified' ? 'success' : undefined)" style="width:100%" />
+          :status="upgradeFailed ? 'exception' : (upgradeDone ? 'success' : undefined)" style="width:100%" />
         <div class="form-tip" style="margin-top:10px">
           {{ upgradeStageText }}
           <span v-if="upgradeStage === 'transferring'">（{{ formatSize(upgradeProgressSent) }} / {{ formatSize(upgradeProgressTotal) }}）</span>
         </div>
+        <el-alert v-if="upgradeDone" type="success" :closable="false" style="margin-top:10px"
+          :title="`✅ 升级完成，节点已运行 ${upgradeTargetVersion}，代理已自动恢复`" />
         <el-alert v-if="upgradeFailed" type="error" :closable="false" :title="'升级失败：' + upgradeErrMsg" style="margin-top:10px" />
       </template>
       <template #footer>
@@ -221,10 +223,9 @@ const uploadRules: FormRules = {
   version: [
     {
       validator: (_r: any, v: string, cb: any) => {
-const [upGoos, upGoarch] = uploadForm.platform.split('/')
-      if (!v) return cb(new Error('请输入版本号'))
-      if (!/^\d{1,4}(\.\d{1,4}){4}$/.test(v)) return cb(new Error('版本号须为五段数字，如 1.0.26.0829.01'))
-      if (versions.value.some((x: any) => x.version === v && x.goos === upGoos && x.goarch === upGoarch)) return cb(new Error('该版本号的此平台包已存在'))
+        const [upGoos, upGoarch] = uploadForm.platform.split('/')
+        if (v && !/^\d{1,4}(\.\d{1,4}){4}$/.test(v)) return cb(new Error('版本号须为五段数字，如 1.0.26.0829.01'))
+        if (versions.value.some((x: any) => x.version === v && x.goos === upGoos && x.goarch === upGoarch)) return cb(new Error('该版本号的此平台包已存在'))
         cb()
       },
       trigger: 'blur'
@@ -392,6 +393,7 @@ const openUpgrade = (row: any) => {
     }
   }
   upgradePhase.value = 'confirm'
+  upgradeDone.value = false
   showUpgrade.value = true
 }
 
@@ -436,14 +438,19 @@ let upgradeWatchTimer: number | undefined
 
 const upgradeFailed = computed(() => upgradeStage.value === 'failed')
 
-const upgradeStageText = computed(() => ({
-  none: '等待开始…',
-  notifying: '正在通知节点…',
-  transferring: '正在传输升级包',
-  sent: '传输完成，等待节点校验…',
-  verified: '校验通过，节点正在重启恢复…',
-  failed: '升级失败'
-}[upgradeStage.value] || upgradeStage.value))
+const upgradeDone = ref(false)
+
+const upgradeStageText = computed(() => {
+  if (upgradeDone.value) return '✅ 升级完成'
+  return ({
+    none: '等待开始…',
+    notifying: '正在通知节点…',
+    transferring: '正在传输升级包',
+    sent: '传输完成，等待节点校验…',
+    verified: '校验通过，节点正在重启恢复…',
+    failed: '升级失败'
+  }[upgradeStage.value] || upgradeStage.value)
+})
 
 const upgradePercent = computed(() => {
   if (upgradeStage.value === 'verified') return 100
@@ -517,6 +524,8 @@ const watchNodeVersion = () => {
     const row = clients.value.find((c: any) => c.username === upgradeForm.username)
     if (row && row.version === upgradeTargetVersion.value) {
       stopUpgradeWatch()
+      stopUpgradePoll()
+      upgradeDone.value = true
       ElMessage.success(`升级完成：节点已运行 ${upgradeTargetVersion.value}，代理已自动恢复`)
     } else if (waited > 180) {
       stopUpgradeWatch()

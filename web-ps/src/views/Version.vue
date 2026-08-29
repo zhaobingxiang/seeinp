@@ -7,10 +7,19 @@
         <el-tag size="small" style="font-family:var(--font-mono,monospace)">{{ currentVersion || '-' }}</el-tag>
       </div>
       <div class="form-tip" style="margin-top:10px">
-        支持两种升级方式：直接上传新版本包（与节点平台一致），或从 seeinpm 版本库拉取。升级过程中全部代理会短暂断开，完成后自动恢复。
+        支持两种升级方式：直接上传新版本包（版本号自动从包内识别），或从 seeinpm 版本库拉取。升级过程中全部代理会短暂断开，完成后自动恢复。
       </div>
-      <el-alert v-if="upStage === 'applying'" type="success" :closable="false" style="margin-top:12px"
+      <template v-if="upStage === 'pulling' || upStage === 'receiving'">
+        <el-progress :percentage="upPercent" style="width:100%;margin-top:14px" />
+        <div class="form-tip" style="margin-top:6px">
+          正在从 seeinpm 拉取升级包{{ upTargetVersion ? '（目标版本 ' + upTargetVersion + '）' : '' }}：{{ formatSize(upDoneBytes) }} / {{ formatSize(upTotalBytes) }}
+        </div>
+      </template>
+      <el-progress v-if="upStage === 'applying'" :percentage="100" status="success" style="width:100%;margin-top:14px" />
+      <el-alert v-if="upStage === 'applying'" type="success" :closable="false" style="margin-top:8px"
         title="升级包校验通过，节点正在重启恢复（约 1 分钟内自动恢复全部代理）" />
+      <el-alert v-if="upDone" type="success" :closable="false" style="margin-top:12px"
+        :title="`✅ 升级完成，节点已运行 ${currentVersion}，代理已自动恢复`" />
       <el-alert v-if="upStage === 'failed'" type="error" :closable="false" style="margin-top:12px"
         :title="'升级失败：' + upErrMsg" />
     </div>
@@ -56,11 +65,8 @@
         <span>上传版本包升级</span>
       </div>
       <el-form label-width="90px" style="max-width:560px">
-        <el-form-item label="版本号">
-          <el-input v-model="uploadVersion" placeholder="如 1.0.26.0830.01" />
-          <div class="form-tip">五段数字：大版本.大版本.年.月日.当日序号；包平台必须与本节点（{{ nodePlatform }}）一致</div>
-        </el-form-item>
         <el-form-item label="安装包">
+          <div class="form-tip" style="margin-bottom:6px">版本号将自动从包内识别；包平台必须与本节点（{{ nodePlatform }}）一致</div>
           <el-upload ref="uploadRef" :limit="1" :auto-upload="false" :on-change="onFileChange" :on-remove="() => uploadFile = null"
             :disabled="busy" drag style="width:100%">
             <div style="padding:12px 0">拖拽或点击选择 seeinps 二进制文件（≤200MB）</div>
@@ -90,7 +96,6 @@ const nodePlatform = ref('')
 const pmVersions = ref<any[]>([])
 const pmLoading = ref(false)
 
-const uploadVersion = ref('')
 const uploadFile = ref<any>(null)
 const uploadPercent = ref(0)
 const uploadRef = ref()
@@ -100,6 +105,7 @@ const upErrMsg = ref('')
 const upDoneBytes = ref(0)
 const upTotalBytes = ref(0)
 const upTargetVersion = ref('')
+const upDone = ref(false)
 
 const busy = computed(() => upStage.value === 'pulling' || upStage.value === 'receiving' || upStage.value === 'applying' || uploadingNow.value)
 const uploadingNow = ref(false)
@@ -166,6 +172,7 @@ const pollStatus = () => {
         stopPoll()
         await loadCurrent()
         if (upTargetVersion.value && currentVersion.value === upTargetVersion.value) {
+          upDone.value = true
           ElMessage.success(`升级完成：节点已运行 ${currentVersion.value}，代理已自动恢复`)
         } else if (upTargetVersion.value) {
           ElMessage.warning('节点已重启，请确认当前版本（预期 ' + upTargetVersion.value + '）')
@@ -196,19 +203,13 @@ const upgradeFromPM = async (version: string) => {
 }
 
 const handleSelfUpload = async () => {
-  if (!/^\d{1,4}(\.\d{1,4}){4}$/.test(uploadVersion.value)) {
-    ElMessage.warning('请输入正确的五段版本号')
-    return
-  }
   if (!uploadFile.value) {
     ElMessage.warning('请选择安装包文件')
     return
   }
   uploadingNow.value = true
-  upTargetVersion.value = uploadVersion.value
   try {
     const fd = new FormData()
-    fd.append('version', uploadVersion.value)
     fd.append('file', uploadFile.value)
     const res: any = await versionApi.selfUpload(fd, (p: number) => { uploadPercent.value = p })
     if (res.code === 0) {
