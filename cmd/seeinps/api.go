@@ -102,6 +102,10 @@ func (c *Client) startLocalServer() error {
 	mux.HandleFunc("GET /api/v1/pm-versions", c.requireAuth(c.handlePMVersions))
 	mux.HandleFunc("POST /api/v1/pm-upgrade", c.requireAuth(c.handlePMUpgrade))
 
+	// 系统日志：运行时查询/修改日志级别（持久化到 toml，异步上报审计 log_level_update）
+	mux.HandleFunc("GET /api/v1/logging", c.requireAuth(c.handleLoggingGet))
+	mux.HandleFunc("PUT /api/v1/logging", c.requireAuth(c.handleLoggingSet))
+
 	// 前端内嵌于二进制（internal/webui），与后端版本严格一致，随一键升级同步更新
 	mux.HandleFunc("/", webui.SPAHandler(webui.PS()))
 	fmt.Printf("[B端] Serving embedded web (version %s)\n", version.Version)

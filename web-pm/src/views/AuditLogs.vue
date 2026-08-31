@@ -75,7 +75,15 @@ const actions = [
   { value: "auth_rebind", label: "重新绑定授权码" },
   { value: "proxy_create", label: "创建代理" },
   { value: "proxy_update", label: "修改代理" },
-  { value: "proxy_delete", label: "删除代理" }
+  { value: "proxy_delete", label: "删除代理" },
+  { value: "client_upgrade", label: "推送升级客户端" },
+  { value: "upgrade_failed", label: "升级客户端失败" },
+  { value: "version_upload", label: "上传升级包" },
+  { value: "version_delete", label: "删除升级包" },
+  { value: "self_upgrade", label: "B端自主升级" },
+  { value: "pm_upgrade", label: "B端从PM拉取升级" },
+  { value: "log_level_update", label: "修改日志级别" },
+  { value: "user_expired", label: "账号过期踢线" }
 ]
 const actionLabel = (a: string) => actions.find((x: any) => x.value === a)?.label || a
 const formatTime = (ts?: number) => { if (!ts) return "-"; return new Date(ts * 1000).toLocaleString() }

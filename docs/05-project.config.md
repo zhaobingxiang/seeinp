@@ -55,48 +55,55 @@
 
 ## 2. 目录结构
 
-### 2.1 项目根目录（仓库级，用户指定层级）
+### 2.1 项目根目录（仓库级，实际结构）
 
 ```
 seeinp/
-├── cmd/                        # 三端主程序入口（Go）
+├── build/                      # 构建脚本与构建期工具
+│   ├── build.sh               #   版本构建脚本：发布产物 → release/（自动构建前端嵌入、注入版本号）
+│   ├── build-deployer.sh      #   seeinps-deployer Windows 交叉构建脚本（bash）
+│   └── genhash/                #   bcrypt 密码哈希小工具（go run ./build/genhash <密码>）
+├── cmd/                        # 主程序入口（Go）
 │   ├── seeinpm/                #   中心端
 │   ├── seeinps/                #   服务端
-│   ├── seeinpc/                #   客户端（GUI）
-│   └── seeinps-deployer/       #   部署工具（Windows）
+│   └── seeinps-deployer/       #   部署工具（Windows，内嵌 Web 前端 web-deployer）
 ├── internal/                   # 内部共享库
-│   ├── protocol/               #   控制协议编解码、消息定义（02 文档）
-│   ├── mux/                    #   多路复用封装
-│   ├── tlsutil/                #   TLS/指纹管理
-│   ├── logx/                   #   分级+轮转+JSON 日志
-│   ├── store/                  #   SQLite 封装（迁移/聚合）
 │   ├── auth/                   #   JWT/bcrypt/DPAPI
-│   └── version/                #   版本信息（ldflags 注入）
-├── web/                        # 前端源码（Vue3，三端共用组件与 SDK）
-│   ├── src/
-│   │   ├── components/         #   共用组件库（含 UpgradeReminder 升级提醒弹窗组件，seeinps 仪表板/seeinpc 启动时复用）
-│   │   ├── views/              #   pm/、ps/ 各自页面（pm 端含「版本管理」页：上传/历史/按端 Tab；ps 端含升级提醒横幅）
-│   │   └── api/                #   生成的 API SDK（封装 /api/v1/version/* 接口）
-├── dist/                       # 部署成果物（构建输出，按程序分目录）
-│   ├── seeinpm/                #   seeinpm-<version>-<os>-<arch>/
-│   ├── seeinps/                #   各架构子目录
-│   └── seeinpc/                #   客户端 exe
-├── release/                    # 用户发布成果物（各架构 + 用户说明）
-│   ├── seeinpm-linux-amd64/    #   含 用户说明.html / 用户说明.docx
-│   ├── seeinps-linux-amd64/
-│   ├── seeinps-linux-arm64/
-│   ├── seeinps-windows-amd64/
-│   ├── seeinpc-windows-amd64/
-│   └── seeinps-deployer-windows-amd64/
-├── driver/                     # 驱动（wintun.dll 等，随构建打包）
-├── test/                       # 功能测试脚本（协议/端到端/冒烟）
-│   ├── protocol/
-│   ├── e2e/
-│   └── smoke/
+│   ├── config/                 #   TOML 配置加载
+│   ├── gzhttp/                 #   gzip HTTP 中间件
+│   ├── logx/                   #   分级+轮转+JSON 日志
+│   ├── mux/                    #   yamux 多路复用封装
+│   ├── portpool/               #   端口池管理
+│   ├── protocol/               #   控制协议编解码、消息定义（02 文档）
+│   ├── store/                  #   SQLite 封装（迁移/聚合）
+│   ├── tlsutil/                #   TLS/指纹管理
+│   ├── tslog/                  #   结构化日志
+│   ├── version/                #   版本信息（ldflags 注入）
+│   └── webui/                  #   内嵌前端（go:embed，构建产物）
+├── web-pm/                     # seeinpm 管理端前端（Vue3 + Element Plus + Vite）
+├── web-ps/                     # seeinps B 端前端（Vue3 + Element Plus + Vite）
+├── conf/                       # 配置模板（seeinpm.toml / seeinps.toml）
 ├── docs/                       # 文档体系（本文档所在）
-├── scripts/                    # 构建/发布/维护脚本（CI 用）
+├── img/                        # 各端图标 PNG（seeinpm/seeinps/seeinpc/seeinps-tools）
+├── ico/                        # 图标 ICO（需要时由 img 转换生成，当前为空）
+├── release/                    # 发布成果物（构建输出，git 忽略）；二进制名 = 程序名，版本/架构由目录体现
+│   ├── seeinpm/<版本>/linux-amd64/
+│   │   ├── seeinpm             #   二进制
+│   │   └── conf/seeinpm.toml   #   配置模板
+│   ├── seeinps/<版本>/{linux-amd64,windows-amd64}/
+│   │   ├── seeinps(.exe)       #   二进制（Windows 带 .exe）
+│   │   └── conf/seeinps.toml   #   配置模板
+│   ├── seeinpc/<版本>/         #   客户端（待开发）
+│   └── seeinps-deployer/<版本>/
+│       └── seeinps-deployer.exe #  部署工具（Windows）
+├── test/                       # 测试
+│   ├── e2e/                    #   e2e 测试脚本 + runtime（本地测试二进制与运行数据）
+│   ├── integration/            #   Go 集成测试
+│   ├── protocol/               #   协议单测
+│   └── legacy-scripts/         #   历史开发/调试脚本归档
 ├── go.mod
-└── Makefile                    # 常用命令入口（见 §3）
+├── go.sum
+└── README.md
 ```
 
 ### 2.2 程序安装目录（每个程序运行时层级，用户指定层级）
@@ -117,7 +124,7 @@ seeinp/
 ```
 
 > 首次运行自动生成上述目录结构与配置文件模板（需求文档 UX 要求）。
-> seeinpm 版本管理上传的安装包落盘于 `data/releases/{endpoint}/`，通过 `/releases/{endpoint}/<file>` 路径对外提供下载（静态文件服务）；版本元数据存于 `data/seeinpm.db` 的 `versions` 表（见 04 文档 §3.7）。
+> seeinpm 版本管理上传的安装包落盘于 `data/releases/{endpoint}/{版本}/{系统-架构}/`，与仓库 `release/` 目录结构一致；B 端经 `/api/v1/ps-release/download` 接口下载，版本元数据存于 `data/seeinpm.db` 的 `versions` 表（见 04 文档 §3.7）。
 > seeinpc 本地配置文件 `conf/config.json` 在原有多 VPN profile 基础上，新增 `ignoredVersions` 字段（字符串数组）用于持久化「该版本不再提醒」状态（见 04 文档 §8）。
 
 ### 2.3 升级程序与备份机制（seeinps / seeinpc）
@@ -172,54 +179,40 @@ seeinps / seeinpc 各自安装目录在 §2.2 通用结构基础上，新增升�
 
 ---
 
-## 3. 常用命令（Makefile）
+## 3. 常用命令
 
-```makefile
-# 基础构建
-make build                # 构建三端当前平台二进制 → dist/<name>/
-make build-pm             # 仅 seeinpm
-make build-ps             # 仅 seeinps
-make build-pc             # 仅 seeinpc（GUI）
-make build-deployer       # 仅部署工具（Windows）
+```bash
+# 构建发布产物（linux，自动构建前端嵌入、注入版本号，输出 release/<程序>/<版本>/<系统-架构>/）
+bash build/build.sh 1.0.26.0830.14              # seeinpm + seeinps
+bash build/build.sh 1.0.26.0830.14 seeinps      # 仅 seeinps
+ARCH=arm64 bash build/build.sh 1.0.26.0830.14   # 指定 GOARCH（默认 amd64）
+WIN=1 bash build/build.sh 1.0.26.0830.14        # 额外产出 Windows 测试二进制 → test/e2e/runtime/
 
-# 交叉编译（release 全量产物）
-make release              # 产出各架构 → release/（含用户说明生成）
-make release-linux        # linux amd64 + arm64（seeinpm/seeinps）
-make release-windows      # windows amd64（seeinps/seeinpc/deployer）
-
-# 运行（开发）
-make run-pm               # 本地起 seeinpm（默认 conf 模板）
-make run-ps               # 本地起 seeinps
-make run-pc               # 起 seeinpc
+# 构建 seeinps-deployer（Windows PowerShell，发布版本号沿用 seeinps 当前版本）
+bash build/build-deployer.sh 1.0.26.0830.14
 
 # 测试
-make test                 # go test ./...
-make test-protocol        # 协议单测/集成（test/protocol）
-make test-e2e             # 端到端（test/e2e，docker-compose 一键环境）
-make test-smoke           # 冒烟脚本
+go test ./...                                   # Go 单测/集成
+python test/e2e/test_upgrade_e2e.py             # e2e（依赖 test/e2e/runtime 下的测试二进制）
 
-# 前端
-make web-dev              # Vite dev server
-make web-build            # 前端构建 → go:embed 打包进二进制
+# 前端开发
+cd web-pm && npm run dev                        # seeinpm 管理端 Vite dev server
+cd web-ps && npm run dev                        # seeinps B 端
 
 # 维护
-make lint                 # golangci-lint
-make fmt                  # gofmt
-make docs                 # 校验文档交叉引用（脚本）
+go run ./build/genhash <密码>                   # 生成 bcrypt 密码哈希（配置文件用）
 ```
 
-交叉编译要点（示例）：
+交叉编译要点（手动构建时参照 build/build.sh 的输出布局）：
 
 ```bash
 # seeinps linux-arm64
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o dist/seeinps/seeinps-linux-arm64 ./cmd/seeinps
-# seeinpm linux-amd64
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/seeinpm/seeinpm-linux-amd64 ./cmd/seeinpm
-# seeinpc windows-amd64
-GOOS=windows GOARCH=amd64 go build -o dist/seeinpc/seeinpc.exe ./cmd/seeinpc
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+  -ldflags "-X github.com/seeinp/seeinp/internal/version.Version=<版本> -X github.com/seeinp/seeinp/internal/version.Banner=seeinp-version:<版本>" \
+  -o release/seeinps/<版本>/linux-arm64/seeinps ./cmd/seeinps
 ```
 
-> `CGO_ENABLED=0` 为默认（现代c.org/sqlite 纯 Go 实现支持）；版本号经 `-ldflags "-X internal/version.Version=$(VERSION)"` 注入。
+> `CGO_ENABLED=0` 为默认（modernc.org/sqlite 纯 Go 实现）；版本号经 `-ldflags` 注入 `internal/version`，二进制内带有 `seeinp-version:<版本>` 标识（升级包自动识别版本依赖该标识，务必经 build/build.sh 构建发布产物）。
 
 ---
 

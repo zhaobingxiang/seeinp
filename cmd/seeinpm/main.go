@@ -36,23 +36,24 @@ import (
 )
 
 const (
-	connReadTimeout  = 60 * time.Second
-	connIdleTimeout  = 300 * time.Second
+	connReadTimeout = 60 * time.Second
+	connIdleTimeout = 300 * time.Second
 )
 
 type Server struct {
-	config           *config.PMConfig
-	tlsConfig        *tls.Config
-	store            *store.Store
-	jwt              *auth.JWTManager
-	portPool         *portpool.Pool
-	clients          map[string]*Client
-	clientsMu        sync.RWMutex
-	sessions         map[string]*Session
-	sessionsMu       sync.RWMutex
-	publicConns      map[int]*PublicListener
+	config             *config.PMConfig
+	configPath         string // 配置文件路径，用于日志级别等设置持久化写回
+	tlsConfig          *tls.Config
+	store              *store.Store
+	jwt                *auth.JWTManager
+	portPool           *portpool.Pool
+	clients            map[string]*Client
+	clientsMu          sync.RWMutex
+	sessions           map[string]*Session
+	sessionsMu         sync.RWMutex
+	publicConns        map[int]*PublicListener
 	publicConnsByProxy map[string]*PublicListener
-	publicMu         sync.RWMutex
+	publicMu           sync.RWMutex
 	// traffic 为代理流量内存计数器，key 为 username + "/" + proxyID
 	traffic          map[string]*proxyTraffic
 	trafficMu        sync.Mutex
@@ -135,15 +136,15 @@ func NewServer(config *config.PMConfig) (*Server, error) {
 	}
 
 	return &Server{
-		config:           config,
-		store:            s,
-		jwt:              jwtMgr,
-		portPool:         portpool.New(ranges, s),
-		clients:          make(map[string]*Client),
-		sessions:         make(map[string]*Session),
-		publicConns:      make(map[int]*PublicListener),
+		config:             config,
+		store:              s,
+		jwt:                jwtMgr,
+		portPool:           portpool.New(ranges, s),
+		clients:            make(map[string]*Client),
+		sessions:           make(map[string]*Session),
+		publicConns:        make(map[int]*PublicListener),
 		publicConnsByProxy: make(map[string]*PublicListener),
-		traffic:          make(map[string]*proxyTraffic),
+		traffic:            make(map[string]*proxyTraffic),
 	}, nil
 }
 
@@ -181,7 +182,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go s.trafficSampler(ctx)
 	go s.trafficFlusher(ctx)
 
-	fmt.Println("[seeinpm] Started - control :999, api :9998")
+	fmt.Println("[seeinpm] Started - control :99, api :90")
 
 	<-ctx.Done()
 	s.shutdown()
@@ -229,6 +230,9 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("POST /api/v1/versions", s.authMiddleware(s.handleVersionUpload))
 	mux.HandleFunc("DELETE /api/v1/versions/{id}", s.authMiddleware(s.handleVersionDelete))
 	mux.HandleFunc("/api/v1/auth/verify-code", s.handleVerifyCode)
+	// seeinps 一键部署（免登录，走账号+授权码校验）：版本列表 / 安装包下载
+	mux.HandleFunc("GET /api/v1/ps-release/versions", s.handlePSReleaseVersions)
+	mux.HandleFunc("GET /api/v1/ps-release/download", s.handlePSReleaseDownload)
 	mux.HandleFunc("/api/v1/port-pool", s.authMiddleware(s.handlePortPool))
 	mux.HandleFunc("GET /api/v1/proxies", s.authMiddleware(s.handleListProxies))
 	mux.HandleFunc("GET /api/v1/proxies/{username}/{proxyId}/sessions", s.authMiddleware(s.handleProxySessions))
@@ -237,6 +241,9 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("GET /api/v1/audit-logs", s.authMiddleware(s.handleAuditLogs))
 	mux.HandleFunc("GET /api/v1/logs", s.authMiddleware(s.handleListLogFiles))
 	mux.HandleFunc("GET /api/v1/logs/content", s.authMiddleware(s.handleLogFileContent))
+	// 系统日志：运行时查询/修改日志级别（持久化到 toml，审计记录 log_level_update）
+	mux.HandleFunc("GET /api/v1/logging", s.authMiddleware(s.handleLoggingGet))
+	mux.HandleFunc("PUT /api/v1/logging", s.authMiddleware(s.handleLoggingSet))
 	// 混合架构：A 端按需拉取在线 B 端（seeinps）运行日志（经控制通道转发）
 	mux.HandleFunc("GET /api/v1/ps-logs", s.authMiddleware(s.handlePSLogList))
 	mux.HandleFunc("GET /api/v1/ps-logs/content", s.authMiddleware(s.handlePSLogContent))
@@ -246,11 +253,17 @@ func (s *Server) startHTTPListener() {
 
 	addr := s.config.Server.HTTPAddr
 	if addr == "" {
-		addr = ":9998"
+		addr = ":90"
 	}
 	fmt.Printf("[HTTP] Listening on %s\n", addr)
-	// gzip：前端产物与 API 响应压缩（窄带链路下体积 -60% 以上）
-	if err := http.ListenAndServe(addr, gzhttp.Handler(mux)); err != nil {
+	// 文件下载接口用独立 mux 注册，完全不经过 gzip 中间件（io.Copy + 大文件与 gzip 管道有交互问题）。
+	// 其余请求（前端/JSON API）走 gzip 压缩。
+	downloadMux := http.NewServeMux()
+	downloadMux.HandleFunc("/api/v1/ps-release/download", s.handlePSReleaseDownload)
+	topMux := http.NewServeMux()
+	topMux.Handle("/api/v1/ps-release/download", downloadMux)
+	topMux.Handle("/", gzhttp.Handler(mux))
+	if err := http.ListenAndServe(addr, topMux); err != nil {
 		log.Printf("[HTTP] Error: %v", err)
 	}
 }
@@ -367,6 +380,7 @@ func (s *Server) checkExpiredUsers() {
 		if _, active := s.isClientActive(u.Username); active {
 			fmt.Printf("[USER] %s expired, kicking (reason=user_expired)\n", u.Username)
 			s.kickClient(u.Username, "user_expired")
+			s.store.InsertAuditLog(u.Username, "user_expired", "", "account expired, active connection kicked")
 		}
 	}
 }
@@ -1033,21 +1047,16 @@ func (s *Server) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"code":2001,"message":"invalid request"}`)
 		return
 	}
-	user, err := s.store.GetUserByUsername(req.Username)
+	user, err := s.verifyUserAuth(req.Username, req.AuthCode)
 	if err != nil {
+		// 区分禁用与其它（账号/授权码无效）
+		if u, uerr := s.store.GetUserByUsername(req.Username); uerr == nil && u.Status != 1 {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(w, `{"code":1003,"message":"user disabled"}`)
+			return
+		}
 		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprintf(w, `{"code":1001,"message":"user not found"}`)
-		return
-	}
-	if user.Status != 1 {
-		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprintf(w, `{"code":1003,"message":"user disabled"}`)
-		return
-	}
-	expectedHash := auth.HashAuthCode(req.AuthCode, user.AuthCodeSalt)
-	if expectedHash != user.AuthCodeHash {
-		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprintf(w, `{"code":1001,"message":"invalid auth code"}`)
+		fmt.Fprintf(w, `{"code":1001,"message":"invalid auth code or user"}`)
 		return
 	}
 	if user.OnlineSession != nil {
@@ -1154,7 +1163,10 @@ func (s *Server) handlePortPoolUpdate(w http.ResponseWriter, r *http.Request) {
 
 	// 找出新池外的活跃分配
 	allocs, _ := s.store.GetAllocatedPorts()
-	type outsideItem struct{ username, proxyID, ptype string; port int }
+	type outsideItem struct {
+		username, proxyID, ptype string
+		port                     int
+	}
 	var outside []outsideItem
 	for _, a := range allocs {
 		if !portInRanges(a.Port, merged) {
@@ -2125,6 +2137,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Init error: %v\n", err)
 		os.Exit(1)
 	}
+	srv.configPath = *confPath
 
 	if err := srv.Start(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

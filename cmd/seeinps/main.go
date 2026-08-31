@@ -29,9 +29,10 @@ import (
 )
 
 type Client struct {
-	config *config.PSConfig
-	store  *store.PSStore
-	jwt    *auth.JWTManager
+	config     *config.PSConfig
+	configPath string // 配置文件路径，用于日志级别等设置持久化写回
+	store      *store.PSStore
+	jwt        *auth.JWTManager
 
 	linkMu    sync.Mutex
 	link      *controlLink
@@ -699,46 +700,74 @@ func (c *Client) handleTCPStream(stream net.Conn, proxy *Proxy) {
 
 func main() {
 	confPath := flag.String("conf", "conf/seeinps.toml", "config")
+	runService := flag.Bool("service", false, "run as a Windows service (windows only)")
 	flag.Parse()
-	cfg, err := config.LoadPSConfig(*confPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	// 运行日志：级别过滤 + 行首时间戳 + 按天/大小轮转（conf [logging] level/max_size/max_backups 生效）
-	// 单实例锁：重复启动会互踢（1002）并抢占 B 端端口，直接拒绝第二个实例
-	instanceLock, err := acquireInstanceLock("data/seeinps.lock")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: another seeinps instance is running (%v), exiting\n", err)
-		os.Exit(1)
-	}
-	defer instanceLock.Close()
 
-	logx.Install(cfg.Logging.Path, "seeinps", cfg.Logging.Level, cfg.Logging.MaxSize, cfg.Logging.MaxBackups)
-	psStore, err := store.NewPS("data/seeinps.db")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	// Windows 服务模式：svc.Run 常驻，由 SCM 控制生命周期（部署工具注册服务时携带 --service）
+	if *runService {
+		if runAsService(*confPath) {
+			return
+		}
 	}
-	defer psStore.Close()
-	jwtSecret, err := auth.GenerateJWTSecret()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	jwt := auth.NewJWTManager(jwtSecret, 24*time.Hour, 48*time.Hour)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	runForeground(*confPath)
+}
+
+// runForeground 前台模式：信号驱动，保持进程运行直到收到中断/终止。
+func runForeground(confPath string) {
+	ctx, cancel, err := startWorker(confPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigCh; cancel() }()
+	<-ctx.Done()
+}
+
+// startWorker 加载配置并启动 seeinps 后台工作协程（配置、锁、日志、存储、控制循环、B端服务）。
+// 返回生命周期上下文与取消函数；平台模式（前台/服务）各自负责触发 cancel。
+func startWorker(confPath string) (context.Context, context.CancelFunc, error) {
+	cfg, err := config.LoadPSConfig(confPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 单实例锁：重复启动会互踢（1002）并抢占 B 端端口，直接拒绝第二个实例
+	if err := os.MkdirAll("data", 0755); err != nil {
+		return nil, nil, fmt.Errorf("create data dir: %v", err)
+	}
+	instanceLock, err := acquireInstanceLock("data/seeinps.lock")
+	if err != nil {
+		return nil, nil, fmt.Errorf("another seeinps instance is running (%v), exiting", err)
+	}
+	logx.Install(cfg.Logging.Path, "seeinps", cfg.Logging.Level, cfg.Logging.MaxSize, cfg.Logging.MaxBackups)
+	psStore, err := store.NewPS("data/seeinps.db")
+	if err != nil {
+		instanceLock.Close()
+		return nil, nil, err
+	}
+	jwtSecret, err := auth.GenerateJWTSecret()
+	if err != nil {
+		instanceLock.Close()
+		return nil, nil, err
+	}
+	jwt := auth.NewJWTManager(jwtSecret, 24*time.Hour, 48*time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// 生命周期结束时释放单实例锁与本地存储句柄
+	context.AfterFunc(ctx, func() {
+		instanceLock.Close()
+		psStore.Close()
+	})
 
 	client := NewClient(cfg, psStore, jwt)
+	client.configPath = confPath
 	client.rootCtx = ctx
 	if err := client.loadProxies(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: load proxies: %v\n", err)
-		os.Exit(1)
+		instanceLock.Close()
+		return nil, nil, fmt.Errorf("load proxies: %w", err)
 	}
 	client.migrateLegacyLocalUser()
 
@@ -771,5 +800,5 @@ func main() {
 		}
 	}()
 
-	<-ctx.Done()
+	return ctx, cancel, nil
 }

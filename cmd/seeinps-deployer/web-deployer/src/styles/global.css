@@ -1,0 +1,183 @@
+/* ===== seeinpm / seeinps 统一设计规范（白+蓝极简）===== */
+:root {
+  --app-primary: #2563eb;
+  --app-primary-hover: #1d4ed8;
+  --app-primary-active: #1e40af;
+  --app-primary-light: #eff4ff;
+  --app-bg: #f5f7fa;
+  --app-card: #ffffff;
+  --app-border: #e5e7eb;
+  --app-border-light: #eef0f3;
+  --app-text: #1f2329;
+  --app-text-secondary: #646a73;
+  --app-text-tertiary: #9aa0a8;
+  --app-radius: 10px;
+  --app-radius-sm: 8px;
+  --app-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --app-shadow-hover: 0 4px 12px rgba(16, 24, 40, 0.08);
+
+  --el-color-primary: #2563eb;
+  --el-color-primary-light-3: #7c9ff0;
+  --el-color-primary-light-5: #a8c0f5;
+  --el-color-primary-light-7: #d3e0fa;
+  --el-color-primary-light-8: #e8eefc;
+  --el-color-primary-light-9: #f3f7fe;
+  --el-color-primary-dark-2: #1e50c4;
+  --el-border-radius-base: 8px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body, #app { height: 100%; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  background-color: var(--app-bg);
+  color: var(--app-text);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ===== 部署工具布局 ===== */
+.deploy-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: stretch;
+  background: linear-gradient(160deg, #eef4ff 0%, #f5f7fa 55%, #eaf1fd 100%);
+}
+
+.deploy-sider {
+  width: 300px;
+  flex-shrink: 0;
+  background: var(--app-card);
+  border-right: 1px solid var(--app-border-light);
+  display: flex;
+  flex-direction: column;
+  padding: 24px;
+}
+
+.deploy-sider .sider-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 28px;
+}
+
+.deploy-sider .sider-logo .logo-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: var(--app-primary);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+}
+
+.deploy-sider .sider-logo .brand-name { font-size: 18px; font-weight: 600; color: var(--app-text); }
+.deploy-sider .sider-logo .brand-name span { color: var(--app-primary); }
+
+.deploy-sider .sider-sub { color: var(--app-text-tertiary); font-size: 13px; line-height: 1.6; margin-bottom: 24px; }
+
+.deploy-main {
+  flex: 1;
+  padding: 32px 40px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.deploy-main .page-title { font-size: 20px; font-weight: 600; color: var(--app-text); margin-bottom: 4px; }
+.deploy-main .page-desc { color: var(--app-text-secondary); font-size: 13px; margin-bottom: 24px; }
+
+.deploy-card {
+  background: var(--app-card);
+  border: 1px solid var(--app-border-light);
+  border-radius: var(--app-radius);
+  box-shadow: var(--app-shadow);
+  padding: 24px;
+  margin-bottom: 20px;
+  max-width: 720px;
+}
+
+.deploy-card .card-heading {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--app-text);
+  margin-bottom: 18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 目标选择卡片 */
+.target-tabs {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.target-tab {
+  flex: 1;
+  border: 1px solid var(--app-border);
+  border-radius: var(--app-radius);
+  padding: 16px 18px;
+  cursor: pointer;
+  transition: all 0.18s ease;
+  background: var(--app-card);
+}
+
+.target-tab:hover { border-color: var(--app-primary); box-shadow: var(--app-shadow-hover); }
+
+.target-tab.is-active {
+  border-color: var(--app-primary);
+  background: var(--app-primary-light);
+}
+
+.target-tab .tab-icon { font-size: 20px; color: var(--app-text-secondary); margin-bottom: 8px; }
+.target-tab.is-active .tab-icon { color: var(--app-primary); }
+.target-tab .tab-name { font-size: 15px; font-weight: 500; color: var(--app-text); }
+.target-tab .tab-desc { font-size: 12px; color: var(--app-text-tertiary); margin-top: 2px; }
+
+/* 进度 / 日志 */
+.log-console {
+  background: #0f172a;
+  border-radius: var(--app-radius-sm);
+  padding: 14px 16px;
+  font-family: "JetBrains Mono", Consolas, "Courier New", monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+  max-height: 320px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-console .log-line { display: block; }
+.log-console .log-info { color: #cbd5e1; }
+.log-console .log-warn { color: #fbbf24; }
+.log-console .log-error { color: #f87171; }
+.log-console .log-success { color: #34d399; font-weight: 600; }
+
+/* 成功卡 */
+.success-box {
+  text-align: center;
+  padding: 20px 0 8px;
+}
+
+.success-box .url-link {
+  font-size: 15px;
+  color: var(--app-primary);
+  font-weight: 500;
+}
+
+/* 步骤指示 */
+.step-tip { color: var(--app-text-tertiary); font-size: 12.5px; margin-bottom: 16px; }
+
+/* 折叠面板内间距微调 */
+.srv-config .el-collapse-item__header { font-size: 13px; color: var(--app-text-secondary); }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #d4d8de; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #bfc5cc; }
+::-webkit-scrollbar-track { background: transparent; }

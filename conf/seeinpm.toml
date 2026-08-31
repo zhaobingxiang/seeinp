@@ -1,7 +1,8 @@
 ﻿# seeinpm configuration
 
 [server]
-addr = ":999"  # Listen address
+addr = ":99"      # 信令/控制通道监听（TLS）
+http_addr = ":90" # B端 Web + API 监听
 
 [tls]
 enabled = true

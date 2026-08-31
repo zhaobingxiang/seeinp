@@ -31,11 +31,72 @@ type Config struct {
 // levelRank 级别数值：debug=0 < info=1 < warn=2 < error=3
 var levelRank = map[string]int{"debug": 0, "info": 1, "warn": 2, "error": 3}
 
-// shouldKeep 判断一行日志是否应输出（当前配置级别）。
+// 运行时日志级别（小写），由 SetLevel 更新，writeLine 从该全局读取，
+// 从而实现不重启进程即可切换过滤级别。默认 info。
+var (
+	levelMu  sync.RWMutex
+	curLevel = "info"
+)
+
+// normalizeLevel 规范化为小写并校验合法性；非法返回 false。
+func normalizeLevel(level string) (string, bool) {
+	lv := strings.ToLower(strings.TrimSpace(level))
+	if _, ok := levelRank[lv]; !ok {
+		return "", false
+	}
+	return lv, true
+}
+
+// SetLevel 运行时修改日志过滤级别（debug/info/warn/error），即时生效。
+// 本函数通过 Install 接管的 os.Stdout 过滤链生效，新增的日志行按新级别判断。
+func SetLevel(level string) error {
+	lv, ok := normalizeLevel(level)
+	if !ok {
+		return fmt.Errorf("invalid log level %q (want debug/info/warn/error)", level)
+	}
+	levelMu.Lock()
+	curLevel = lv
+	levelMu.Unlock()
+	return nil
+}
+
+// GetLevel 返回当前生效的过滤级别（小写）。
+func GetLevel() string {
+	levelMu.RLock()
+	defer levelMu.RUnlock()
+	return curLevel
+}
+
+// currentThreshold 当前全局级别对应阈值。
+func currentThreshold() int {
+	levelMu.RLock()
+	lv := curLevel
+	levelMu.RUnlock()
+	threshold, ok := levelRank[lv]
+	if !ok {
+		return 1 // 默认 info
+	}
+	return threshold
+}
+
+// shouldKeep 判断一行日志是否应输出（基于该 Config 实例的级别，供单元测试与单实例使用）。
 // 只有行首明确带 [DEBUG]/[INFO]/[WARN]/[ERROR] 级别标记的行才参与过滤；
 // 未标记或未知标记（如 [CTRL]/[ALLOC]）的行始终保留，保证现有日志不被误滤。
+// 说明：Install 接入的 stdout 过滤使用 globalShouldKeep（读全局运行时级别）。
 func (c *Config) shouldKeep(line string) bool {
-	threshold, ok := levelRank[strings.ToLower(c.Level)]
+	return lineShouldKeep(line, strings.ToLower(c.Level))
+}
+
+// globalShouldKeep 基于全局运行时级别判断一行日志是否输出（SetLevel 即时生效）。
+func globalShouldKeep(line string) bool {
+	levelMu.RLock()
+	lv := curLevel
+	levelMu.RUnlock()
+	return lineShouldKeep(line, lv)
+}
+
+func lineShouldKeep(line, level string) bool {
+	threshold, ok := levelRank[level]
 	if !ok {
 		threshold = 1 // 默认 info
 	}
@@ -50,6 +111,29 @@ func (c *Config) shouldKeep(line string) bool {
 	}
 	return true
 }
+
+// -------------------- 分级日志便捷函数 --------------------
+// 输出带标准级别标记（[DEBUG]/[INFO]/[WARN]/[ERROR]）的日志，经 Install 接管的
+// os.Stdout 写入，从而真正受 SetLevel 级别过滤。写前也做阈值判断，双保险。
+func taggedPrintf(tag, format string, args ...interface{}) {
+	if currentThreshold() > levelRank[strings.ToLower(tag)] {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	os.Stdout.WriteString("[" + tag + "] " + msg + "\n")
+}
+
+// Debugf 输出 debug 级日志（级别<=debug 时显示）。
+func Debugf(format string, args ...interface{}) { taggedPrintf("DEBUG", format, args...) }
+
+// Infof 输出 info 级日志（级别<=info 时显示）。
+func Infof(format string, args ...interface{}) { taggedPrintf("INFO", format, args...) }
+
+// Warnf 输出 warn 级日志（级别<=warn 时显示）。
+func Warnf(format string, args ...interface{}) { taggedPrintf("WARN", format, args...) }
+
+// Errorf 输出 error 级日志（所有有效级别均显示）。
+func Errorf(format string, args ...interface{}) { taggedPrintf("ERROR", format, args...) }
 
 // RotateWriter 并发安全的轮转写入器
 type RotateWriter struct {
@@ -195,13 +279,22 @@ func (w *RotateWriter) Close() error {
 // Install 将 os.Stdout / os.Stderr 替换为「级别过滤 + 行首时间戳 + 轮转」写入器，并接管 log 包输出。
 // 原理：os.Stdout/Stderr 换成 pipe 写端，后台协程按行加时间戳（并按级别过滤）后写入 RotateWriter。
 // 返回的 restore 可还原。
+// 过滤级别以 level 初始化为全局运行时级别（之后可通过 SetLevel 在线调整），传入非法级别时按 info 兜底。
 func Install(dir, name, level string, maxSizeMB, maxBackups int) (restore func()) {
 	rw, err := NewRotateWriter(Config{Dir: dir, Name: name, MaxSizeMB: maxSizeMB, MaxBackups: maxBackups})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logx: init rotate writer: %v\n", err)
 		return func() {}
 	}
-	filter := &Config{Level: level}
+	if lv, ok := normalizeLevel(level); ok {
+		levelMu.Lock()
+		curLevel = lv
+		levelMu.Unlock()
+	} else {
+		levelMu.Lock()
+		curLevel = "info"
+		levelMu.Unlock()
+	}
 	origOut, origErr := os.Stdout, os.Stderr
 	r1, w1, err := os.Pipe()
 	if err != nil {
@@ -213,18 +306,19 @@ func Install(dir, name, level string, maxSizeMB, maxBackups int) (restore func()
 	}
 	os.Stdout = w1
 	os.Stderr = w2
-	// log 包默认 writer 在 init 时绑定 os.Stderr 指针，需显式接管并去掉自带时间戳（避免重复）
-	log.SetOutput(rw)
+	// log 包默认 writer 在 init 时绑定 os.Stderr 指针，需显式接管并去掉自带时间戳（避免重复）。
+	// 经带级别过滤的 writer 写入，使 log.Printf 也受 SetLevel 约束。
+	log.SetOutput(&filteredWriter{rw: rw})
 	log.SetFlags(0)
 
 	done := make(chan struct{})
 	var wg sync.WaitGroup
-	// 统一把一行（含结尾换行）按级别过滤后写入 rw
+	// 统一把一行（含结尾换行）按全局级别过滤后写入 rw（在线 SetLevel 即时生效）
 	writeLine := func(b []byte) {
 		if len(b) == 0 {
 			return
 		}
-		if !filter.shouldKeep(string(b)) {
+		if !globalShouldKeep(string(b)) {
 			return
 		}
 		ts := time.Now().Format("2006-01-02 15:04:05")
@@ -253,4 +347,26 @@ func Install(dir, name, level string, maxSizeMB, maxBackups int) (restore func()
 		os.Stdout = origOut
 		os.Stderr = origErr
 	}
+}
+
+// filteredWriter 包装 RotateWriter，逐行应用全局级别过滤并为落盘行加时间戳。
+// 用于 log 包输出（log.Printf/log.Fatalf 等），保证其同样受 SetLevel 约束且不重复时间戳。
+type filteredWriter struct {
+	rw *RotateWriter
+}
+
+// Write 实现 io.Writer：log 包一次写入可能含多行，逐行过滤并加时间戳落盘。
+func (w *filteredWriter) Write(p []byte) (int, error) {
+	data := string(p)
+	for _, line := range strings.Split(data, "\n") {
+		if len(line) == 0 {
+			continue
+		}
+		if !globalShouldKeep(line) {
+			continue
+		}
+		ts := time.Now().Format("2006-01-02 15:04:05")
+		w.rw.Write([]byte(ts + " " + line + "\n"))
+	}
+	return len(p), nil
 }

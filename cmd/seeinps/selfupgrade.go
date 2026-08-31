@@ -145,7 +145,7 @@ func (c *Client) handleSelfUpgrade(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if version == "" {
 		os.Remove(upgradeTmpPath)
-		writeErr(w, http.StatusBadRequest, 2002, "无法识别包内版本，请使用 scripts/build.sh 构建或手动填写版本号")
+		writeErr(w, http.StatusBadRequest, 2002, "无法识别包内版本，请使用 build/build.sh 构建或手动填写版本号")
 		return
 	}
 
@@ -173,6 +173,7 @@ func (c *Client) handleSelfUpgrade(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// 上传成功即视为已受理（应用阶段秒级完成，重启由前端轮询 /auth/status 版本号判定）
+	c.audit(r, "self_upgrade", version, fmt.Sprintf("size=%d sha256=%s", size, sha[:12]))
 	writeOK(w, map[string]interface{}{"started": true, "version": version, "sha256": sha})
 }
 
@@ -234,6 +235,7 @@ func (c *Client) handlePMUpgrade(w http.ResponseWriter, r *http.Request) {
 		}
 		// 元信息已收到；后续进度由 handleUpgradeStream 接收时刷新（receiving -> applying）
 	}()
+	c.audit(r, "pm_upgrade", req.Version, "via=seeinpm pull")
 	writeOK(w, map[string]interface{}{"started": true, "version": req.Version})
 }
 

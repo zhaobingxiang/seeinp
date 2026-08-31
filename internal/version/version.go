@@ -12,7 +12,7 @@ var (
 	BuildTime = "unknown"
 )
 
-// Banner 构建时注入 "seeinp-version:<版本号>"（见 scripts/build.sh），
+// Banner 构建时注入 "seeinp-version:<版本号>"（见 build/build.sh），
 // 上传升级包时服务端扫描该标识自动识别包内版本
 var Banner = "seeinp-version:dev"
 
@@ -23,7 +23,7 @@ const VersionMagic = "seeinp-version:"
 
 var versionRe = regexp.MustCompile(`seeinp-version:(\d{1,4}(?:\.\d{1,4}){4})`)
 
-var ErrVersionNotFound = errors.New("二进制中未找到版本标识，请使用 scripts/build.sh 构建")
+var ErrVersionNotFound = errors.New("二进制中未找到版本标识，请使用 build/build.sh 构建")
 
 // ExtractVersionFromFile 从升级包二进制中提取构建时注入的版本号
 func ExtractVersionFromFile(path string) (string, error) {

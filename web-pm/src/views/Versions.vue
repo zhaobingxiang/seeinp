@@ -414,6 +414,16 @@ const handleUpgrade = async () => {
     ElMessage.warning('请选择目标版本')
     return
   }
+  // 风险确认：告知升级会导致该节点代理断开
+  try {
+    await ElMessageBox.confirm(
+      `节点「${upgradeForm.username}」升级期间，该节点的全部代理将中断，客户端无法使用映射端口，升级完成后节点自动重连并恢复端口映射。\n\n是否已确认并在业务低峰期执行本次升级？`,
+      '升级风险提示',
+      { type: 'warning', confirmButtonText: '我已了解，开始升级', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch {
+    return // 用户取消，不执行升级
+  }
   upgrading.value = true
   try {
     const res: any = await clientApi.upgrade(upgradeForm.username, upgradeForm.versionId)

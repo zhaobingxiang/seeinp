@@ -18,6 +18,11 @@
             <el-option :value="1000" label="1000 行" />
             <el-option :value="2000" label="2000 行" />
           </el-select>
+          <span style="color:var(--app-text-tertiary)">日志级别：</span>
+          <el-select v-model="logLevel" style="width:110px">
+            <el-option v-for="lv in ['debug','info','warn','error']" :key="lv" :label="lv.toUpperCase()" :value="lv" />
+          </el-select>
+          <el-button type="warning" plain :loading="changingLevel" @click="onLevelChange">保存</el-button>
           <el-button type="primary" @click="loadContent" :loading="loadingContent">刷新</el-button>
         </div>
         <el-button type="success" :disabled="!currentFile" @click="download">下载日志</el-button>
@@ -32,17 +37,18 @@
           <el-empty v-if="files.length === 0 && !loadingFiles" description="无日志文件" :image-size="60" />
         </div>
         <div class="log-view">
-          <pre class="log-content">{{ content || '选择左侧文件查看日志' }}</pre>
+          <pre class="log-content" v-html="renderContent()"></pre>
         </div>
       </div>
     </div>
   </Layout>
 </template>
 <script setup lang="ts">
-import { ref, onMounted } from "vue"
+import { ref, computed, onMounted } from "vue"
 import { Search } from "@element-plus/icons-vue"
-import { logApi } from "@/api"
+import { logApi, loggingApi } from "@/api"
 import Layout from "@/components/Layout.vue"
+import { ElMessage } from "element-plus"
 
 const files = ref<any[]>([])
 const loadingFiles = ref(true)
@@ -51,6 +57,8 @@ const content = ref("")
 const loadingContent = ref(false)
 const lines = ref(500)
 const keyword = ref("")
+const logLevel = ref("info")
+const changingLevel = ref(false)
 const formatTime = (ts?: number) => { if (!ts) return "-"; return new Date(ts * 1000).toLocaleString() }
 const formatSize = (n?: number) => {
   if (!n || n <= 0) return "0 B"
@@ -96,7 +104,40 @@ const download = async () => {
     URL.revokeObjectURL(a.href)
   } catch (e) { console.error(e) }
 }
-onMounted(loadFiles)
+const renderContent = () => {
+  if (!content.value) return content.value || "选择左侧文件查看日志"
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  const color = (lv: string) => ({
+    debug: "#9aa6b2", info: "#d4d4d4", warn: "#e6a700", error: "#f56c6c", fatal: "#f56c6c"
+  }[lv] || "#d4d4d4")
+  return content.value.split(/\r?\n/).map((ln: string) => {
+    const m = ln.match(/\[(DEBUG|INFO|WARN|ERROR|FATAL)\]/)
+    const colorCode = m ? color(m[1].toLowerCase()) : null
+    if (!colorCode) return esc(ln)
+    return `<span style="color:${colorCode}">${esc(ln)}</span>`
+  }).join("\n")
+}
+const loadLogLevel = async () => {
+  try {
+    const res: any = await loggingApi.get()
+    if (res.code === 0 && res.data?.level) logLevel.value = res.data.level
+  } catch (e) { console.error(e) }
+}
+const onLevelChange = async () => {
+  const lv = logLevel.value
+  if (!["debug", "info", "warn", "error"].includes(lv)) return
+  changingLevel.value = true
+  try {
+    const res: any = await loggingApi.set(lv)
+    if (res.code === 0) {
+      ElMessage.success(`日志级别已修改为 ${lv.toUpperCase()}`)
+    } else {
+      ElMessage.error(res.msg || "修改失败")
+    }
+  } catch (e) { console.error(e); ElMessage.error("修改日志级别失败") }
+  finally { changingLevel.value = false }
+}
+onMounted(() => { loadLogLevel(); loadFiles() })
 </script>
 <style scoped>
 .subtitle { color: var(--app-text-tertiary); font-size: 12px; font-weight: 400; }

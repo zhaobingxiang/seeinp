@@ -20,8 +20,16 @@ api.interceptors.response.use(
   (response) => response.data,
   (error) => {
     if (error.response?.status === 401) {
-      localStorage.removeItem('token')
-      window.location.href = '/ps/login'
+      // 登录/初始化接口的 401 是"账号或密码错误"等业务失败：不跳转页面，
+      // 由调用方（Login.vue 等）用 ElMessage 弹出具体错误提示；
+      // 已在登录页时同样无需跳转（否则整页刷新会把提示吞掉）
+      const url: string = error.config?.url || ''
+      const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/init')
+      const onLoginPage = window.location.pathname.startsWith('/ps/login')
+      if (!isAuthEndpoint && !onLoginPage) {
+        localStorage.removeItem('token')
+        window.location.href = '/ps/login'
+      }
     }
     return Promise.reject(error)
   }
@@ -65,6 +73,11 @@ export const auditApi = {
 export const logApi = {
   listFiles: () => api.get('/logs'),
   content: (file: string, lines: number, keyword?: string, download?: boolean) => api.get('/logs/content', { params: { file, lines, keyword, download } })
+}
+
+export const loggingApi = {
+  get: () => api.get('/logging'),
+  set: (level: string) => api.put('/logging', { level })
 }
 
 export default api

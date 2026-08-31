@@ -1,5 +1,5 @@
 [server]
-server_addr = "170.106.109.105:999"
+server_addr = "see.timesee.cn:99"
 
 [auth]
 username = "user1"

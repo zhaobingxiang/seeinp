@@ -39,7 +39,7 @@ type PSLocalConfig struct {
 // LoadPSConfig loads seeinps configuration from file
 func LoadPSConfig(path string) (*PSConfig, error) {
 	config := &PSConfig{
-		Server: PSServerConfig{ServerAddr: "127.0.0.1:999"},
+		Server: PSServerConfig{ServerAddr: "127.0.0.1:99"},
 		TLS:    PSTLSConfig{Enabled: true},
 		Local:  PSLocalConfig{BendAddr: ":65443"},
 		Logging: LoggingConfig{

@@ -1,6 +1,6 @@
 // Package webui 通过 go:embed 内嵌 PM/PS 两套 Vue 前端构建产物，使二进制版本包自包含：
 // 一键升级二进制即同步更新前端，不再依赖磁盘上的 dist 目录（也杜绝命中旧构建的坑）。
-// 构建时由 scripts/build.sh 先构建前端并拷贝到本包 files 目录；未构建时使用占位页（可编译）。
+// 构建时由 build/build.sh 先构建前端并拷贝到本包 files 目录；未构建时使用占位页（可编译）。
 package webui
 
 import (

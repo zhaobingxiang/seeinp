@@ -1,7 +1,7 @@
 # seeinps test config
 
 [server]
-server_addr = "127.0.0.1:999"
+server_addr = "127.0.0.1:99"
 
 [auth]
 username = "user1"

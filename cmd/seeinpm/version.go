@@ -320,7 +320,7 @@ func (s *Server) handleVersionUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if version == "" {
 		os.Remove(tmpPath)
-		writeErr(w, http.StatusBadRequest, 2002, "无法识别包内版本，请使用 scripts/build.sh 构建或手动填写版本号")
+		writeErr(w, http.StatusBadRequest, 2002, "无法识别包内版本，请使用 build/build.sh 构建或手动填写版本号")
 		return
 	}
 	if !versionPattern.MatchString(version) {
@@ -547,6 +547,7 @@ func (s *Server) handleUpgradeReport(msg *protocol.Message, client *Client) {
 	}
 	fmt.Printf("[UPGRADE] %s package %s verified, node restarting\n", client.username, d.Version)
 	upgradeStage(client.username, "verified", "")
+	s.store.InsertAuditLog(client.username, "client_upgrade", d.Version, "via=publish verified")
 }
 
 // handleVersionListReq 处理 B 端版本列表查询：按节点平台过滤后返回（不含文件内容）
@@ -581,6 +582,7 @@ func (s *Server) handleVersionPullReq(msg *protocol.Message, client *Client) {
 	} else {
 		respData = &protocol.UpgradePushData{ReleaseID: v.ID, Version: v.Version, GoOS: v.GoOS, GoArch: v.GoArch, Sha256: v.Sha256, Size: v.FileSize}
 		fmt.Printf("[VERSION] %s pulls %s (%d bytes)\n", client.username, v.Version, v.FileSize)
+		s.store.InsertAuditLog(client.username, "client_upgrade", v.Version, fmt.Sprintf("via=self-pull size=%d", v.FileSize))
 	}
 	client.writeControl(&protocol.Message{Type: protocol.TypeVersionPullResp, ID: msg.ID, Ts: time.Now().Unix(), Code: &code, Data: respData})
 	if code == int(protocol.CodeOK) {

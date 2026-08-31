@@ -1,7 +1,7 @@
 # seeinpm test config
 
 [server]
-addr = ":999"
+addr = ":99"
 
 [tls]
 enabled = true

@@ -9,20 +9,58 @@
       <div class="form-tip" style="margin-top:10px">
         支持两种升级方式：直接上传新版本包（版本号自动从包内识别），或从 seeinpm 版本库拉取。升级过程中全部代理会短暂断开，完成后自动恢复。
       </div>
-      <template v-if="upStage === 'pulling' || upStage === 'receiving'">
-        <el-progress :percentage="upPercent" style="width:100%;margin-top:14px" />
-        <div class="form-tip" style="margin-top:6px">
-          正在从 seeinpm 拉取升级包{{ upTargetVersion ? '（目标版本 ' + upTargetVersion + '）' : '' }}：{{ formatSize(upDoneBytes) }} / {{ formatSize(upTotalBytes) }}
+    </div>
+
+    <!-- 升级进度弹窗 -->
+    <el-dialog v-model="showUpDialog" :close-on-click-modal="false" :close-on-press-escape="false" :show-close="upStage === 'failed'"
+      width="440px" align-center>
+      <template #header>
+        <span>{{ dialogTitle }}</span>
+      </template>
+
+      <!-- 拉取中 -->
+      <template v-if="upStage === 'pulling'">
+        <div class="up-dialog-body">
+          <el-progress :percentage="percent" :indeterminate="true" :duration="2"
+            :stroke-width="10" :show-text="false" style="width:100%" />
+          <div class="up-dialog-tip">
+            正在从 seeinpm 拉取升级包{{ upTargetVersion ? '（目标版本 ' + upTargetVersion + '）' : '' }}，请勿关闭本页面…
+          </div>
         </div>
       </template>
-      <el-progress v-if="upStage === 'applying'" :percentage="100" status="success" style="width:100%;margin-top:14px" />
-      <el-alert v-if="upStage === 'applying'" type="success" :closable="false" style="margin-top:8px"
-        title="升级包校验通过，节点正在重启恢复（约 1 分钟内自动恢复全部代理）" />
-      <el-alert v-if="upDone" type="success" :closable="false" style="margin-top:12px"
-        :title="`✅ 升级完成，节点已运行 ${currentVersion}，代理已自动恢复`" />
-      <el-alert v-if="upStage === 'failed'" type="error" :closable="false" style="margin-top:12px"
-        :title="'升级失败：' + upErrMsg" />
-    </div>
+
+      <!-- 接收升级包 -->
+      <template v-else-if="upStage === 'receiving'">
+        <div class="up-dialog-body">
+          <el-progress :percentage="percent" :stroke-width="12" style="width:100%" />
+          <div class="up-dialog-tip">
+            正在接收升级包：{{ formatSize(upDoneBytes) }} / {{ formatSize(upTotalBytes) }}，接收完成后自动校验并重启。
+          </div>
+        </div>
+      </template>
+
+      <!-- 应用升级 -->
+      <template v-else-if="upStage === 'applying'">
+        <div class="up-dialog-body">
+          <el-progress :percentage="100" status="success" :stroke-width="12" style="width:100%" />
+          <div class="up-dialog-tip">升级包校验通过，节点正在重启恢复（约 1 分钟内自动恢复全部代理），请稍候…</div>
+        </div>
+      </template>
+
+      <!-- 升级成功 -->
+      <template v-else-if="upDone">
+        <div class="up-dialog-body">
+          <el-result icon="success" title="升级成功" :sub-title="`节点已成功升级到 ${currentVersion}，正在重启，页面即将自动刷新…`" />
+        </div>
+      </template>
+
+      <!-- 升级失败 -->
+      <template v-else-if="upStage === 'failed'">
+        <div class="up-dialog-body">
+          <el-result icon="error" title="升级失败" :sub-title="upErrMsg" />
+        </div>
+      </template>
+    </el-dialog>
 
     <!-- 从 seeinpm 拉取升级 -->
     <div class="page-card" style="padding:20px;margin-bottom:20px">
@@ -34,10 +72,10 @@
         <el-empty description="seeinpm 版本库暂无本平台的版本包" />
       </div>
       <el-table v-else :data="pmVersions" style="width: 100%">
-        <el-table-column prop="version" label="版本号" width="150">
+        <el-table-column prop="version" label="版本号" width="160">
           <template #default="{ row }">
             <span style="font-family:var(--font-mono,monospace)">{{ row.version }}</span>
-            <el-tag v-if="row.version === currentVersion" type="info" size="small" style="margin-left:6px">当前</el-tag>
+            <el-tag v-if="badgeFor(row.version)" :type="badgeFor(row.version).type" size="small" style="margin-left:6px">{{ badgeFor(row.version).text }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="大小" width="110">
@@ -52,7 +90,7 @@
         <el-table-column label="操作" width="110">
           <template #default="{ row }">
             <el-button type="primary" size="small" :disabled="busy" @click="upgradeFromPM(row.version)">
-              {{ row.version === currentVersion ? '重新安装' : '升级到此版本' }}
+              {{ actionLabelFor(row.version) }}
             </el-button>
           </template>
         </el-table-column>
@@ -86,7 +124,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { versionApi, statusApi } from '@/api'
 import { extractVersionFromFile } from '@/utils/version'
@@ -107,9 +145,18 @@ const upDoneBytes = ref(0)
 const upTotalBytes = ref(0)
 const upTargetVersion = ref('')
 const upDone = ref(false)
+const showUpDialog = ref(false)
 
 const busy = computed(() => upStage.value === 'pulling' || upStage.value === 'receiving' || upStage.value === 'applying' || uploadingNow.value)
 const uploadingNow = ref(false)
+
+const dialogTitle = computed(() => {
+  if (upStage.value === 'failed') return '升级失败'
+  if (upDone.value) return '升级成功'
+  if (upStage.value === 'applying') return '正在应用升级'
+  if (upStage.value === 'receiving') return '正在接收升级包'
+  return '正在拉取升级包'
+})
 
 const percent = computed(() => {
   if (upStage.value === 'applying') return 100
@@ -125,6 +172,31 @@ const formatSize = (n?: number) => {
   if (n > 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB'
   if (n > 1 << 10) return (n / (1 << 10)).toFixed(1) + ' KB'
   return n + ' B'
+}
+
+// 五段版本号逐段数值比较：>0 表示 a 更新
+const compareVersion = (a: string, b: string) => {
+  const pa = (a || '').split('.').map((x: string) => parseInt(x, 10))
+  const pb = (b || '').split('.').map((x: string) => parseInt(x, 10))
+  if (pa.length !== 5 || pa.some((n: number) => isNaN(n))) return -1
+  if (pb.length !== 5 || pb.some((n: number) => isNaN(n))) return 1
+  for (let i = 0; i < 5; i++) {
+    if (pa[i] !== pb[i]) return pa[i] > pb[i] ? 1 : -1
+  }
+  return 0
+}
+
+// 相对当前版本的操作标签：重新安装 / 升级到此版本 / 回滚至该版本
+const actionLabelFor = (version: string) => {
+  if (version === currentVersion.value) return '重新安装'
+  if (compareVersion(version, currentVersion.value) > 0) return '升级到此版本'
+  return '回滚至该版本'
+}
+// 版本状态标签：最新 / 当前 / 更低版本（回滚目标）
+const badgeFor = (version: string) => {
+  if (version === currentVersion.value) return { text: '当前', type: 'info' as const }
+  if (compareVersion(version, currentVersion.value) > 0) return { text: '最新', type: 'success' as const }
+  return { text: '更低版本', type: 'warning' as const }
 }
 
 const preSessionId = ref('')
@@ -180,6 +252,8 @@ const pollStatus = () => {
       upDoneBytes.value = d.doneBytes || 0
       upTotalBytes.value = d.totalBytes || 0
       if (d.stage === 'failed') {
+        upErrMsg.value = d.error || '未知错误'
+        showUpDialog.value = true
         ElMessage.error('升级失败：' + (d.error || '未知错误'))
         stopPoll()
       } else if (d.stage === 'idle') {
@@ -190,9 +264,14 @@ const pollStatus = () => {
         const restarted = !!(preSessionId.value && res.data?.sessionId && res.data.sessionId !== preSessionId.value)
         if (upTargetVersion.value && restarted && currentVersion.value === upTargetVersion.value) {
           upDone.value = true
+          showUpDialog.value = true
           ElMessage.success(`升级完成：节点已运行 ${currentVersion.value}，代理已自动恢复`)
+          // 确认升级成功后，等待 3 秒刷新页面
+          window.setTimeout(() => { window.location.reload() }, 3000)
         } else if (upTargetVersion.value) {
-          ElMessage.warning('节点已重启，请确认当前版本（预期 ' + upTargetVersion.value + '）')
+          showUpDialog.value = true
+          upStage.value = 'failed'
+          upErrMsg.value = '节点已重启，请确认当前版本（预期 ' + upTargetVersion.value + '）'
         }
         loadPMVersions()
       }
@@ -205,6 +284,16 @@ const stopPoll = () => {
 }
 
 const upgradeFromPM = async (version: string) => {
+  // 风险确认：告知升级会中断本节点代理
+  try {
+    await ElMessageBox.confirm(
+      `${actionLabelFor(version)} ${version} 期间，本节点的全部代理将中断，客户端无法使用映射端口，操作完成后节点自动重连并恢复端口映射。\n\n是否确认开始？`,
+      '升级风险提示',
+      { type: 'warning', confirmButtonText: '我已了解，开始操作', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch {
+    return // 用户取消，不执行升级
+  }
   try {
     // 记录当前会话 ID：节点重启重连后会变化，用于判定升级完成
     const st: any = await statusApi.getStatus()
@@ -212,7 +301,9 @@ const upgradeFromPM = async (version: string) => {
     const res: any = await versionApi.pmUpgrade(version)
     if (res.code === 0) {
       upTargetVersion.value = version
+      upDone.value = false
       upStage.value = 'pulling'
+      showUpDialog.value = true
       pollStatus()
     } else {
       ElMessage.error(res.message || '发起升级失败')
@@ -227,6 +318,16 @@ const handleSelfUpload = async () => {
     ElMessage.warning('请选择安装包文件')
     return
   }
+  // 风险确认：告知升级会中断本节点代理
+  try {
+    await ElMessageBox.confirm(
+      `上传并应用升级包期间，本节点的全部代理将中断，客户端无法使用映射端口，升级完成后节点自动重连并恢复端口映射。\n\n是否确认开始升级？`,
+      '升级风险提示',
+      { type: 'warning', confirmButtonText: '我已了解，开始升级', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch {
+    return // 用户取消，不执行升级
+  }
   uploadingNow.value = true
   try {
     const fd = new FormData()
@@ -235,8 +336,10 @@ const handleSelfUpload = async () => {
     if (res.code === 0) {
       // 后端自动识别包内版本，作为完成判定依据
       upTargetVersion.value = res.data?.version || ''
+      upDone.value = false
       ElMessage.success('上传完成，节点正在应用升级（即将重启）')
       upStage.value = 'applying'
+      showUpDialog.value = true
       pollStatus()
     } else {
       ElMessage.error(res.message || '上传失败')
@@ -272,5 +375,19 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--app-text-tertiary);
   line-height: 1.5;
+}
+</style>
+
+<style>
+/* 升级弹窗（el-dialog 经 teleport 渲染到 body，须用非 scoped 样式） */
+.up-dialog-body {
+  padding: 6px 4px 4px;
+}
+.up-dialog-tip {
+  margin-top: 14px;
+  font-size: 13px;
+  color: var(--app-text-secondary, #606266);
+  line-height: 1.6;
+  text-align: center;
 }
 </style>

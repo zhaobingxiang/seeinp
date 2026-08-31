@@ -17,8 +17,15 @@ api.interceptors.response.use(
   (response) => response.data,
   (error) => {
     if (error.response?.status === 401) {
-      localStorage.removeItem('pm_token')
-      window.location.href = '/pm/login'
+      // 登录/初始化接口的 401 是"账号或密码错误"等业务失败：不跳转页面，
+      // 由调用方用 ElMessage 弹出具体错误提示；已在登录页时同样不跳转
+      const url: string = error.config?.url || ''
+      const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/init')
+      const onLoginPage = window.location.pathname.startsWith('/pm/login')
+      if (!isAuthEndpoint && !onLoginPage) {
+        localStorage.removeItem('pm_token')
+        window.location.href = '/pm/login'
+      }
     }
     return Promise.reject(error)
   }
@@ -60,6 +67,12 @@ export const logApi = {
   content: (file: string, lines: number, keyword?: string, download?: boolean) => api.get('/logs/content', { params: { file, lines, keyword, download } })
 }
 
+// 系统日志：运行时查询/修改日志级别
+export const loggingApi = {
+  get: () => api.get('/logging'),
+  set: (level: string) => api.put('/logging', { level })
+}
+
 // 混合架构：经控制通道按需拉取在线 seeinps 的运行日志（不落 PM 存储）
 export const psLogApi = {
   listFiles: (username: string) => api.get('/ps-logs', { params: { username } }),
@@ -78,10 +91,11 @@ export const clientApi = {
 }
 
 // 版本管理：大包在慢链路上传可能持续数十分钟，不设客户端超时，进度经 onProgress 回调反馈
+// 不要显式设置 Content-Type：axios 在 FormData + 浏览器 XHR 下会自动添加带 boundary 的 multipart header；
+// 显式写 "multipart/form-data"（无 boundary）会让浏览器原样发送，导致服务端 r.ParseMultipartForm 失败
 export const versionApi = {
   list: (endpoint: string) => api.get('/versions', { params: { endpoint } }),
   upload: (formData: FormData, onProgress?: (percent: number) => void) => api.post('/versions', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 0,
     onUploadProgress: (e: any) => { if (e.total) onProgress?.(Math.round((e.loaded / e.total) * 100)) }
   }),
