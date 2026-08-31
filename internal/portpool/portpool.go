@@ -83,9 +83,10 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, u
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Check if this proxyID already has an active allocation
-	if existing, err := p.store.GetPortByProxyID(proxyID); err == nil {
-		fmt.Printf("[POOL] Reusing port %d for proxy %s\n", existing.Port, proxyID)
+	// Check if this (user, proxy) already has an active allocation.
+	// 复合键定位：proxyID 并非全局唯一（不同用户的 web-ui 同名），只按 proxyID 会误复用他人端口
+	if existing, err := p.store.GetPortByUserProxy(userID, proxyID); err == nil {
+		fmt.Printf("[POOL] Reusing port %d for user=%s proxy=%s\n", existing.Port, userID, proxyID)
 		return &Allocation{
 			Port:    existing.Port,
 			UserID:  existing.UserID,
@@ -107,7 +108,7 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, u
 		// 复用该代理的历史端口（含已释放）：见 inps 断线重连后对外端口保持稳定，
 		// 避免 cleanup 释放 + 重连重分配导致端口漂移。
 		// 注意：历史端口必须仍在新池内（端口池改小后池外端口不再复用，强制回池内重新分配）
-		if last, err := p.store.GetLastPortByProxyID(proxyID); err == nil && !p.store.IsPortAllocated(last.Port) {
+		if last, err := p.store.GetLastPortByUserProxy(userID, proxyID); err == nil && !p.store.IsPortAllocated(last.Port) {
 			if p.containsLocked(last.Port) {
 				if inRanges(last.Port, userRanges) {
 					if err := p.checkSystemPort(last.Port); err == nil {
@@ -131,7 +132,7 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, u
 	}
 
 	// 清理本代理的历史释放记录，再按端口 upsert（端口可能残留其他代理的释放行）
-	if err := p.store.DeleteReleasedByProxyID(proxyID); err != nil {
+	if err := p.store.DeleteReleasedByUserProxy(userID, proxyID); err != nil {
 		return nil, fmt.Errorf("cleanup released allocation: %w", err)
 	}
 	if err := p.store.UpsertPortAllocation(port, userID, proxyID, proxyType); err != nil {
@@ -146,10 +147,10 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, u
 	}, nil
 }
 
-func (p *Pool) Release(proxyID string) {
+func (p *Pool) Release(userID, proxyID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.store.ReleasePort(proxyID)
+	p.store.ReleasePortByUserProxy(userID, proxyID)
 }
 
 func (p *Pool) checkAvailable(port int) error {

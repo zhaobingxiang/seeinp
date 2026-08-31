@@ -108,6 +108,16 @@ type PublicListener struct {
 	connsMu     sync.Mutex
 }
 
+// mapKey 返回该监听器在 publicConnsByProxy 中的复合键（user:proxy）。
+// 监听器因端口被复用而停止时，按端口从 publicConns 取回 pl 再据此删除自身条目。
+func (pl *PublicListener) mapKey() string {
+	u := ""
+	if pl.Client != nil {
+		u = pl.Client.username
+	}
+	return u + ":" + pl.ProxyID
+}
+
 func NewServer(config *config.PMConfig) (*Server, error) {
 	s, err := store.New(config.Database.Path)
 	if err != nil {
@@ -394,12 +404,13 @@ func (s *Server) cleanupStaleAllocations() {
 
 	for _, alloc := range stale {
 		s.stopPublicListener(alloc.Port)
-		s.portPool.Release(alloc.ProxyID)
 		s.flushTraffic(alloc.UserID, alloc.ProxyID)
 		if err := s.store.MarkProxyOffline(alloc.UserID, alloc.ProxyID); err != nil {
 			log.Printf("[CLEANUP] Mark proxy offline error: %v", err)
 		}
-		fmt.Printf("[CLEANUP] Released port %d for offline user %s\n", alloc.Port, alloc.UserID)
+		// 方案B：离线只停公网转发，端口仍预留给该代理；只有代理或用户被删除才放回公共池，
+		// 避免重连前端口被其他用户（如新部署的 web-ui 映射）抢占。
+		fmt.Printf("[CLEANUP] proxy=%s user=%s offline, port %d kept reserved\n", alloc.ProxyID, alloc.UserID, alloc.Port)
 	}
 
 	if len(stale) > 0 {
@@ -451,7 +462,8 @@ func (s *Server) startPublicListener(port int, proxyID, proxyType string, client
 
 	s.publicMu.Lock()
 	s.publicConns[port] = pl
-	s.publicConnsByProxy[proxyID] = pl
+	// 复合键：proxyID 全局不唯一，不同用户的同名代理需各自独立监听器
+	s.publicConnsByProxy[client.username+":"+proxyID] = pl
 	s.publicMu.Unlock()
 
 	fmt.Printf("[PUBLIC] Listening on :%d for proxy %s\n", port, proxyID)
@@ -464,7 +476,7 @@ func (s *Server) stopPublicListener(port int) {
 	pl, ok := s.publicConns[port]
 	if ok {
 		delete(s.publicConns, port)
-		delete(s.publicConnsByProxy, pl.ProxyID)
+		delete(s.publicConnsByProxy, pl.mapKey())
 	}
 	s.publicMu.Unlock()
 
@@ -956,6 +968,9 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	// 删除用户：先断开在线会话，再把其全部端口释放回公共池，最后级联清理数据
+	s.kickClient(username, "user_deleted")
+	s.releaseUserPorts(username)
 	if err := s.store.DeleteUser(username); err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -1192,13 +1207,17 @@ func (s *Server) handlePortPoolUpdate(w http.ResponseWriter, r *http.Request) {
 	oldRanges := s.portPool.GetRanges()
 	if len(outside) > 0 && req.Action == "recycle" {
 		for _, it := range outside {
-			// 在线代理踢线重连（kickClient 会停监听+释放端口+标记离线，重连后按池内重新分配）；
-			// 离线代理仅清分配记录，下次上线同样走池内
+			// 端口池收缩回收是管理员的显式治理动作：无论在线离线，都把池外代理端口
+			// 停转发并释放回公共池，重连后按池内重新分配；在线代理同时踢线强制造应新模式
 			if _, active := s.isClientActive(it.username); active {
 				s.kickClient(it.username, "port_pool_shrunk")
-			} else {
-				_ = s.store.ReleasePort(it.proxyID)
 			}
+			if alloc, err := s.store.GetPortByUserProxy(it.username, it.proxyID); err == nil {
+				s.stopPublicListener(alloc.Port)
+			}
+			s.portPool.Release(it.username, it.proxyID)
+			s.flushTraffic(it.username, it.proxyID)
+			_ = s.store.MarkProxyOffline(it.username, it.proxyID)
 			recycled = append(recycled, map[string]interface{}{"username": it.username, "proxyId": it.proxyID, "port": it.port})
 		}
 	} else {
@@ -1292,7 +1311,7 @@ func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 		}
 		if p.Online {
 			s.publicMu.RLock()
-			if pl, ok := s.publicConnsByProxy[p.ProxyID]; ok && pl.Client != nil && pl.Client.username == p.Username {
+			if pl, ok := s.publicConnsByProxy[p.Username+":"+p.ProxyID]; ok {
 				resp.Port = pl.Port
 			}
 			s.publicMu.RUnlock()
@@ -1357,12 +1376,12 @@ func (s *Server) handleProxyDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.publicMu.RLock()
-	pl, online := s.publicConnsByProxy[proxyID]
+	pl, online := s.publicConnsByProxy[username+":"+proxyID]
 	s.publicMu.RUnlock()
 	if online && pl.Client != nil && pl.Client.username == username {
 		s.stopPublicListener(pl.Port)
 		pl.killActiveConns()
-		s.portPool.Release(proxyID)
+		// 方案B：禁用只停转发，端口仍预留给该代理；启用量会恢复原端口，避免被他人抢占
 		// 通知 seeinps 该代理已被禁用，使其清除转发端口并转入重试
 		pl.Client.writeControl(protocol.NewMessage(protocol.TypeProxyRevoke, &protocol.ProxyRevokeData{ProxyID: proxyID, Reason: "proxy_disabled"}))
 	}
@@ -1371,7 +1390,7 @@ func (s *Server) handleProxyDisable(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[PROXY] Mark offline error: %v", err)
 	}
 	fmt.Printf("[PROXY] %s.%s disabled\n", username, proxyID)
-	s.audit(r, "proxy_disable", username+"."+proxyID, "status=0; 已断开连接并释放端口")
+	s.audit(r, "proxy_disable", username+"."+proxyID, "status=0; 已断开连接，端口保留")
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
 
@@ -1945,7 +1964,7 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 	}
 	// 端口数量配额：仅对"新分配"生效，代理重连的端口复用不受限
 	if user.MaxPorts > 0 {
-		if _, err := s.store.GetPortByProxyID(d.ProxyID); err != nil {
+		if _, err := s.store.GetPortByUserProxy(client.username, d.ProxyID); err != nil {
 			if n, err := s.store.CountActiveAllocationsByUser(client.username); err == nil && n >= user.MaxPorts {
 				fmt.Printf("[ALLOC] proxy=%s rejected: port quota %d reached (user=%s)\n", d.ProxyID, user.MaxPorts, client.username)
 				client.writeControl(protocol.NewResponse(msg, protocol.CodePortPoolExhausted, map[string]string{"reason": "port_quota"}))
@@ -1955,7 +1974,7 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 	}
 
 	s.publicMu.RLock()
-	if oldPL, ok := s.publicConnsByProxy[d.ProxyID]; ok {
+	if oldPL, ok := s.publicConnsByProxy[client.username+":"+d.ProxyID]; ok {
 		s.publicMu.RUnlock()
 		s.stopPublicListener(oldPL.Port)
 	} else {
@@ -1976,7 +1995,7 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 
 	if err := s.startPublicListener(alloc.Port, d.ProxyID, d.Type, client); err != nil {
 		log.Printf("[ALLOC] Start listener error: %v", err)
-		s.portPool.Release(d.ProxyID)
+		s.portPool.Release(client.username, d.ProxyID)
 		client.writeControl(protocol.NewResponse(msg, protocol.CodeInternal, nil))
 		return
 	}
@@ -1998,10 +2017,10 @@ func (s *Server) handleReleasePort(msg *protocol.Message, client *Client) {
 	d := &protocol.ReleasePortData{}
 	json.Unmarshal(dataBytes, d)
 
-	if alloc, err := s.store.GetPortByProxyID(d.ProxyID); err == nil {
+	if alloc, err := s.store.GetPortByUserProxy(client.username, d.ProxyID); err == nil {
 		s.stopPublicListener(alloc.Port)
 	}
-	s.portPool.Release(d.ProxyID)
+	s.portPool.Release(client.username, d.ProxyID)
 	s.flushTraffic(client.username, d.ProxyID)
 	if err := s.store.MarkProxyOffline(client.username, d.ProxyID); err != nil {
 		log.Printf("[RELEASE] Mark proxy offline error: %v", err)
@@ -2010,7 +2029,8 @@ func (s *Server) handleReleasePort(msg *protocol.Message, client *Client) {
 	client.writeControl(protocol.NewResponse(msg, protocol.CodeOK, nil))
 }
 
-// kickClient 断开用户的控制连接并释放其全部端口（禁用/重置授权码时调用）。
+// kickClient 断开用户的控制连接并停用其公网转发（禁用/重置授权码/过期时调用）。
+// 端口在池中仍预留给该用户/代理，只有用户或代理被删除才真正放回公共池。
 // 先推送 SESSION_REVOKE 通知 seeinps 停止重连（尽力而为），再关闭会话；
 // 心跳协程退出时的 deferred 清理会清内存 client 与 DB 在线状态。
 func (s *Server) kickClient(username, reason string) {
@@ -2029,10 +2049,27 @@ func (s *Server) kickClient(username, reason string) {
 		// 无活跃连接也要清 DB 残留在线状态，否则重连被 1002 语义误判
 		s.store.ClearUserOnlineStatus(username)
 	}
-	s.releaseUserPorts(username)
+	s.stopUserForwarding(username)
 }
 
-// releaseUserPorts 停止该用户全部公网监听并释放端口
+// stopUserForwarding 停用该用户全部公网转发监听（断开/禁用/重置授权码/过期时），
+// 但保留端口在公共池中的预留：端口仍归该代理所有，直到代理或用户被删除才放回公共池。
+func (s *Server) stopUserForwarding(username string) {
+	allocs, err := s.store.GetAllocationsByUser(username)
+	if err != nil {
+		log.Printf("[USER] Stop forwarding for %s error: %v", username, err)
+		return
+	}
+	for _, a := range allocs {
+		s.stopPublicListener(a.Port)
+		s.flushTraffic(a.UserID, a.ProxyID)
+		if err := s.store.MarkProxyOffline(a.UserID, a.ProxyID); err != nil {
+			log.Printf("[USER] Mark proxy offline error: %v", err)
+		}
+	}
+}
+
+// releaseUserPorts 停止该用户全部公网监听并把端口释放回公共池（仅删除用户时调用）
 func (s *Server) releaseUserPorts(username string) {
 	allocs, err := s.store.GetAllocationsByUser(username)
 	if err != nil {
@@ -2041,7 +2078,7 @@ func (s *Server) releaseUserPorts(username string) {
 	}
 	for _, a := range allocs {
 		s.stopPublicListener(a.Port)
-		s.portPool.Release(a.ProxyID)
+		s.portPool.Release(a.UserID, a.ProxyID)
 		s.flushTraffic(a.UserID, a.ProxyID)
 		if err := s.store.MarkProxyOffline(a.UserID, a.ProxyID); err != nil {
 			log.Printf("[USER] Mark proxy offline error: %v", err)
@@ -2084,7 +2121,7 @@ func (s *Server) shutdown() {
 			pl.Ln.Close()
 		}
 		delete(s.publicConns, port)
-		delete(s.publicConnsByProxy, pl.ProxyID)
+		delete(s.publicConnsByProxy, pl.mapKey())
 	}
 	s.publicMu.Unlock()
 

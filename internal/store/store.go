@@ -256,8 +256,24 @@ func (s *Store) ClearUserOnlineStatusIfSession(username, sessionID string) error
 }
 
 func (s *Store) DeleteUser(username string) error {
-	_, err := s.db.Exec("DELETE FROM users WHERE username = ?", username)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// 级联删除：会话、代理记录与端口分配（端口分配删除后即放回公共池）
+	stmts := []string{
+		"DELETE FROM proxy_sessions WHERE username = ?",
+		"DELETE FROM proxies WHERE username = ?",
+		"DELETE FROM port_allocations WHERE user_id = ?",
+		"DELETE FROM users WHERE username = ?",
+	}
+	for _, q := range stmts {
+		if _, err := tx.Exec(q, username); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // SetUserStatus 设置用户状态（1 启用 / 0 禁用）；返回用户是否存在
@@ -310,11 +326,13 @@ type PortAllocation struct {
 	ReleasedAt  *int64
 }
 
-// GetPortByProxyID 返回该代理当前活跃（status=1）的端口分配
-func (s *Store) GetPortByProxyID(proxyID string) (*PortAllocation, error) {
+// GetPortByUserProxy 返回该代理当前活跃（status=1）的端口分配。
+// 以 (user_id, proxy_id) 复合键定位：proxy_id 并非全局唯一（例如每个部署目标的 web-ui 都叫 web-ui），
+// 不能只按 proxy_id 查，否则不同用户的同名代理会互相命中、端口被误复用。
+func (s *Store) GetPortByUserProxy(userID, proxyID string) (*PortAllocation, error) {
 	pa := &PortAllocation{}
 	var releasedAt sql.NullInt64
-	err := s.db.QueryRow("SELECT id, port, user_id, proxy_id, proxy_type, status, allocated_at, released_at FROM port_allocations WHERE proxy_id = ? AND status = 1", proxyID).Scan(&pa.ID, &pa.Port, &pa.UserID, &pa.ProxyID, &pa.ProxyType, &pa.Status, &pa.AllocatedAt, &releasedAt)
+	err := s.db.QueryRow("SELECT id, port, user_id, proxy_id, proxy_type, status, allocated_at, released_at FROM port_allocations WHERE user_id = ? AND proxy_id = ? AND status = 1", userID, proxyID).Scan(&pa.ID, &pa.Port, &pa.UserID, &pa.ProxyID, &pa.ProxyType, &pa.Status, &pa.AllocatedAt, &releasedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -324,11 +342,11 @@ func (s *Store) GetPortByProxyID(proxyID string) (*PortAllocation, error) {
 	return pa, nil
 }
 
-// GetLastPortByProxyID 返回该代理最近一次使用的端口（无论当前状态），用于断线重连后端口稳定
-func (s *Store) GetLastPortByProxyID(proxyID string) (*PortAllocation, error) {
+// GetLastPortByUserProxy 返回该代理最近一次使用的端口（无论当前状态），用于断线重连后端口稳定
+func (s *Store) GetLastPortByUserProxy(userID, proxyID string) (*PortAllocation, error) {
 	pa := &PortAllocation{}
 	var releasedAt sql.NullInt64
-	err := s.db.QueryRow("SELECT id, port, user_id, proxy_id, proxy_type, status, allocated_at, released_at FROM port_allocations WHERE proxy_id = ? ORDER BY allocated_at DESC, id DESC LIMIT 1", proxyID).Scan(&pa.ID, &pa.Port, &pa.UserID, &pa.ProxyID, &pa.ProxyType, &pa.Status, &pa.AllocatedAt, &releasedAt)
+	err := s.db.QueryRow("SELECT id, port, user_id, proxy_id, proxy_type, status, allocated_at, released_at FROM port_allocations WHERE user_id = ? AND proxy_id = ? ORDER BY allocated_at DESC, id DESC LIMIT 1", userID, proxyID).Scan(&pa.ID, &pa.Port, &pa.UserID, &pa.ProxyID, &pa.ProxyType, &pa.Status, &pa.AllocatedAt, &releasedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -338,9 +356,9 @@ func (s *Store) GetLastPortByProxyID(proxyID string) (*PortAllocation, error) {
 	return pa, nil
 }
 
-// DeleteReleasedByProxyID 清理该代理的历史释放记录，避免残留行占用 UNIQUE(port)
-func (s *Store) DeleteReleasedByProxyID(proxyID string) error {
-	_, err := s.db.Exec("DELETE FROM port_allocations WHERE proxy_id = ? AND status = 0", proxyID)
+// DeleteReleasedByUserProxy 清理该代理的历史释放记录，避免残留行占用 UNIQUE(port)
+func (s *Store) DeleteReleasedByUserProxy(userID, proxyID string) error {
+	_, err := s.db.Exec("DELETE FROM port_allocations WHERE user_id = ? AND proxy_id = ? AND status = 0", userID, proxyID)
 	return err
 }
 
@@ -354,9 +372,9 @@ ON CONFLICT(port) DO UPDATE SET user_id = excluded.user_id, proxy_id = excluded.
 	return err
 }
 
-func (s *Store) ReleasePort(proxyID string) error {
+func (s *Store) ReleasePortByUserProxy(userID, proxyID string) error {
 	now := time.Now().Unix()
-	_, err := s.db.Exec("UPDATE port_allocations SET status = 0, released_at = ? WHERE proxy_id = ? AND status = 1", now, proxyID)
+	_, err := s.db.Exec("UPDATE port_allocations SET status = 0, released_at = ? WHERE user_id = ? AND proxy_id = ? AND status = 1", now, userID, proxyID)
 	return err
 }
 
@@ -385,11 +403,6 @@ func (s *Store) GetAllocatedPorts() ([]*PortAllocation, error) {
 		allocs = append(allocs, pa)
 	}
 	return allocs, nil
-}
-
-func (s *Store) CleanupStaleAllocations() error {
-	_, err := s.db.Exec("UPDATE port_allocations SET status = 0, released_at = ? WHERE status = 1 AND user_id IN (SELECT username FROM users WHERE online_session IS NULL)", time.Now().Unix())
-	return err
 }
 
 func (s *Store) GetStaleAllocations() ([]*PortAllocation, error) {
@@ -597,6 +610,10 @@ func (s *Store) CleanupOfflineProxies(cutoff int64) (int64, error) {
 			return 0, err
 		}
 		if _, err := s.db.Exec("DELETE FROM proxies WHERE username = ? AND proxy_id = ?", k.u, k.p); err != nil {
+			return 0, err
+		}
+		// 方案B：代理被清理（删除）时其预留端口一并放回公共池
+		if _, err := s.db.Exec("DELETE FROM port_allocations WHERE user_id = ? AND proxy_id = ?", k.u, k.p); err != nil {
 			return 0, err
 		}
 	}

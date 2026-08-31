@@ -313,7 +313,7 @@ func (a *API) downloadOnRemote(stream *sseWriter, pack *installPackage, remote *
 	totalBytes := pack.fileSize
 	dlScript := fmt.Sprintf(`#!/bin/sh
 URL=$(printf '%%s' '%s' | base64 -d)
-DST=%s.part
+DST=%s
 rm -f "$DST" /tmp/seeinps-pkg.done /tmp/seeinps-pkg.sha /tmp/seeinps-pkg.exit /tmp/seeinps-pkg.err
 DL=0; TOTAL=%d; CHUNK=8192; EC=0
 while [ $DL -lt $TOTAL ]; do
@@ -336,6 +336,28 @@ touch /tmp/seeinps-pkg.done
 		appLog("warn", "[deploy] 直连下载准备失败: %v", err)
 		return false
 	}
+
+	// 预检：部分带安全 agent/网关的机器只放行小响应，吞掉 HTTP 大文件下载体 ——
+	// 这类环境直连必然 0 字节超时。用 1MB Range 探针尽早判定，命中即切 SFTP，不再空等分片下载。
+	probeScript := fmt.Sprintf(`#!/bin/sh
+URL=$(printf '%%s' '%s' | base64 -d)
+curl -sS --connect-timeout 10 --max-time 30 -r 0-1048575 "$URL" -o /tmp/seeinps-pkg.probe 2>/tmp/seeinps-pkg.probe.err
+RC=$?
+SZ=$(stat -c %%s /tmp/seeinps-pkg.probe 2>/dev/null || echo 0)
+rm -f /tmp/seeinps-pkg.probe
+echo "rc=$RC size=$SZ"
+`, urlB64)
+	probeOut, probeErr := remote.runAsRoot(fmt.Sprintf("printf '%%s' %s | base64 -d > /tmp/seeinps-probe.sh && chmod +x /tmp/seeinps-probe.sh && bash /tmp/seeinps-probe.sh; rm -f /tmp/seeinps-probe.sh",
+		shellB64(base64.StdEncoding.EncodeToString([]byte(probeScript)))))
+	_ = probeErr // runAsRoot 的退出码仅反映外层 rm 是否成功，结果一律从 stdout 解析
+	var preRC, preSize int
+	fmt.Sscanf(strings.TrimSpace(string(probeOut)), "rc=%d size=%d", &preRC, &preSize)
+	if preRC != 0 || preSize == 0 {
+		stream.warn(fmt.Sprintf("直连下载被目标机安全策略拦截（探针 rc=%d 已下载 %d 字节），回退到 SFTP 上传", preRC, preSize))
+		appLog("warn", "[deploy] 直连下载被拦截: 探针 rc=%d size=%d", preRC, preSize)
+		return false
+	}
+	stream.info("直连下载预检通过（探针 rc=0 已下载 1MiB），开始分片下载")
 
 	// 后台启动下载脚本
 	if _, err := remote.runAsRoot("nohup /tmp/seeinps-dl.sh >/dev/null 2>&1 & echo started"); err != nil {
@@ -369,7 +391,7 @@ touch /tmp/seeinps-pkg.done
 			break
 		}
 		if size == lastSize {
-			if time.Since(stallSince) > 10*time.Second {
+			if time.Since(stallSince) > 45*time.Second {
 				errOut, _ := remote.run("cat /tmp/seeinps-pkg.err 2>/dev/null | tail -3")
 				stream.warn(fmt.Sprintf("直连下载停滞超 45 秒（已下载 %d/%d 字节），回退到 SFTP 上传；curl 输出：%s", size, pack.fileSize, strings.TrimSpace(string(errOut))))
 				appLog("warn", "[deploy] 直连下载停滞 %d/%d curl_stderr=%s", size, pack.fileSize, strings.TrimSpace(string(errOut)))
