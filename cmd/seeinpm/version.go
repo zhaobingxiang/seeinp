@@ -96,7 +96,7 @@ func upgradeProgress(username string, sent int64) {
 	st.mu.Unlock()
 }
 
-// completeUpgradeIfMatches 节点重连上报版本后调用：存在 sent 阶段的升级记录且版本一致，
+// completeUpgradeIfMatches 节点重连上报版本后调用：存在升级记录且版本一致，
 // 则推进为 verified——校验回报可能在节点 exec 重启瞬间丢失（写完即重启），不能依赖它判定成功
 func completeUpgradeIfMatches(username, version string) {
 	upgradeStatesMu.Lock()
@@ -107,8 +107,29 @@ func completeUpgradeIfMatches(username, version string) {
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if st.stage == "sent" && st.version == version {
+	// sent：正常完成路径；failed/transferring：流写入报 session shutdown 但节点实际
+	// 已收完包并重启成功（以重连 HELLO 版本为准），同样判定升级成功
+	if st.version == version && st.stage != "verified" {
 		st.stage = "verified"
+		st.errMsg = ""
+		st.updatedAt = time.Now()
+	}
+}
+
+// upgradeFailIfNotVerified 仅当当前阶段不是 verified 时才标记失败（原子防覆盖）：
+// 节点收完包立即重启会使 PM 侧流写入报错，但包实际已完整接收并被节点校验通过
+func upgradeFailIfNotVerified(username, errMsg string) {
+	upgradeStatesMu.Lock()
+	defer upgradeStatesMu.Unlock()
+	st, ok := upgradeStates[username]
+	if !ok {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.stage != "verified" {
+		st.stage = "failed"
+		st.errMsg = errMsg
 		st.updatedAt = time.Now()
 	}
 }
@@ -457,7 +478,9 @@ func (s *Server) handleClientUpgrade(w http.ResponseWriter, r *http.Request) {
 		upgradeStage(username, "transferring", "")
 		if err := s.sendUpgradeStream(client, v); err != nil {
 			fmt.Printf("[UPGRADE] %s stream send error: %v\n", username, err)
-			upgradeStage(username, "failed", "传输升级包失败: "+err.Error())
+			// 节点收完全部字节并校验通过后会立即重启（旧连接关闭 → session shutdown），
+			// 此时 UPGRADE_REPORT 已把状态推进为 verified，不能再覆盖为 failed
+			upgradeFailIfNotVerified(username, "传输升级包失败: "+err.Error())
 			return
 		}
 		upgradeStage(username, "sent", "")
