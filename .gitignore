@@ -29,9 +29,10 @@ Thumbs.db
 dist/
 bin/
 
-# 开发目录不入库（用户决定 2026-09-01：test/ 与 build/ 仅本地维护）
+# 开发目录不入库（用户决定 2026-09-01：test/、build/、docs/ 仅本地维护）
 /test/
 /build/
+/docs/
 
 # Logs
 logs/
