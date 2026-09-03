@@ -59,14 +59,14 @@
           </el-table-column>
           <el-table-column label="类型" width="110">
             <template #default="{ row }">
-              <el-tag size="small" :type="row.type === 'tcp' ? 'primary' : 'warning'">
-                {{ row.type === 'tcp' ? 'TCP' : '运维HTTP' }}
+              <el-tag size="small" :type="row.type === 'ops_http' ? 'warning' : 'primary'">
+                {{ row.type === 'tcp' ? 'TCP' : row.type === 'udp' ? 'UDP' : '运维HTTP' }}
               </el-tag>
             </template>
           </el-table-column>
           <el-table-column label="本地" min-width="170">
             <template #default="{ row }">
-              <span v-if="row.type === 'tcp'" style="font-family:var(--font-mono,monospace);font-size:13px">{{ row.localAddr }}:{{ row.localPort }}</span>
+              <span v-if="row.type === 'tcp' || row.type === 'udp'" style="font-family:var(--font-mono,monospace);font-size:13px">{{ row.localAddr }}:{{ row.localPort }}</span>
               <span v-else>账号 {{ row.proxyUsername }}</span>
             </template>
           </el-table-column>

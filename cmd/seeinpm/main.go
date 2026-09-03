@@ -31,6 +31,7 @@ import (
 	"github.com/seeinp/seeinp/internal/protocol"
 	"github.com/seeinp/seeinp/internal/store"
 	"github.com/seeinp/seeinp/internal/tlsutil"
+	"github.com/seeinp/seeinp/internal/udpframing"
 	"github.com/seeinp/seeinp/internal/version"
 	"github.com/seeinp/seeinp/internal/webui"
 )
@@ -38,6 +39,8 @@ import (
 const (
 	connReadTimeout = 60 * time.Second
 	connIdleTimeout = 300 * time.Second
+	// udpSessionIdle 会话无任何双向活动超过此时间则回收（与 seeinps 联动）
+	udpSessionIdle = 120 * time.Second
 )
 
 type Server struct {
@@ -101,11 +104,22 @@ type PublicListener struct {
 	ProxyID string
 	Type    string
 	Ln      net.Listener
+	// UdpConn 仅 UDP 映射使用（type=="udp"）；TCP 类代理为 nil
+	UdpConn net.PacketConn
 	Client  *Client
 	tr      *proxyTraffic
 	// activeConns 跟踪该监听器上的活动转发连接（公网连接与 mux 流），禁用时强制断开
 	activeConns map[net.Conn]struct{}
 	connsMu     sync.Mutex
+	// udpSessions 按外部客户端源地址索引的 UDP 会话（仅 UDP 代理使用）
+	udpSessions map[string]*udpPMSession
+	udpMu       sync.Mutex
+}
+
+// udpPMSession 一个外部 UDP 客户端会话：公网侧共享 UdpConn，back 侧独占一条 yamux 流。
+type udpPMSession struct {
+	clientAddr net.Addr
+	stream     net.Conn
 }
 
 // mapKey 返回该监听器在 publicConnsByProxy 中的复合键（user:proxy）。
@@ -445,19 +459,30 @@ func (s *Server) cleanupStaleAllocations() {
 
 // Public listener functions
 func (s *Server) startPublicListener(port int, proxyID, proxyType string, client *Client) error {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		return fmt.Errorf("listen on port %d: %w", port, err)
-	}
-
 	pl := &PublicListener{
 		Port:        port,
 		ProxyID:     proxyID,
 		Type:        proxyType,
-		Ln:          ln,
 		Client:      client,
 		tr:          s.trafficFor(client.username, proxyID),
 		activeConns: make(map[net.Conn]struct{}),
+	}
+
+	if proxyType == "udp" {
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+		if err != nil {
+			return fmt.Errorf("listen udp on port %d: %w", port, err)
+		}
+		pl.UdpConn = pc
+		pl.udpSessions = make(map[string]*udpPMSession)
+		fmt.Printf("[PUBLIC] Listening UDP on :%d for proxy %s\n", port, proxyID)
+	} else {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			return fmt.Errorf("listen on port %d: %w", port, err)
+		}
+		pl.Ln = ln
+		fmt.Printf("[PUBLIC] Listening on :%d for proxy %s\n", port, proxyID)
 	}
 
 	s.publicMu.Lock()
@@ -466,8 +491,11 @@ func (s *Server) startPublicListener(port int, proxyID, proxyType string, client
 	s.publicConnsByProxy[client.username+":"+proxyID] = pl
 	s.publicMu.Unlock()
 
-	fmt.Printf("[PUBLIC] Listening on :%d for proxy %s\n", port, proxyID)
-	go s.acceptPublicConnections(pl)
+	if pl.UdpConn != nil {
+		go s.acceptPublicUDPConnections(pl)
+	} else {
+		go s.acceptPublicConnections(pl)
+	}
 	return nil
 }
 
@@ -480,10 +508,17 @@ func (s *Server) stopPublicListener(port int) {
 	}
 	s.publicMu.Unlock()
 
-	if ok && pl.Ln != nil {
-		pl.Ln.Close()
-		fmt.Printf("[PUBLIC] Stopped listening on :%d\n", port)
+	if !ok {
+		return
 	}
+	if pl.Ln != nil {
+		pl.Ln.Close()
+	}
+	if pl.UdpConn != nil {
+		pl.udpCloseAllSessions()
+		pl.UdpConn.Close()
+	}
+	fmt.Printf("[PUBLIC] Stopped listening on :%d\n", port)
 }
 
 func (s *Server) acceptPublicConnections(pl *PublicListener) {
@@ -529,11 +564,102 @@ func (pl *PublicListener) untrackConns(conns ...net.Conn) {
 // killActiveConns 强制关闭该监听器上的全部活动转发连接（禁用代理时调用）
 func (pl *PublicListener) killActiveConns() {
 	pl.connsMu.Lock()
-	defer pl.connsMu.Unlock()
 	for c := range pl.activeConns {
 		c.Close()
 	}
 	pl.activeConns = make(map[net.Conn]struct{})
+	pl.connsMu.Unlock()
+	pl.udpCloseAllSessions()
+}
+
+// udpCloseAllSessions 关闭该 UDP 监听器上的全部会话流（禁用/端口复用/停止时调用）
+func (pl *PublicListener) udpCloseAllSessions() {
+	pl.udpMu.Lock()
+	defer pl.udpMu.Unlock()
+	for _, sess := range pl.udpSessions {
+		if sess.stream != nil {
+			sess.stream.Close()
+		}
+	}
+}
+
+// acceptPublicUDPConnections UDP 代理共享一个公网 UDP socket（ReadFrom 得到源地址），
+// 每个源地址映射一条 yamux 会话流，按会话分帧转发。
+func (s *Server) acceptPublicUDPConnections(pl *PublicListener) {
+	pc := pl.UdpConn
+	buf := make([]byte, udpframing.MaxDatagram)
+	for {
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		payload := make([]byte, n)
+		copy(payload, buf[:n])
+		s.routeUDPPacket(pl, addr, payload)
+	}
+}
+
+// routeUDPPacket 命中或新建外部源地址对应的会话并转发一个数据报。
+func (s *Server) routeUDPPacket(pl *PublicListener, addr net.Addr, payload []byte) {
+	key := addr.String()
+	pl.udpMu.Lock()
+	sess, ok := pl.udpSessions[key]
+	if !ok {
+		stream, err := pl.Client.session.Open()
+		if err != nil {
+			log.Printf("[UDP] open stream error: %v", err)
+			pl.udpMu.Unlock()
+			return
+		}
+		// 会话建立流头：stype(0x02) + proxyIdLen + proxyId + clientLen + clientAddr
+		ca := addr.String()
+		header := make([]byte, 3+len(pl.ProxyID)+len(ca))
+		header[0] = protocol.StreamTypeUDP
+		header[1] = byte(len(pl.ProxyID))
+		copy(header[2:], pl.ProxyID)
+		h := 2 + len(pl.ProxyID)
+		header[h] = byte(len(ca))
+		copy(header[h+1:], ca)
+		if _, err := stream.Write(header); err != nil {
+			stream.Close()
+			log.Printf("[UDP] write header error: %v", err)
+			pl.udpMu.Unlock()
+			return
+		}
+		sess = &udpPMSession{clientAddr: addr, stream: stream}
+		pl.udpSessions[key] = sess
+		go s.udpResponsePump(pl, key, sess)
+	}
+	stream := sess.stream
+	pl.udpMu.Unlock()
+
+	// 外网→内网：写一帧到会话流，并刷新空闲计时（双方共享同一流）
+	stream.SetReadDeadline(time.Now().Add(udpSessionIdle))
+	udpframing.WriteFrame(stream, payload)
+	pl.tr.in.Add(int64(len(payload)))
+}
+
+// udpResponsePump 内网→外网：读会话流帧，写回公网 socket 对应源地址；流关闭/空闲超时回收会话。
+func (s *Server) udpResponsePump(pl *PublicListener, key string, sess *udpPMSession) {
+	defer sess.stream.Close()
+	defer func() {
+		pl.udpMu.Lock()
+		delete(pl.udpSessions, key)
+		pl.udpMu.Unlock()
+	}()
+	buf := make([]byte, udpframing.MaxDatagram)
+	for {
+		sess.stream.SetReadDeadline(time.Now().Add(udpSessionIdle))
+		payload, err := udpframing.ReadFrame(sess.stream, buf)
+		if err != nil {
+			return
+		}
+		buf = payload
+		if _, err := pl.UdpConn.WriteTo(payload, sess.clientAddr); err != nil {
+			return
+		}
+		pl.tr.out.Add(int64(len(payload)))
+	}
 }
 
 func (s *Server) handlePublicConnection(pl *PublicListener, conn net.Conn) {

@@ -18,14 +18,12 @@
         <el-table-column prop="id" label="名称" min-width="120" />
         <el-table-column prop="type" label="类型" width="110">
           <template #default="{ row }">
-            <el-tag :type="row.type === 'tcp' ? 'primary' : 'warning'" size="small">
-              {{ row.type === 'tcp' ? 'TCP' : '运维HTTP' }}
-            </el-tag>
+            <el-tag :type="typeTag(row.type)" size="small">{{ typeLabel(row.type) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="本地地址" width="180">
           <template #default="{ row }">
-            <span v-if="row.type === 'tcp'" style="font-family:var(--font-mono,monospace)">{{ row.localAddr }}:{{ row.localPort }}</span>
+            <span v-if="row.type === 'tcp' || row.type === 'udp'" style="font-family:var(--font-mono,monospace)">{{ row.localAddr }}:{{ row.localPort }}</span>
             <span v-else>{{ row.proxyUsername }}</span>
           </template>
         </el-table-column>
@@ -59,12 +57,13 @@
         <el-form-item label="代理类型" prop="type">
           <el-select v-model="form.type" style="width: 100%" :disabled="!!editingProxy">
             <el-option label="TCP 映射" value="tcp" />
+            <el-option label="UDP 映射" value="udp" />
             <el-option label="运维代理 (HTTP)" value="ops_http" />
           </el-select>
           <div v-if="editingProxy" class="form-tip">类型创建后不可修改，如需变更请删除后重建</div>
         </el-form-item>
 
-        <template v-if="form.type === 'tcp'">
+        <template v-if="form.type === 'tcp' || form.type === 'udp'">
           <el-form-item label="本地地址" prop="localAddr">
             <el-input v-model="form.localAddr" placeholder="127.0.0.1" />
           </el-form-item>
@@ -114,6 +113,9 @@ const proxies = ref<any[]>([])
 
 const defaultACL = ['0.0.0.0/0']
 const hasOps = computed(() => proxies.value.some((p: any) => p.type === 'ops_http'))
+
+const typeLabel = (t: string) => (t === 'tcp' ? 'TCP' : t === 'udp' ? 'UDP' : '运维HTTP')
+const typeTag = (t: string) => (t === 'ops_http' ? 'warning' : 'primary')
 
 const emptyForm = () => ({
   id: '',

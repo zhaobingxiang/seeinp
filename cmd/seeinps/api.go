@@ -435,7 +435,7 @@ func decodeProxyReq(r *http.Request) (*proxyReq, error) {
 		req.LocalAddr = "127.0.0.1"
 	}
 	switch req.Type {
-	case "tcp":
+	case "tcp", "udp":
 		if _, err := validatePort(req.LocalPort); err != nil {
 			return nil, err
 		}
@@ -448,12 +448,10 @@ func decodeProxyReq(r *http.Request) (*proxyReq, error) {
 			return nil, err
 		}
 		req.ACL = acl
-	case "udp":
-		return nil, fmt.Errorf("UDP 映射暂未实现")
 	case "ops_socks":
 		return nil, fmt.Errorf("SOCKS5 运维代理为二期功能")
 	default:
-		return nil, fmt.Errorf("代理类型仅支持 tcp / ops_http")
+		return nil, fmt.Errorf("代理类型仅支持 tcp / udp / ops_http")
 	}
 	return req, nil
 }

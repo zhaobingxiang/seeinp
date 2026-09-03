@@ -97,7 +97,7 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, u
 
 	var port int
 	if preferredPort != nil {
-		if err := p.checkAvailable(*preferredPort); err != nil {
+		if err := p.checkAvailable(*preferredPort, proxyType); err != nil {
 			return nil, err
 		}
 		if !inRanges(*preferredPort, userRanges) {
@@ -111,7 +111,7 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, u
 		if last, err := p.store.GetLastPortByUserProxy(userID, proxyID); err == nil && !p.store.IsPortAllocated(last.Port) {
 			if p.containsLocked(last.Port) {
 				if inRanges(last.Port, userRanges) {
-					if err := p.checkSystemPort(last.Port); err == nil {
+					if err := p.checkSystemPort(last.Port, proxyType); err == nil {
 						port = last.Port
 						fmt.Printf("[POOL] Restoring port %d for proxy %s\n", port, proxyID)
 					}
@@ -124,7 +124,7 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, u
 		}
 		if port == 0 {
 			var err error
-			port, err = p.findAvailable(userRanges)
+			port, err = p.findAvailable(userRanges, proxyType)
 			if err != nil {
 				return nil, err
 			}
@@ -153,7 +153,7 @@ func (p *Pool) Release(userID, proxyID string) {
 	p.store.ReleasePortByUserProxy(userID, proxyID)
 }
 
-func (p *Pool) checkAvailable(port int) error {
+func (p *Pool) checkAvailable(port int, proxyType string) error {
 	if p.store.IsPortAllocated(port) {
 		return fmt.Errorf("port %d already allocated", port)
 	}
@@ -167,13 +167,13 @@ func (p *Pool) checkAvailable(port int) error {
 	if !valid {
 		return fmt.Errorf("port %d not in valid range", port)
 	}
-	if err := p.checkSystemPort(port); err != nil {
+	if err := p.checkSystemPort(port, proxyType); err != nil {
 		return fmt.Errorf("port %d not available: %w", port, err)
 	}
 	return nil
 }
 
-func (p *Pool) findAvailable(userRanges []Range) (int, error) {
+func (p *Pool) findAvailable(userRanges []Range, proxyType string) (int, error) {
 	for _, r := range p.ranges {
 		for port := r.Start; port <= r.End; port++ {
 			if !inRanges(port, userRanges) {
@@ -182,7 +182,7 @@ func (p *Pool) findAvailable(userRanges []Range) (int, error) {
 			if p.store.IsPortAllocated(port) {
 				continue
 			}
-			if err := p.checkSystemPort(port); err == nil {
+			if err := p.checkSystemPort(port, proxyType); err == nil {
 				return port, nil
 			}
 		}
@@ -190,7 +190,16 @@ func (p *Pool) findAvailable(userRanges []Range) (int, error) {
 	return 0, fmt.Errorf("no available ports in pool")
 }
 
-func (p *Pool) checkSystemPort(port int) error {
+// checkSystemPort 探测端口在系统中是否可绑定；UDP 代理按 UDP 探测，其余按 TCP。
+func (p *Pool) checkSystemPort(port int, proxyType string) error {
+	if proxyType == "udp" {
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+		if err != nil {
+			return err
+		}
+		pc.Close()
+		return nil
+	}
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return err

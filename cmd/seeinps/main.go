@@ -25,6 +25,7 @@ import (
 	"github.com/seeinp/seeinp/internal/mux"
 	"github.com/seeinp/seeinp/internal/protocol"
 	"github.com/seeinp/seeinp/internal/store"
+	"github.com/seeinp/seeinp/internal/udpframing"
 	"github.com/seeinp/seeinp/internal/version"
 )
 
@@ -679,6 +680,8 @@ func (c *Client) handleDataStream(stream net.Conn) {
 		c.handleOpsStream(stream, proxy)
 	case protocol.StreamTypeTCP:
 		c.handleTCPStream(stream, proxy)
+	case protocol.StreamTypeUDP:
+		c.handleUDPStream(stream, proxy)
 	default:
 		fmt.Printf("[DATA] unsupported stype %d for %s\n", stype[0], proxyID)
 	}
@@ -696,6 +699,67 @@ func (c *Client) handleTCPStream(stream net.Conn, proxy *Proxy) {
 	go func() { io.Copy(stream, targetConn); done <- struct{}{} }()
 	<-done
 	<-done
+}
+
+// handleUDPStream 处理一条 UDP 会话流。会话由 seeinpm 首次收包时建立，
+// 载荷格式见协议规范 §3/§8.3：先 clientAddr，随后双向分帧数据报。
+// 会话无需跨流状态，本流自持内网 UDP 套接字自给自足。
+func (c *Client) handleUDPStream(stream net.Conn, proxy *Proxy) {
+	var clLen [1]byte
+	if _, err := io.ReadFull(stream, clLen[:]); err != nil {
+		return
+	}
+	if clLen[0] < 1 || clLen[0] > 128 {
+		stream.Close()
+		return
+	}
+	clBuf := make([]byte, clLen[0])
+	if _, err := io.ReadFull(stream, clBuf); err != nil {
+		return
+	}
+
+	// 拨内网 UDP 目标
+	dst, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", proxy.LocalAddr, proxy.LocalPort))
+	if err != nil {
+		stream.Close()
+		return
+	}
+	uconn, err := net.DialUDP("udp", nil, dst)
+	if err != nil {
+		fmt.Printf("[UDP] dial %s fail: %v\n", proxy.ID, err)
+		stream.Close()
+		return
+	}
+
+	// 泵B：内网目标回包 → 会话流
+	go func() {
+		defer uconn.Close()
+		buf := make([]byte, udpframing.MaxDatagram)
+		for {
+			n, rerr := uconn.Read(buf)
+			if rerr != nil || n == 0 {
+				return
+			}
+			if err := udpframing.WriteFrame(stream, buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+
+	// 泵A：会话流帧 → 内网目标
+	var rbuf []byte
+	for {
+		payload, err := udpframing.ReadFrame(stream, rbuf)
+		if err != nil {
+			break
+		}
+		rbuf = payload
+		if _, err := uconn.Write(payload); err != nil {
+			break
+		}
+	}
+	uconn.Close()
+	stream.Close()
 }
 
 func main() {
