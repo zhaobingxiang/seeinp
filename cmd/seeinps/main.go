@@ -737,7 +737,7 @@ func (c *Client) handleUDPStream(stream net.Conn, proxy *Proxy) {
 		buf := make([]byte, udpframing.MaxDatagram)
 		for {
 			n, rerr := uconn.Read(buf)
-			if rerr != nil || n == 0 {
+			if rerr != nil {
 				return
 			}
 			if err := udpframing.WriteFrame(stream, buf[:n]); err != nil {
