@@ -39,7 +39,8 @@ export const authApi = {
   login: (data: any) => api.post('/auth/login', data),
   init: (data: any) => api.post('/auth/init', data),
   getStatus: () => api.get('/auth/status'),
-  rebind: (data: any) => api.post('/auth/rebind', data)
+  rebind: (data: any) => api.post('/auth/rebind', data),
+  captcha: () => api.get('/auth/captcha')
 }
 
 export const proxyApi = {

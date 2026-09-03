@@ -29,7 +29,12 @@
       <div class="page-card">
         <div class="card-header" style="padding:14px 16px;border-bottom:1px solid var(--app-border-light)">
           <span>实时流量 Top</span>
-          <span class="refresh-hint">自动刷新 {{ refreshInterval }}s</span>
+          <div class="header-actions">
+            <span class="refresh-label">自动刷新</span>
+            <el-select v-model="refreshInterval" size="small" style="width:86px" @change="restartTimer">
+              <el-option v-for="iv in refreshOptions" :key="iv" :label="iv + ' 秒'" :value="iv" />
+            </el-select>
+          </div>
         </div>
         <el-table :data="topProxies" v-loading="loadingProxies" style="width:100%">
           <el-table-column prop="name" label="代理" min-width="150">
@@ -86,7 +91,8 @@ import { healthApi, proxyApi, auditApi, portApi } from "@/api"
 import Layout from "@/components/Layout.vue"
 
 const router = useRouter()
-const refreshInterval = 10
+const refreshOptions = [5, 10, 30, 60, 120]
+const refreshInterval = ref(10)
 
 const health = ref<any>({})
 const proxies = ref<any[]>([])
@@ -100,10 +106,11 @@ const enabledCount = computed(() => proxies.value.filter((p: any) => p.status ==
 const totalIn = computed(() => proxies.value.reduce((s, p: any) => s + (p.bytesIn || 0), 0))
 const totalOut = computed(() => proxies.value.reduce((s, p: any) => s + (p.bytesOut || 0), 0))
 const totalTraffic = computed(() => totalIn.value + totalOut.value)
+// 仅显示在线代理中总流量（入站+出站）前 5 名
 const topProxies = computed(() =>
   proxies.value
     .filter((p: any) => p.online && p.status === 1)
-    .sort((a: any, b: any) => (b.rateIn + b.rateOut) - (a.rateIn + a.rateOut))
+    .sort((a: any, b: any) => ((b.bytesIn || 0) + (b.bytesOut || 0)) - ((a.bytesIn || 0) + (a.bytesOut || 0)))
     .slice(0, 5)
 )
 
@@ -136,7 +143,8 @@ const actions = [
   { value: "auth_rebind", label: "重新绑定授权码" },
   { value: "proxy_create", label: "创建代理" },
   { value: "proxy_update", label: "修改代理" },
-  { value: "proxy_delete", label: "删除代理" }
+  { value: "proxy_delete", label: "删除代理" },
+  { value: "proxy_cleanup_offline", label: "清理离线代理" }
 ]
 const actionLabel = (a: string) => actions.find((x: any) => x.value === a)?.label || a
 
@@ -156,7 +164,9 @@ const loadData = async () => {
   } catch (e) { console.error(e) } finally { loadingProxies.value = false }
 }
 
-onMounted(() => { loadData(); timer = setInterval(loadData, refreshInterval * 1000) })
+const restartTimer = () => { if (timer) clearInterval(timer); timer = setInterval(loadData, refreshInterval.value * 1000) }
+
+onMounted(() => { loadData(); restartTimer() })
 onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>
 <style scoped>
@@ -164,10 +174,11 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
 .traffic-value { font-size: 22px; }
 .stat-sub { margin-top: 2px; font-size: 12px; color: var(--app-text-tertiary); }
 
-.dash-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: 16px; align-items: start; }
+.dash-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: 16px; align-items: stretch; }
 @media (max-width: 1100px) { .dash-grid { grid-template-columns: 1fr; } }
 
-.refresh-hint { font-size: 12px; color: var(--app-text-tertiary); font-weight: 400; }
+.header-actions { display: flex; align-items: center; gap: 6px; font-weight: 400; }
+.refresh-label { font-size: 12px; color: var(--app-text-tertiary); }
 .rate-cell { display: flex; flex-direction: column; gap: 2px; font-family: var(--font-mono, monospace); font-size: 12px; }
 .rate-down { color: #2563eb; }
 .rate-up { color: #6b7280; }

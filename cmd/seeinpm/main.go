@@ -25,6 +25,7 @@ import (
 	"github.com/seeinp/seeinp/internal/auth"
 	"github.com/seeinp/seeinp/internal/config"
 	"github.com/seeinp/seeinp/internal/gzhttp"
+	"github.com/seeinp/seeinp/internal/guard"
 	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/mux"
 	"github.com/seeinp/seeinp/internal/portpool"
@@ -49,6 +50,7 @@ type Server struct {
 	tlsConfig          *tls.Config
 	store              *store.Store
 	jwt                *auth.JWTManager
+	guard              *guard.LoginGuard
 	portPool           *portpool.Pool
 	clients            map[string]*Client
 	clientsMu          sync.RWMutex
@@ -163,6 +165,7 @@ func NewServer(config *config.PMConfig) (*Server, error) {
 		config:             config,
 		store:              s,
 		jwt:                jwtMgr,
+		guard:              guard.New(),
 		portPool:           portpool.New(ranges, s),
 		clients:            make(map[string]*Client),
 		sessions:           make(map[string]*Session),
@@ -241,6 +244,7 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/auth/init", s.handleAuthInit)
 	mux.HandleFunc("/api/v1/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("GET /api/v1/auth/captcha", s.handleAuthCaptcha)
 	mux.HandleFunc("/api/v1/auth/refresh", s.handleAuthRefresh)
 	mux.HandleFunc("/api/v1/users", s.authMiddleware(s.handleUsers))
 	mux.HandleFunc("PUT /api/v1/users/{username}", s.authMiddleware(s.handleUpdateUser))
@@ -259,6 +263,7 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("GET /api/v1/ps-release/download", s.handlePSReleaseDownload)
 	mux.HandleFunc("/api/v1/port-pool", s.authMiddleware(s.handlePortPool))
 	mux.HandleFunc("GET /api/v1/proxies", s.authMiddleware(s.handleListProxies))
+	mux.HandleFunc("POST /api/v1/proxies/cleanup-offline", s.authMiddleware(s.handleCleanupOfflineProxies))
 	mux.HandleFunc("GET /api/v1/proxies/{username}/{proxyId}/sessions", s.authMiddleware(s.handleProxySessions))
 	mux.HandleFunc("POST /api/v1/proxies/{username}/{proxyId}/disable", s.authMiddleware(s.handleProxyDisable))
 	mux.HandleFunc("POST /api/v1/proxies/{username}/{proxyId}/enable", s.authMiddleware(s.handleProxyEnable))
@@ -301,6 +306,7 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" ||
 			r.URL.Path == "/api/v1/auth/login" ||
+			r.URL.Path == "/api/v1/auth/captcha" ||
 			r.URL.Path == "/api/v1/auth/init" ||
 			r.URL.Path == "/api/v1/auth/refresh" ||
 			r.URL.Path == "/api/v1/auth/verify-code" {
@@ -859,6 +865,17 @@ func (s *Server) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
 
+func (s *Server) handleAuthCaptcha(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != "GET" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		fmt.Fprintf(w, `{"code":405,"message":"method not allowed"}`)
+		return
+	}
+	id, image := s.guard.CreateCaptcha()
+	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"captcha_id":"%s","image_base64":"%s"}}`, id, image)
+}
+
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != "POST" {
@@ -867,31 +884,63 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		CaptchaID   string `json:"captcha_id"`
+		CaptchaText string `json:"captcha_text"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, `{"code":2001,"message":"invalid request body"}`)
 		return
 	}
+
+	// 先判锁定：锁定期间即使密码/验证码正确也拒绝
+	if locked, remaining, failed := s.guard.Locked(req.Username); locked {
+		s.auditLogin(req.Username, "login_locked", r)
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(w, `{"code":1103,"message":"账号已锁定","data":{"lock_remaining":%d,"failed_count":%d}}`, remaining, failed)
+		return
+	}
+	if s.guard.NeedsCaptcha(req.Username) {
+		if !s.guard.VerifyCaptcha(req.CaptchaID, req.CaptchaText) {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprintf(w, `{"code":1104,"message":"验证码错误或已失效，请重新输入"}`)
+			return
+		}
+	}
+
 	user, err := s.store.GetAdminUser(req.Username)
 	if err != nil {
+		failed, _ := s.guard.OnFailure(req.Username)
 		s.auditLogin(req.Username, "login_failed", r)
-		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprintf(w, `{"code":1001,"message":"invalid credentials"}`)
+		s.writeLoginFailure(w, req.Username, failed, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
 	if !auth.CheckPassword(req.Password, user.PasswordHash) {
+		failed, lockSec := s.guard.OnFailure(req.Username)
 		s.auditLogin(req.Username, "login_failed", r)
-		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprintf(w, `{"code":1001,"message":"invalid credentials"}`)
+		if lockSec > 0 {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(w, `{"code":1103,"message":"密码错误次数过多，账号已锁定","data":{"lock_remaining":%d,"failed_count":%d}}`, lockSec, failed)
+			return
+		}
+		s.writeLoginFailure(w, req.Username, failed, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
+
+	s.guard.Reset(req.Username)
 	accessToken, _ := s.jwt.GenerateAccessToken(req.Username, "admin")
 	refreshToken, _ := s.jwt.GenerateRefreshToken(req.Username, "admin")
 	s.auditLogin(req.Username, "login", r)
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"access_token":"%s","refresh_token":"%s"}}`, accessToken, refreshToken)
+}
+
+// writeLoginFailure 输出带防护信息的登录失败响应，供前端决定是否展示验证码 / 剩余次数
+func (s *Server) writeLoginFailure(w http.ResponseWriter, username string, failed int, status int, msg string) {
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"code":1001,"message":"%s","data":{"need_captcha":%t,"failed_count":%d}}`,
+		msg, failed >= guard.CaptchaThreshold, failed)
 }
 
 func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
@@ -1441,6 +1490,9 @@ func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 				resp.Port = pl.Port
 			}
 			s.publicMu.RUnlock()
+		} else if pa, err := s.store.GetLastPortByUserProxy(p.Username, p.ProxyID); err == nil {
+			// 离线/禁用代理端口保留（方案B），返回保留端口便于按端口筛选与排序
+			resp.Port = pa.Port
 		}
 		tr := s.trafficFor(p.Username, p.ProxyID)
 		resp.BytesIn += tr.in.Load() - tr.flushedIn.Load()
@@ -1453,6 +1505,21 @@ func (s *Server) handleListProxies(w http.ResponseWriter, r *http.Request) {
 	}
 	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": list})
 	w.Write(data)
+}
+
+// handleCleanupOfflineProxies 手动清理全部离线（未禁用）代理：
+// 复用 CleanupOfflineProxies 清理逻辑，cutoff 取当前时间使所有离线代理（status=1, online=0）都命中。
+// 被清理代理的会话记录与预留端口一并删除（端口放回公共池），重新连接时会自动重建记录。
+func (s *Server) handleCleanupOfflineProxies(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	n, err := s.store.CleanupOfflineProxies(time.Now().Unix())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"code":5000,"message":"cleanup failed"}`)
+		return
+	}
+	s.audit(r, "proxy_cleanup_offline", "all", fmt.Sprintf("removed=%d offline proxies, ports returned to pool", n))
+	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"removed":%d}}`, n)
 }
 
 // handleProxySessions 返回代理最近 10 次连接/离线时间

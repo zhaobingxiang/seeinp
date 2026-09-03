@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/seeinp/seeinp/internal/auth"
+	"github.com/seeinp/seeinp/internal/guard"
 	"github.com/seeinp/seeinp/internal/gzhttp"
 	"github.com/seeinp/seeinp/internal/protocol"
 	"github.com/seeinp/seeinp/internal/store"
@@ -43,6 +44,12 @@ func writeErr(w http.ResponseWriter, httpStatus, code int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatus)
 	json.NewEncoder(w).Encode(apiResponse{Code: code, Message: message})
+}
+
+func writeErrData(w http.ResponseWriter, httpStatus, code int, message string, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatus)
+	json.NewEncoder(w).Encode(apiResponse{Code: code, Message: message, Data: data})
 }
 
 // migrateLegacyLocalUser 导入旧版 data/local-user.json，升级后本地账号不丢失
@@ -83,6 +90,7 @@ func (c *Client) startLocalServer() error {
 	mux.HandleFunc("GET /api/v1/auth/status", c.handleAuthStatus)
 	mux.HandleFunc("POST /api/v1/auth/init", c.handleAuthInit)
 	mux.HandleFunc("POST /api/v1/auth/login", c.handleAuthLogin)
+	mux.HandleFunc("GET /api/v1/auth/captcha", c.handleAuthCaptcha)
 	mux.HandleFunc("POST /api/v1/auth/rebind", c.requireAuth(c.handleAuthRebind))
 	mux.HandleFunc("GET /health", c.handleHealth)
 
@@ -306,25 +314,62 @@ func (c *Client) handleAuthRebind(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]interface{}{"restarted": true})
 }
 
+func (c *Client) handleAuthCaptcha(w http.ResponseWriter, r *http.Request) {
+	id, image := c.guard.CreateCaptcha()
+	writeOK(w, map[string]interface{}{"captcha_id": id, "image_base64": image})
+}
+
 func (c *Client) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		CaptchaID   string `json:"captcha_id"`
+		CaptchaText string `json:"captcha_text"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, 2001, "请求格式错误")
 		return
 	}
+
+	// 先判锁定：锁定期间即使密码/验证码正确也拒绝
+	if locked, remaining, failed := c.guard.Locked(req.Username); locked {
+		c.auditPlain(req.Username, "login_locked", "ip="+r.RemoteAddr, r)
+		writeErrData(w, http.StatusForbidden, 1103, "账号已锁定", map[string]interface{}{
+			"lock_remaining": remaining,
+			"failed_count":   failed,
+		})
+		return
+	}
+	if c.guard.NeedsCaptcha(req.Username) {
+		if !c.guard.VerifyCaptcha(req.CaptchaID, req.CaptchaText) {
+			writeErr(w, http.StatusUnauthorized, 1104, "验证码错误或已失效，请重新输入")
+			return
+		}
+	}
+
 	u, err := c.store.GetLocalUser()
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, 3002, "尚未初始化")
 		return
 	}
 	if req.Username != u.Username || !auth.CheckPassword(req.Password, u.PasswordHash) {
+		failed, lockSec := c.guard.OnFailure(req.Username)
 		c.auditPlain(req.Username, "login_failed", "ip="+r.RemoteAddr, r)
-		writeErr(w, http.StatusUnauthorized, 1001, "用户名或密码错误")
+		if lockSec > 0 {
+			writeErrData(w, http.StatusForbidden, 1103, "密码错误次数过多，账号已锁定", map[string]interface{}{
+				"lock_remaining": lockSec,
+				"failed_count":   failed,
+			})
+			return
+		}
+		writeErrData(w, http.StatusUnauthorized, 1001, "用户名或密码错误", map[string]interface{}{
+			"need_captcha": failed >= guard.CaptchaThreshold,
+			"failed_count": failed,
+		})
 		return
 	}
+
+	c.guard.Reset(req.Username)
 	token, err := c.jwt.GenerateAccessToken(u.Username, "ps")
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, 5000, "生成令牌失败")

@@ -33,7 +33,7 @@
         <span>已分配端口（{{ pool.allocations?.length || 0 }}）</span>
       </div>
       <div style="padding:12px 20px 20px">
-        <el-table :data="pool.allocations || []" size="small">
+        <el-table :data="pageAllocations" size="small">
           <el-table-column prop="port" label="端口" width="100" />
           <el-table-column label="代理" min-width="180"><template #default="{ row }">{{ row.username }}.{{ row.proxyId }}</template></el-table-column>
           <el-table-column prop="type" label="类型" width="100" />
@@ -44,6 +44,7 @@
           </el-table-column>
         </el-table>
         <el-empty v-if="!(pool.allocations?.length)" description="暂无已分配端口" :image-size="60" />
+        <PaginationBar v-if="(pool.allocations?.length || 0) > 0" v-model:page="page" v-model:pageSize="pageSize" :total="pool.allocations?.length || 0" />
       </div>
     </div>
   </Layout>
@@ -53,11 +54,19 @@ import { ref, computed, onMounted } from "vue"
 import { ElMessage, ElMessageBox } from "element-plus"
 import { portApi } from "@/api"
 import Layout from "@/components/Layout.vue"
+import PaginationBar from "@/components/PaginationBar.vue"
 
 const pool = ref<any>({})
 const ranges = ref<any[]>([])
 const saving = ref(false)
 const dirty = ref(false)
+// 已分配端口分页（默认 20 条/页）
+const page = ref(1)
+const pageSize = ref(20)
+const pageAllocations = computed(() => {
+  const allocs = pool.value.allocations || []
+  return allocs.slice((page.value - 1) * pageSize.value, page.value * pageSize.value)
+})
 
 const rangeError = computed(() => {
   for (const rg of ranges.value) {

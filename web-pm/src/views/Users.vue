@@ -6,13 +6,30 @@
         <el-button type="primary" @click="openCreate">创建用户</el-button>
       </div>
       <div style="padding:12px 20px 20px">
-        <el-table :data="users" v-loading="loading">
+        <div class="filter-bar">
+          <el-input v-model="filters.username" placeholder="用户名" clearable style="width:150px" @input="onFilterChange" />
+          <el-select v-model="filters.status" placeholder="账号状态" clearable style="width:110px" @change="onFilterChange">
+            <el-option label="启用" value="1" />
+            <el-option label="禁用" value="0" />
+          </el-select>
+          <el-select v-model="filters.online" placeholder="在线情况" clearable style="width:110px" @change="onFilterChange">
+            <el-option label="在线" value="online" />
+            <el-option label="离线" value="offline" />
+          </el-select>
+          <el-select v-model="filters.expire" placeholder="有效期" clearable style="width:110px" @change="onFilterChange">
+            <el-option label="永久" value="permanent" />
+            <el-option label="未过期" value="valid" />
+            <el-option label="已过期" value="expired" />
+          </el-select>
+          <el-input v-model="filters.port" placeholder="端口(匹配用户端口池)" clearable style="width:180px" @input="onFilterChange" />
+        </div>
+        <el-table :data="pageUsers" v-loading="loading" @sort-change="onSortChange">
           <el-table-column prop="id" label="ID" width="60" />
-          <el-table-column prop="username" label="用户名" min-width="110" />
+          <el-table-column prop="username" label="用户名" min-width="110" sortable="custom" />
           <el-table-column prop="remark" label="备注" min-width="110" />
-          <el-table-column label="账号" width="80"><template #default="{row}"><el-tag :type="row.status === 1 ? 'success' : 'danger'" size="small">{{ row.status === 1 ? '启用' : '禁用' }}</el-tag></template></el-table-column>
-          <el-table-column label="在线" width="80"><template #default="{row}"><el-tag :type="row.online ? 'success' : 'info'" size="small">{{ row.online ? '在线' : '离线' }}</el-tag></template></el-table-column>
-          <el-table-column label="有效期" width="150">
+          <el-table-column prop="status" label="账号" width="80" sortable="custom"><template #default="{row}"><el-tag :type="row.status === 1 ? 'success' : 'danger'" size="small">{{ row.status === 1 ? '启用' : '禁用' }}</el-tag></template></el-table-column>
+          <el-table-column prop="online" label="在线" width="80" sortable="custom"><template #default="{row}"><el-tag :type="row.online ? 'success' : 'info'" size="small">{{ row.online ? '在线' : '离线' }}</el-tag></template></el-table-column>
+          <el-table-column prop="expireDate" label="有效期" width="150" sortable="custom">
             <template #default="{row}">
               <template v-if="row.expireDate">
                 <span>{{ row.expireDate }}</span>
@@ -46,7 +63,8 @@
             </template>
           </el-table-column>
         </el-table>
-        <el-empty v-if="users.length === 0" description="暂无用户" />
+        <el-empty v-if="pageUsers.length === 0" :description="users.length && !filteredUsers.length ? '无匹配的用户' : '暂无用户'" />
+        <PaginationBar v-if="sortedUsers.length > 0" v-model:page="page" v-model:pageSize="pageSize" :total="sortedUsers.length" />
       </div>
     </div>
 
@@ -90,11 +108,12 @@
   </Layout>
 </template>
 <script setup lang="ts">
-import { ref, reactive, onMounted } from "vue"
+import { ref, reactive, computed, onMounted } from "vue"
 import { ElMessage, ElMessageBox } from "element-plus"
 import type { FormInstance, FormRules } from "element-plus"
 import { userApi, portApi } from "@/api"
 import Layout from "@/components/Layout.vue"
+import PaginationBar from "@/components/PaginationBar.vue"
 
 const users = ref<any[]>([])
 const loading = ref(true)
@@ -107,6 +126,62 @@ const createdAuthCode = ref("")
 const authCodeInputRef = ref()
 const formRef = ref<FormInstance>()
 const globalRanges = ref<any[]>([])
+
+// ===== 分页 / 筛选 / 排序 =====
+const filters = reactive({ username: "", status: "", online: "", expire: "", port: "" })
+const sortState = ref<{ prop: string; order: string }>({ prop: "", order: "" })
+const page = ref(1)
+const pageSize = ref(20)
+
+const onFilterChange = () => { page.value = 1 }
+const onSortChange = ({ prop, order }: { prop: string; order: string }) => {
+  sortState.value = { prop: prop || "", order: order || "" }
+  page.value = 1
+}
+
+const filteredUsers = computed(() => {
+  let arr = users.value
+  const kw = filters.username.trim().toLowerCase()
+  if (kw) arr = arr.filter((u: any) => (u.username || "").toLowerCase().includes(kw))
+  if (filters.status === "1") arr = arr.filter((u: any) => u.status === 1)
+  else if (filters.status === "0") arr = arr.filter((u: any) => u.status !== 1)
+  if (filters.online === "online") arr = arr.filter((u: any) => u.online)
+  else if (filters.online === "offline") arr = arr.filter((u: any) => !u.online)
+  if (filters.expire === "permanent") arr = arr.filter((u: any) => !u.expireDate)
+  else if (filters.expire === "valid") arr = arr.filter((u: any) => u.expireDate && !u.expired)
+  else if (filters.expire === "expired") arr = arr.filter((u: any) => u.expired)
+  const port = parseInt(filters.port, 10)
+  if (!isNaN(port)) {
+    // 端口筛选：仅匹配有固定用户端口池且包含该端口的用户（不含「不限」）
+    arr = arr.filter((u: any) => (u.portRanges || []).some((r: any) => r.start <= port && port <= r.end))
+  }
+  return arr
+})
+
+const sortedUsers = computed(() => {
+  const { prop, order } = sortState.value
+  if (!prop || !order || order === "null") return filteredUsers.value
+  const dir = order === "ascending" ? 1 : -1
+  const cmp = (a: any, b: any): number => {
+    let va: any, vb: any
+    switch (prop) {
+      case "username": va = a.username; vb = b.username; break
+      case "status": va = a.status; vb = b.status; break
+      case "online": va = a.online ? 1 : 0; vb = b.online ? 1 : 0; break
+      case "expireDate":
+        va = a.expireDate ? new Date(a.expireDate).getTime() : Number.MAX_SAFE_INTEGER
+        vb = b.expireDate ? new Date(b.expireDate).getTime() : Number.MAX_SAFE_INTEGER
+        break
+      default: return 0
+    }
+    if (va < vb) return -1 * dir
+    if (va > vb) return 1 * dir
+    return 0
+  }
+  return [...filteredUsers.value].sort(cmp)
+})
+
+const pageUsers = computed(() => sortedUsers.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
 
 const form = reactive({
   username: "", remark: "", expireDate: "", maxPorts: 0,
@@ -232,6 +307,14 @@ const copyAuthCode = async () => {
 onMounted(() => { loadUsers(); loadGlobalRanges() })
 </script>
 <style scoped>
+.filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
 .form-tip {
   font-size: 12px;
   color: var(--app-text-tertiary);

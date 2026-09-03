@@ -11,7 +11,7 @@
         <el-empty description="暂无版本包，点击右上角「上传版本」发布第一个版本" />
       </div>
 
-      <el-table v-else :data="versions" style="width: 100%">
+      <el-table v-else :data="pageVersions" style="width: 100%">
         <el-table-column prop="version" label="版本号" width="150">
           <template #default="{ row }">
             <span style="font-family:var(--font-mono,monospace)">{{ row.version }}</span>
@@ -46,6 +46,7 @@
           </template>
         </el-table-column>
       </el-table>
+      <PaginationBar v-if="versions.length > 0" v-model:page="versionsPage" v-model:pageSize="versionsPageSize" :total="versions.length" />
     </div>
 
     <!-- 在线节点 -->
@@ -59,7 +60,7 @@
         <el-empty description="暂无在线的 seeinps 节点" />
       </div>
 
-      <el-table v-else :data="clients" style="width: 100%">
+      <el-table v-else :data="pageClients" style="width: 100%">
         <el-table-column prop="username" label="用户名" min-width="120" />
         <el-table-column label="连接状态" width="100">
           <template #default="{ row }">
@@ -91,6 +92,7 @@
           </template>
         </el-table-column>
       </el-table>
+      <PaginationBar v-if="clients.length > 0" v-model:page="clientsPage" v-model:pageSize="clientsPageSize" :total="clients.length" />
       <div class="form-tip" style="margin-top:12px">
         升级过程中该节点的所有代理会短暂断开，节点升级完成后自动重连并恢复端口映射；升级结果以节点重连后上报的版本号为准。
       </div>
@@ -182,16 +184,31 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, watchEffect, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules, UploadFile } from 'element-plus'
 import { versionApi, clientApi } from '@/api'
 import { extractVersionFromFile } from '@/utils/version'
 import Layout from '@/components/Layout.vue'
+import PaginationBar from '@/components/PaginationBar.vue'
 
 const versions = ref<any[]>([])
 const clients = ref<any[]>([])
 const refreshing = ref(false)
+
+// 版本包 / 在线节点分页（默认 20 条/页，各自独立）
+const versionsPage = ref(1)
+const versionsPageSize = ref(20)
+const clientsPage = ref(1)
+const clientsPageSize = ref(20)
+const pageVersions = computed(() => versions.value.slice((versionsPage.value - 1) * versionsPageSize.value, versionsPage.value * versionsPageSize.value))
+const pageClients = computed(() => clients.value.slice((clientsPage.value - 1) * clientsPageSize.value, clientsPage.value * clientsPageSize.value))
+watchEffect(() => {
+  const maxV = Math.max(1, Math.ceil(versions.value.length / versionsPageSize.value))
+  if (versionsPage.value > maxV) versionsPage.value = maxV
+  const maxC = Math.max(1, Math.ceil(clients.value.length / clientsPageSize.value))
+  if (clientsPage.value > maxC) clientsPage.value = maxC
+})
 
 const showUpload = ref(false)
 const uploading = ref(false)

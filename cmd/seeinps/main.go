@@ -21,6 +21,7 @@ import (
 	"github.com/hashicorp/yamux"
 	"github.com/seeinp/seeinp/internal/auth"
 	"github.com/seeinp/seeinp/internal/config"
+	"github.com/seeinp/seeinp/internal/guard"
 	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/mux"
 	"github.com/seeinp/seeinp/internal/protocol"
@@ -34,6 +35,7 @@ type Client struct {
 	configPath string // 配置文件路径，用于日志级别等设置持久化写回
 	store      *store.PSStore
 	jwt        *auth.JWTManager
+	guard      *guard.LoginGuard
 
 	linkMu    sync.Mutex
 	link      *controlLink
@@ -267,6 +269,7 @@ func NewClient(cfg *config.PSConfig, psStore *store.PSStore, jwt *auth.JWTManage
 		config:  cfg,
 		store:   psStore,
 		jwt:     jwt,
+		guard:   guard.New(),
 		proxies: make(map[string]*Proxy),
 	}
 }

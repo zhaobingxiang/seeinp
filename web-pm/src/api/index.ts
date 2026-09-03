@@ -33,7 +33,8 @@ api.interceptors.response.use(
 
 export const authApi = {
   init: (data: any) => api.post('/auth/init', data),
-  login: (data: any) => api.post('/auth/login', data)
+  login: (data: any) => api.post('/auth/login', data),
+  captcha: () => api.get('/auth/captcha')
 }
 
 export const userApi = {
@@ -53,6 +54,7 @@ export const portApi = {
 
 export const proxyApi = {
   list: () => api.get('/proxies'),
+  cleanupOffline: () => api.post('/proxies/cleanup-offline'),
   sessions: (username: string, proxyId: string) => api.get(`/proxies/${encodeURIComponent(username)}/${encodeURIComponent(proxyId)}/sessions`),
   disable: (username: string, proxyId: string) => api.post(`/proxies/${encodeURIComponent(username)}/${encodeURIComponent(proxyId)}/disable`),
   enable: (username: string, proxyId: string) => api.post(`/proxies/${encodeURIComponent(username)}/${encodeURIComponent(proxyId)}/enable`)
