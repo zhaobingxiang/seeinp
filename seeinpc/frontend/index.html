@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>seeinpc</title>
+<link rel="icon" href="seeinpc.png">
+<style>
+  :root{
+    --primary:#2563eb; --primary-hover:#1d4ed8; --primary-active:#1e40af; --primary-light:#eff4ff;
+    --bg:#f5f7fa; --card:#fff; --border:#e5e7eb; --border-2:#eef0f3;
+    --text:#1f2329; --text-2:#646a73; --text-3:#9aa0a8;
+    --green:#16a34a; --green-bg:#f0fdf4; --green-bd:#bbf7d0;
+    --yellow:#d97706; --yellow-bg:#fffbeb; --yellow-bd:#fde68a;
+    --red:#dc2626; --red-bg:#fef2f2; --red-bd:#fecaca;
+    --radius:10px; --radius-sm:8px;
+    --shadow:0 1px 2px rgba(16,24,40,.05);
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    font-family:"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:14px;color:var(--text);background:var(--bg);
+    display:flex;overflow:hidden;user-select:none;
+  }
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:#d3d8e0;border-radius:4px}
+  ::-webkit-scrollbar-track{background:transparent}
+
+  .sidebar{width:208px;background:#fff;border-right:1px solid var(--border-2);display:flex;flex-direction:column;flex-shrink:0}
+  .logo{height:56px;display:flex;align-items:center;gap:10px;padding:0 18px;border-bottom:1px solid var(--border-2)}
+  .logo img{width:26px;height:26px;border-radius:6px}
+  .logo b{font-size:15px;letter-spacing:.5px}
+  .nav{padding:12px 10px;flex:1}
+  .nav-item{
+    display:flex;align-items:center;gap:10px;height:38px;padding:0 12px;border-radius:var(--radius-sm);
+    color:var(--text-2);cursor:pointer;font-size:13.5px;margin-bottom:4px;
+  }
+  .nav-item:hover{background:var(--bg)}
+  .nav-item.active{background:var(--primary-light);color:var(--primary);font-weight:600}
+  .nav-item svg{width:17px;height:17px;flex-shrink:0}
+  .side-foot{padding:14px 18px;border-top:1px solid var(--border-2);font-size:12px;color:var(--text-3);line-height:1.7}
+
+  .main{flex:1;display:flex;flex-direction:column;min-width:0}
+  .topbar{
+    height:56px;background:#fff;border-bottom:1px solid var(--border-2);
+    display:flex;align-items:center;padding:0 20px;gap:12px;flex-shrink:0;
+    --wails-draggable:drag;
+  }
+  .topbar .title{font-size:15.5px;font-weight:600;flex:1}
+  .win-close{
+    width:32px;height:32px;border:none;border-radius:8px;background:none;color:var(--text-3);
+    font-size:14px;cursor:pointer;--wails-draggable:none;flex-shrink:0;
+  }
+  .win-close:hover{background:var(--red-bg);color:var(--red)}
+  .logo{--wails-draggable:drag}
+  .content{flex:1;overflow:hidden;padding:18px 20px;display:flex;flex-direction:column}
+
+  .btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    height:32px;padding:0 14px;border-radius:var(--radius-sm);border:1px solid transparent;
+    font-size:13px;cursor:pointer;background:none;color:var(--text-2);white-space:nowrap;
+  }
+  .btn-primary{background:var(--primary);color:#fff}
+  .btn-primary:hover{background:var(--primary-hover)}
+  .btn-outline{border-color:var(--border);background:#fff;color:var(--text)}
+  .btn-outline:hover{color:var(--primary);border-color:var(--primary)}
+  .btn-danger{border-color:var(--red-bd);background:#fff;color:var(--red)}
+  .btn-danger:hover{background:var(--red-bg)}
+  .btn-sm{height:28px;padding:0 12px;font-size:12.5px}
+  .btn:disabled{opacity:.55;cursor:not-allowed}
+  .btn.busy{opacity:.7;pointer-events:none}
+
+  .toolbar{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-shrink:0}
+  .toolbar .spacer{flex:1}
+  .summary{font-size:12.5px;color:var(--text-3)}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+  .vcard{
+    background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+    box-shadow:var(--shadow);padding:16px;display:flex;flex-direction:column;gap:12px;
+  }
+  .vcard.running{border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.08)}
+  .vcard-head{display:flex;align-items:center;gap:10px}
+  .vcard-name{font-size:14.5px;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .badge{
+    display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 9px;border-radius:999px;
+    border:1px solid;white-space:nowrap;
+  }
+  .badge .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+  .badge.running{color:var(--green);background:var(--green-bg);border-color:var(--green-bd)}
+  .badge.ok{color:var(--primary);background:var(--primary-light);border-color:#bfdbfe}
+  .badge.wait{color:var(--yellow);background:var(--yellow-bg);border-color:var(--yellow-bd)}
+  .badge.fail{color:var(--red);background:var(--red-bg);border-color:var(--red-bd)}
+  .badge.off{color:var(--text-3);background:var(--bg);border-color:var(--border)}
+  .badge.running .dot{animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+  .kv{display:flex;font-size:12.5px;line-height:22px}
+  .kv .k{width:72px;color:var(--text-3);flex-shrink:0}
+  .kv .v{color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .kv .v b{color:var(--text);font-weight:600}
+  .copy{color:var(--primary);cursor:pointer;font-size:12px;margin-left:6px}
+  .chips{display:flex;flex-wrap:wrap;gap:6px}
+  .chip{font-size:11.5px;background:var(--bg);border:1px solid var(--border-2);color:var(--text-2);padding:1px 8px;border-radius:999px}
+  .vcard-foot{display:flex;align-items:center;gap:8px;border-top:1px solid var(--border-2);padding-top:12px}
+  .vcard-foot .info{flex:1;font-size:12px;color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .vcard-msg{font-size:12px;color:var(--red);background:var(--red-bg);border-radius:6px;padding:6px 10px}
+  .vcard-msg.warn{color:var(--yellow);background:var(--yellow-bg)}
+  .empty{color:var(--text-3);font-size:13px;text-align:center;padding:60px 0}
+
+  .log-panel{
+    background:#1f2329;border-radius:var(--radius);padding:14px 16px;height:100%;
+    font-family:Consolas,"Courier New",monospace;font-size:12.5px;line-height:22px;color:#c9ced6;overflow:auto;
+    user-select:text;white-space:pre-wrap;word-break:break-all;
+  }
+  .log-toolbar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-shrink:0}
+  select,input[type=text],input[type=password],input[type=number]{
+    height:32px;border:1px solid var(--border);border-radius:var(--radius-sm);padding:0 10px;font-size:13px;
+    outline:none;background:#fff;color:var(--text);width:100%;
+  }
+  select{width:auto}
+  input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 2px rgba(37,99,235,.12)}
+
+  .set-card{background:#fff;border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px;max-width:640px;margin-bottom:14px}
+  .set-card h3{font-size:14px;margin-bottom:12px}
+  .set-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:9px 0;border-bottom:1px solid var(--border-2);font-size:13px}
+  .set-row:last-child{border-bottom:none}
+  .set-row .desc{font-size:12px;color:var(--text-3);margin-top:2px}
+  .switch{width:36px;height:20px;border-radius:999px;background:var(--border);position:relative;cursor:pointer;transition:.2s;flex-shrink:0}
+  .switch::after{content:"";position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.2)}
+  .switch.on{background:var(--primary)}
+  .switch.on::after{left:18px}
+
+  .statusbar{
+    height:32px;background:#fff;border-top:1px solid var(--border-2);display:flex;align-items:center;
+    padding:0 16px;gap:18px;font-size:12px;color:var(--text-3);flex-shrink:0;
+  }
+  .statusbar .grow{flex:1}
+  .sb-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:1px}
+
+  .mask{position:fixed;inset:0;background:rgba(16,24,40,.45);display:none;align-items:center;justify-content:center;z-index:50}
+  .mask.show{display:flex}
+  .dialog{
+    width:430px;max-width:92vw;background:#fff;border-radius:12px;box-shadow:0 12px 40px rgba(16,24,40,.2);
+    padding:22px;animation:pop .18s ease;
+  }
+  @keyframes pop{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
+  .dialog h3{font-size:15px;margin-bottom:4px}
+  .dialog .sub{font-size:12.5px;color:var(--text-3);margin-bottom:16px;line-height:1.6}
+  .field{margin-bottom:12px}
+  .field label{display:block;font-size:12.5px;color:var(--text-2);margin-bottom:5px}
+  .field label b{color:var(--red)}
+  .field .hint{font-size:12px;color:var(--text-3);margin-top:4px;line-height:1.5}
+  .dialog-foot{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+  .captcha-row{display:none;gap:8px}
+  .captcha-row.show{display:flex}
+  .captcha-img{width:110px;height:32px;border-radius:6px;border:1px solid var(--border);cursor:pointer;object-fit:cover;background:var(--bg)}
+  .tabs{display:flex;gap:6px;margin-bottom:14px;background:var(--bg);border-radius:8px;padding:4px}
+  .tab{flex:1;text-align:center;font-size:13px;color:var(--text-2);padding:7px 0;border-radius:6px;cursor:pointer}
+  .tab.active{background:#fff;color:var(--primary);font-weight:600;box-shadow:var(--shadow)}
+  .form-err{font-size:12.5px;color:var(--red);margin-top:10px;min-height:16px}
+  .acl-input{display:flex;gap:8px;margin-top:6px}
+  .acl-input input{flex:1}
+
+  .toast{
+    position:fixed;top:26px;left:50%;transform:translateX(-50%) translateY(-8px);
+    background:#1f2329;color:#fff;font-size:13px;padding:9px 18px;border-radius:8px;opacity:0;
+    transition:.25s;z-index:99;pointer-events:none;box-shadow:0 6px 20px rgba(16,24,40,.25);max-width:80vw;
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.err{background:var(--red)}
+
+  .page{display:none;flex:1;min-height:0;flex-direction:column}
+  .page.active{display:flex}
+  .page-scroll{flex:1;overflow:auto;min-height:0}
+</style>
+</head>
+<body>
+
+  <div class="sidebar">
+    <div class="logo"><img src="seeinpc.png" alt="seeinpc"><b>seeinpc</b></div>
+    <div class="nav">
+      <div class="nav-item active" data-page="vpn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l7 4v5c0 4.4-3 8.4-7 9-4-.6-7-4.6-7-9V7l7-4z"/></svg>
+        运维 VPN
+      </div>
+      <div class="nav-item" data-page="logs">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        运行日志
+      </div>
+      <div class="nav-item" data-page="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 4v2M12 18v2M4 12h2M18 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4"/></svg>
+        设置
+      </div>
+    </div>
+    <div class="side-foot" id="sideFoot">v-</div>
+  </div>
+
+  <div class="main">
+    <div class="topbar" id="titlebar">
+      <div class="title" id="pageTitle">运维 VPN</div>
+      <button class="win-close" title="最小化到托盘" onclick="App.HideWindow()">✕</button>
+    </div>
+
+    <div class="content">
+      <!-- 运维 VPN -->
+      <div class="page active" id="page-vpn">
+        <div class="toolbar">
+          <button class="btn btn-primary" onclick="openMask('maskAdd')">＋ 添加 seeinps 运维</button>
+          <button class="btn btn-outline" onclick="openMask('maskManual')">手动添加 VPN</button>
+          <button class="btn btn-outline" id="btnRefresh" onclick="doRefresh()">刷新状态</button>
+          <div class="spacer"></div>
+          <div class="summary" id="summary"></div>
+        </div>
+        <div class="page-scroll">
+          <div class="cards" id="cards"></div>
+          <div class="empty" id="emptyTip" style="display:none">
+            还没有运维入口。点击「添加 seeinps 运维」，登录 seeinps 后自动获取已添加的运维 HTTP 代理并生成卡片。
+          </div>
+        </div>
+      </div>
+
+      <!-- 运行日志 -->
+      <div class="page" id="page-logs">
+        <div class="log-toolbar">
+          <select id="selLevel"><option>debug</option><option selected>info</option><option>warn</option><option>error</option></select>
+          <button class="btn btn-outline btn-sm" onclick="applyLevel()">应用级别</button>
+          <select id="selLogInterval" onchange="setLogInterval(this.value)">
+            <option value="1000">1 秒刷新</option>
+            <option value="2000" selected>2 秒刷新</option>
+            <option value="5000">5 秒刷新</option>
+            <option value="10000">10 秒刷新</option>
+          </select>
+          <button class="btn btn-outline btn-sm" id="btnLogPause" onclick="toggleLogPause()">暂停刷新</button>
+          <button class="btn btn-outline btn-sm" onclick="App.OpenLogsDir()">打开日志目录</button>
+          <div class="spacer" style="flex:1"></div>
+          <div class="summary">logs/seeinpc_YYYYMMDD.log</div>
+        </div>
+        <div class="page-scroll">
+          <div class="log-panel" id="logPanel">（日志加载中…）</div>
+        </div>
+      </div>
+
+      <!-- 设置 -->
+      <div class="page" id="page-settings">
+        <div class="page-scroll">
+          <div class="set-card">
+            <h3>常规</h3>
+            <div class="set-row"><div>连通性探测间隔</div>
+              <select id="setInterval"><option value="15">15 秒</option><option value="30">30 秒</option><option value="60">60 秒</option></select></div>
+            <div class="set-row"><div>关闭窗口时最小化到托盘</div><div class="switch on" id="setTray" onclick="this.classList.toggle('on')"></div></div>
+          </div>
+          <div class="set-card">
+            <h3>日志</h3>
+            <div class="set-row"><div>日志级别</div>
+              <select id="setLevel"><option>debug</option><option>info</option><option>warn</option><option>error</option></select></div>
+            <div class="set-row"><div>配置与日志目录</div>
+              <div style="display:flex;gap:8px">
+                <button class="btn btn-outline btn-sm" onclick="App.OpenConfDir()">打开配置目录</button>
+                <button class="btn btn-outline btn-sm" onclick="App.OpenLogsDir()">打开日志目录</button>
+              </div></div>
+          </div>
+          <div class="set-card">
+            <h3>关于</h3>
+            <div class="set-row"><div>版本</div><span id="aboutVer" style="font-size:12.5px;color:var(--text-2)">-</span></div>
+            <div class="set-row"><div>管理员权限</div><span id="aboutAdmin" style="font-size:12.5px;color:var(--text-2)">-</span></div>
+            <div class="set-row"><div>wintun 驱动</div><span id="aboutDriver" style="font-size:12.5px;color:var(--text-2)">-</span></div>
+            <div class="set-row"><div>升级检查</div><button class="btn btn-outline btn-sm" onclick="toast('将在二期接入官网版本接口（/api/v1/version/check?endpoint=seeinpc）')">敬请期待</button></div>
+          </div>
+          <div style="max-width:640px;display:flex;justify-content:flex-end;gap:10px;padding-bottom:20px">
+            <button class="btn btn-outline" onclick="App.QuitApp()">退出 seeinpc</button>
+            <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="statusbar">
+      <span id="sbDriver"><span class="sb-dot" style="background:#9aa0a8"></span>驱动检测中</span>
+      <span id="sbVpn"><span class="sb-dot" style="background:#9aa0a8"></span>当前无运行的 VPN</span>
+      <span class="grow"></span>
+      <span id="sbInterval"></span>
+      <span id="sbLevel"></span>
+    </div>
+  </div>
+
+<!-- 添加 seeinps 运维 -->
+<div class="mask" id="maskAdd">
+  <div class="dialog">
+    <h3>添加 seeinps 运维</h3>
+    <div class="sub">服务器地址固定（see.timemsee.cn / see.timesee.cn 自动回退），无需填写。</div>
+    <div class="tabs">
+      <div class="tab active" id="tabLogin" onclick="switchAddMode('login')">登录 seeinps 获取</div>
+      <div class="tab" id="tabDirect" onclick="switchAddMode('direct')">直接填写运维代理</div>
+    </div>
+
+    <!-- 模式一：登录 seeinps 获取 -->
+    <div id="modeLogin">
+      <div class="field"><label>web-ui 外部端口 <b>*</b></label>
+        <input type="number" id="addPort" placeholder="seeinps 映射到外网的 web-ui 端口"></div>
+      <div class="field"><label>seeinps 登录用户名 <b>*</b></label>
+        <input type="text" id="addUser" placeholder="seeinps 管理端用户名"></div>
+      <div class="field"><label>seeinps 登录密码 <b>*</b></label>
+        <input type="password" id="addPwd" placeholder="seeinps 管理端密码"></div>
+      <div class="field captcha-row" id="captchaRow">
+        <div style="flex:1"><label>验证码 <b>*</b></label>
+          <input type="text" id="addCaptcha" placeholder="输入右侧验证码"></div>
+        <div style="align-self:flex-end">
+          <img class="captcha-img" id="captchaImg" title="点击刷新">
+        </div>
+      </div>
+      <div class="hint">登录成功后自动获取该 seeinps 已添加的运维 HTTP 代理，每个代理生成一张卡片。连续输错 3 次需验证码，6 次锁定 30 分钟。</div>
+    </div>
+
+    <!-- 模式二：直接填写运维代理 -->
+    <div id="modeDirect" style="display:none">
+      <div class="field"><label>运维代理ID（端口 1-65535）<b>*</b></label>
+        <input type="number" id="dOps" placeholder="见 seeinps 管理页「运维ID」"></div>
+      <div class="field"><label>运维代理用户名</label>
+        <input type="text" id="dUser" placeholder="运维代理账号"></div>
+      <div class="field"><label>运维代理密码</label>
+        <input type="password" id="dPwd" placeholder="运维代理密码（留空则稍后在卡片填写）"></div>
+      <div class="field"><label>目标网段 <b>*</b></label>
+        <div class="chips" id="dAclChips"></div>
+        <div class="acl-input">
+          <input type="text" id="dAclInput" placeholder="如 192.168.10.0/24">
+          <button class="btn btn-outline btn-sm" onclick="addDAcl()">添加</button>
+        </div>
+        <div class="hint">必填，至少一个网段（决定哪些流量走 VPN，不支持 0.0.0.0/0）</div></div>
+      <div class="hint">凭「运维ID + 代理账号 + 代理密码」直接生成一张 VPN 卡片，无需登录 seeinps。</div>
+    </div>
+
+    <div class="form-err" id="addError"></div>
+    <div class="dialog-foot">
+      <button class="btn btn-outline" onclick="closeMask('maskAdd')">取消</button>
+      <button class="btn btn-primary" id="btnAdd" onclick="doAdd()">获取 / 添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- 手动添加 VPN -->
+<div class="mask" id="maskManual">
+  <div class="dialog">
+    <h3>手动添加 VPN</h3>
+    <div class="sub">未接入 seeinps 管理页时的备选方式：凭「运维ID + 代理账号 + 代理密码」手工填写。</div>
+    <div class="field"><label>名称 <b>*</b></label><input type="text" id="mName"></div>
+    <div class="field"><label>代理服务器</label>
+      <input type="text" id="mServer" placeholder="填写 http 代理地址，留空使用固定地址（see.timemsee.cn / see.timesee.cn）"></div>
+    <div class="field"><label>端口号（1-65535）<b>*</b></label>
+      <input type="number" id="mOps" placeholder="运维代理对外端口"></div>
+    <div class="field"><label>代理用户名</label><input type="text" id="mUser" placeholder="可选"></div>
+    <div class="field"><label>代理密码</label><input type="password" id="mPwd" placeholder="可选，留空则稍后在卡片填写"></div>
+    <div class="field"><label>目标网段 <b>*</b></label>
+      <div class="chips" id="mAclChips"></div>
+      <div class="acl-input">
+        <input type="text" id="mAclInput" placeholder="如 192.168.10.0/24">
+        <button class="btn btn-outline btn-sm" onclick="addMAcl()">添加</button>
+      </div>
+      <div class="hint">必填，至少一个网段（决定哪些流量走 VPN，不支持 0.0.0.0/0）</div></div>
+    <div class="field"><label>内网探测目标（可选）</label>
+      <input type="text" id="mProbe" placeholder="如 192.168.1.1:443，留空自动取首个网段地址"></div>
+    <div class="form-err" id="manualError"></div>
+    <div class="dialog-foot">
+      <button class="btn btn-outline" onclick="closeMask('maskManual')">取消</button>
+      <button class="btn btn-primary" id="btnManual" onclick="doManual()">添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- 填写代理密码 -->
+<div class="mask" id="maskPwd">
+  <div class="dialog">
+    <h3>填写代理密码</h3>
+    <div class="sub">该运维入口已从 seeinps 同步。出于安全考虑，seeinps 不返回代理密码明文，请向管理员获取后一次性填写（本机 DPAPI 加密保存）。</div>
+    <div class="field"><label>代理密码 <b>*</b></label>
+      <input type="password" id="pwdInput" placeholder="运维代理密码"></div>
+    <div class="form-err" id="pwdError"></div>
+    <div class="dialog-foot">
+      <button class="btn btn-outline" onclick="closeMask('maskPwd')">取消</button>
+      <button class="btn btn-primary" id="btnPwd" onclick="doFillPwd()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 编辑入口 -->
+<div class="mask" id="maskEdit">
+  <div class="dialog">
+    <h3>编辑运维入口</h3>
+    <div class="sub">目标网段决定哪些流量走虚拟网卡（对应 seeinps 的 ACL）。</div>
+    <div class="field"><label>名称</label><input type="text" id="eName"></div>
+    <div class="field"><label>代理服务器</label><input type="text" id="eServer" placeholder="填写 http 代理地址，留空使用固定地址"></div>
+    <div class="field"><label>连接状态探测</label>
+      <div class="switch" id="eProbeIntranet" onclick="this.classList.toggle('on');toggleProbeTarget()"></div>
+      <div class="hint">默认仅探测 HTTP 代理是否可用；勾选后额外探测下方内网目标是否可达</div></div>
+    <div class="field" id="eProbeRow" style="display:none"><label>内网探测目标</label>
+      <input type="text" id="eProbe" placeholder="ip:port，留空自动取首个网段地址">
+      <div class="hint">应填写一个该内网中稳定可达的 TCP 端口</div></div>
+    <div class="field"><label>目标网段</label>
+      <div class="chips" id="eAclChips"></div>
+      <div class="acl-input">
+        <input type="text" id="eAclInput" placeholder="如 10.20.0.0/16">
+        <button class="btn btn-outline btn-sm" onclick="addEAcl()">添加</button>
+      </div></div>
+    <div class="form-err" id="editError"></div>
+    <div class="dialog-foot">
+      <button class="btn btn-danger btn-sm" style="margin-right:auto" onclick="doRemove()">移除入口</button>
+      <button class="btn btn-outline" onclick="closeMask('maskEdit')">取消</button>
+      <button class="btn btn-primary" id="btnEdit" onclick="doEdit()">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let App; // window.go.main.App
+let state = { cards: [], settings: {} };
+let captchaId = "";
+let editingId = "", pwdId = "";
+let editAcl = [], manualAcl = [], directAcl = [];
+let logTimer = null, curPage = "vpn";
+let logIntervalMs = 2000, logPaused = false;
+
+async function init(){
+  App = window.go.main.App;
+  window.runtime.EventsOn("state", s => { state = s; render(); });
+  state = await App.GetState();
+  render();
+  startLogTimer();
+}
+
+/* ---------- 渲染 ---------- */
+const badgeMap = {
+  running:{cls:"running",text:"已连接"},
+  ready:{cls:"ok",text:"就绪 · 代理可达"},
+  waitpwd:{cls:"wait",text:"待填写代理密码"},
+  fail:{cls:"fail",text:"探测失败"},
+};
+function esc(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+function render(){
+  if(!state) return;
+  const cards = state.cards || [];
+  // 侧栏页脚 + 状态栏
+  document.getElementById("sideFoot").innerHTML =
+    `v${esc(state.version||"-")}<br>seeinpc · Windows 客户端`;
+  document.getElementById("sbDriver").innerHTML = state.driverOk
+    ? `<span class="sb-dot" style="background:var(--green)"></span>驱动 wintun 已就绪`
+    : `<span class="sb-dot" style="background:var(--red)"></span>驱动 wintun 未就绪`;
+  const sbVpn = document.getElementById("sbVpn");
+  if(state.runningId){
+    sbVpn.innerHTML = `<span class="sb-dot" style="background:var(--green)"></span>当前 VPN：${esc(state.runningName)} · ${state.connCount||0} 条转发连接`;
+  }else{
+    sbVpn.innerHTML = `<span class="sb-dot" style="background:#9aa0a8"></span>当前无运行的 VPN`;
+  }
+  document.getElementById("sbInterval").textContent = `探测间隔 ${state.settings.probeIntervalSec||30}s`;
+  document.getElementById("sbLevel").textContent = `日志级别 ${(state.logLevel||"info").toUpperCase()}`;
+
+  // 探测中状态：工具栏刷新按钮置灰
+  const probing = !!state.probing;
+  const rb = document.getElementById("btnRefresh");
+  rb.disabled = probing;
+  rb.textContent = probing ? "探测中…" : "刷新状态";
+
+  // 卡片
+  const box = document.getElementById("cards");
+  box.innerHTML = "";
+  document.getElementById("emptyTip").style.display = cards.length ? "none" : "block";
+  let running = 0;
+  cards.forEach(c => {
+    if(c.status==="running") running++;
+    const b = badgeMap[c.status] || badgeMap.ready;
+    let msg = "";
+    if(c.status==="waitpwd"){
+      msg = `<div class="vcard-msg warn">已从 seeinps 同步，请一次性填写代理密码后即可连接</div>`;
+    }else if(c.status==="fail" && c.probeMsg){
+      msg = `<div class="vcard-msg">${esc(c.probeMsg)}</div>`;
+    }else if(c.status==="running" && c.probe && c.probe!=="ok" && c.probe!=="unknown" && c.probeMsg){
+      msg = `<div class="vcard-msg warn">${esc(c.probeMsg)}</div>`;
+    }
+    const probeTxt = c.probe==="ok" ? `正常${c.rtt?" · "+c.rtt:""}${c.lastProbe?"（"+c.lastProbe+"）":""}`
+      : c.probe==="unknown" ? (c.status==="running"?"连接中…":"未探测")
+      : (c.probeMsg||c.probe);
+    let foot;
+    if(c.status==="running"){
+      foot = `<button class="btn btn-danger btn-sm" onclick="doDisconnect()">断开连接</button>
+              <button class="btn btn-outline btn-sm" onclick="openEdit('${c.id}')">编辑</button>`;
+    }else if(c.status==="waitpwd"){
+      foot = `<button class="btn btn-primary btn-sm" onclick="openPwd('${c.id}')">填写代理密码</button>
+              <button class="btn btn-outline btn-sm" onclick="openEdit('${c.id}')">编辑</button>`;
+    }else{
+      foot = `<button class="btn btn-primary btn-sm" onclick="doConnect('${c.id}', this)">连接 VPN</button>
+              <button class="btn btn-outline btn-sm" ${probing?"disabled":""} onclick="doRefresh()">${probing?"探测中…":"探测"}</button>
+              <button class="btn btn-outline btn-sm" onclick="openEdit('${c.id}')">编辑</button>`;
+    }
+    const el = document.createElement("div");
+    el.className = "vcard" + (c.status==="running" ? " running":"");
+    el.innerHTML = `
+      <div class="vcard-head">
+        <div class="vcard-name" title="${esc(c.name)}">${esc(c.name)}</div>
+        <span class="badge ${b.cls}"><span class="dot"></span>${b.text}</span>
+      </div>
+      ${msg}
+      <div>
+        <div class="kv"><span class="k">代理ID</span><span class="v"><b>${c.opsId}</b>
+          <span class="copy" onclick="copyText('${c.opsId}')">复制</span></span></div>
+        <div class="kv"><span class="k">代理账号</span><span class="v">${esc(c.proxyUser)} · ${c.hasPwd?"密码已保存":"密码未填写"}</span></div>
+        <div class="kv"><span class="k">探测状态</span><span class="v">${esc(probeTxt)}</span></div>
+        <div class="kv" style="align-items:flex-start"><span class="k">目标网段</span>
+          <span class="v"><span class="chips">${(c.acl||[]).map(a=>`<span class="chip">${esc(a)}</span>`).join("")}</span></span></div>
+      </div>
+      <div class="vcard-foot">
+        <div class="info">${c.manual?"手动添加":"来自 seeinps · "+esc(c.sourcePs||"")}</div>
+        ${foot}
+      </div>`;
+    box.appendChild(el);
+  });
+  document.getElementById("summary").textContent =
+    `共 ${cards.length} 个运维入口 · ${running} 个已连接（同一时刻仅允许一个 VPN 运行）`;
+
+  // 设置页回显
+  if(curPage==="settings" || !document.getElementById("setInterval").value){
+    document.getElementById("setInterval").value = String(state.settings.probeIntervalSec||30);
+    document.getElementById("setTray").classList.toggle("on", !!state.settings.minimizeToTray);
+    document.getElementById("setLevel").value = state.settings.logLevel||"info";
+    document.getElementById("selLevel").value = state.settings.logLevel||"info";
+    document.getElementById("aboutVer").textContent = state.version||"-";
+    document.getElementById("aboutAdmin").textContent = state.admin ? "是（正常）" : "否（请右键以管理员身份运行）";
+    document.getElementById("aboutDriver").textContent = state.driverOk ? "wintun 0.14.1 已就绪" : "未就绪";
+  }
+}
+
+/* ---------- 操作 ---------- */
+async function doRefresh(){
+  try{ await App.RefreshProbes(); }catch(e){ toast(String(e), true); }
+}
+async function doConnect(id, btn){
+  const c = (state.cards||[]).find(x=>x.id===id);
+  toast(`正在连接 ${c?c.name:""}…`);
+  btn && setBusy(btn, true, "连接中…");
+  try{
+    const r = await App.Connect(id);
+    if(!r.ok){ toast(r.message, true); }
+    else{ toast(r.message||"已连接"); }
+  }catch(e){ toast(String(e), true); }
+  finally{ btn && setBusy(btn, false); }
+}
+async function doDisconnect(){
+  const r = await App.Disconnect();
+  toast(r.message||"已断开");
+}
+
+/* 添加 seeinps 运维（双模式） */
+let addMode = "login";
+function switchAddMode(m){
+  addMode = m;
+  document.getElementById("tabLogin").classList.toggle("active", m==="login");
+  document.getElementById("tabDirect").classList.toggle("active", m==="direct");
+  document.getElementById("modeLogin").style.display = m==="login" ? "" : "none";
+  document.getElementById("modeDirect").style.display = m==="direct" ? "" : "none";
+  document.getElementById("addError").textContent = "";
+}
+async function doAdd(){
+  const errEl = document.getElementById("addError");
+  errEl.textContent = "";
+  if(addMode==="direct"){
+    const ops = parseInt(document.getElementById("dOps").value, 10);
+    setBusy("btnAdd", true, "添加中…");
+    try{
+      const r = await App.AddOpsDirect(ops||0,
+        document.getElementById("dUser").value.trim(),
+        document.getElementById("dPwd").value,
+        directAcl);
+      if(!r.ok){ errEl.textContent = r.message; return; }
+      closeMask("maskAdd");
+      directAcl = []; renderDAcl();
+      toast(r.message||"已添加");
+    }catch(e){ errEl.textContent = String(e); }
+    finally{ setBusy("btnAdd", false, "获取 / 添加"); }
+    return;
+  }
+  // 登录获取模式
+  const port = parseInt(document.getElementById("addPort").value, 10);
+  const user = document.getElementById("addUser").value.trim();
+  const pwd = document.getElementById("addPwd").value;
+  const cap = document.getElementById("addCaptcha").value.trim();
+  if(!port || !user || !pwd){ errEl.textContent = "请填写 web-ui 外部端口、用户名与密码"; return; }
+  setBusy("btnAdd", true, "登录中…");
+  try{
+    const r = await App.AddSeeinps(port, user, pwd, captchaId, cap);
+    if(r.needCaptcha){
+      captchaId = r.captchaId||"";
+      document.getElementById("captchaRow").classList.add("show");
+      if(r.captchaB64){
+        document.getElementById("captchaImg").src = "data:image/png;base64," + r.captchaB64;
+      }
+      errEl.textContent = r.message||"请输入验证码";
+      return;
+    }
+    if(!r.ok){ errEl.textContent = r.message||"登录失败"; return; }
+    closeMask("maskAdd");
+    captchaId = "";
+    document.getElementById("captchaRow").classList.remove("show");
+    document.getElementById("addCaptcha").value = "";
+    toast(r.message||"已添加");
+  }catch(e){
+    errEl.textContent = String(e);
+  }finally{ setBusy("btnAdd", false, "获取 / 添加"); }
+}
+
+/* 手动添加 */
+function addMAcl(){
+  const v = document.getElementById("mAclInput").value.trim();
+  if(!v) return;
+  if(v==="0.0.0.0/0"){ toast("不支持 0.0.0.0/0：会劫持本机全部流量导致断网", true); return; }
+  manualAcl.push(v);
+  document.getElementById("mAclInput").value = "";
+  renderMAcl();
+}
+function renderMAcl(){
+  document.getElementById("mAclChips").innerHTML =
+    manualAcl.map((a,i)=>`<span class="chip">${esc(a)} <b style="cursor:pointer;color:var(--red)" onclick="manualAcl.splice(${i},1);renderMAcl()">×</b></span>`).join("");
+}
+function addDAcl(){
+  const v = document.getElementById("dAclInput").value.trim();
+  if(!v) return;
+  if(v==="0.0.0.0/0"){ toast("不支持 0.0.0.0/0：会劫持本机全部流量导致断网", true); return; }
+  directAcl.push(v);
+  document.getElementById("dAclInput").value = "";
+  renderDAcl();
+}
+function renderDAcl(){
+  document.getElementById("dAclChips").innerHTML =
+    directAcl.map((a,i)=>`<span class="chip">${esc(a)} <b style="cursor:pointer;color:var(--red)" onclick="directAcl.splice(${i},1);renderDAcl()">×</b></span>`).join("");
+}
+async function doManual(){
+  const errEl = document.getElementById("manualError");
+  errEl.textContent = "";
+  const ops = parseInt(document.getElementById("mOps").value, 10);
+  setBusy("btnManual", true, "添加中…");
+  try{
+    const r = await App.ManualAdd(
+      document.getElementById("mName").value.trim(),
+      document.getElementById("mServer").value.trim(),
+      ops||0,
+      document.getElementById("mUser").value.trim(),
+      document.getElementById("mPwd").value,
+      manualAcl,
+      document.getElementById("mProbe").value.trim());
+    if(!r.ok){ errEl.textContent = r.message; return; }
+    closeMask("maskManual");
+    manualAcl = []; renderMAcl();
+    toast("已添加");
+  }catch(e){ errEl.textContent = String(e); }
+  finally{ setBusy("btnManual", false, "添加"); }
+}
+
+/* 填写密码 */
+function openPwd(id){ pwdId = id; document.getElementById("pwdInput").value=""; openMask("maskPwd"); }
+async function doFillPwd(){
+  const errEl = document.getElementById("pwdError");
+  setBusy("btnPwd", true, "保存中…");
+  try{
+    const r = await App.FillPassword(pwdId, document.getElementById("pwdInput").value);
+    if(!r.ok){ errEl.textContent = r.message; return; }
+    closeMask("maskPwd");
+    toast(r.message);
+  }catch(e){ errEl.textContent = String(e); }
+  finally{ setBusy("btnPwd", false, "保存"); }
+}
+
+/* 编辑 */
+function openEdit(id){
+  editingId = id;
+  const c = (state.cards||[]).find(x=>x.id===id);
+  if(!c) return;
+  document.getElementById("eName").value = c.name;
+  document.getElementById("eServer").value = c.server||"";
+  document.getElementById("eProbe").value = c.probeTarget||"";
+  document.getElementById("eProbeIntranet").classList.toggle("on", !!c.probeIntranet);
+  toggleProbeTarget();
+  editAcl = [...(c.acl||[])];
+  renderEAcl();
+  openMask("maskEdit");
+}
+function toggleProbeTarget(){
+  const on = document.getElementById("eProbeIntranet").classList.contains("on");
+  document.getElementById("eProbeRow").style.display = on ? "" : "none";
+}
+function addEAcl(){
+  const v = document.getElementById("eAclInput").value.trim();
+  if(!v) return;
+  if(v==="0.0.0.0/0"){ toast("不支持 0.0.0.0/0：会劫持本机全部流量导致断网", true); return; }
+  editAcl.push(v);
+  document.getElementById("eAclInput").value = "";
+  renderEAcl();
+}
+function renderEAcl(){
+  document.getElementById("eAclChips").innerHTML =
+    editAcl.map((a,i)=>`<span class="chip">${esc(a)} <b style="cursor:pointer;color:var(--red)" onclick="editAcl.splice(${i},1);renderEAcl()">×</b></span>`).join("");
+}
+async function doEdit(){
+  const errEl = document.getElementById("editError");
+  setBusy("btnEdit", true, "保存中…");
+  try{
+    const r = await App.UpdateEntry(editingId,
+      document.getElementById("eName").value.trim(),
+      document.getElementById("eServer").value.trim(),
+      document.getElementById("eProbe").value.trim(),
+      document.getElementById("eProbeIntranet").classList.contains("on"),
+      editAcl);
+    if(!r.ok){ errEl.textContent = r.message; return; }
+    closeMask("maskEdit");
+    toast("已保存");
+  }catch(e){ errEl.textContent = String(e); }
+  finally{ setBusy("btnEdit", false, "保存"); }
+}
+async function doRemove(){
+  if(!confirm("确认移除该运维入口？")) return;
+  const r = await App.RemoveEntry(editingId);
+  closeMask("maskEdit");
+  toast(r.message);
+}
+
+/* 设置 */
+async function saveSettings(){
+  const s = {
+    probeIntervalSec: parseInt(document.getElementById("setInterval").value,10),
+    minimizeToTray: document.getElementById("setTray").classList.contains("on"),
+    logLevel: document.getElementById("setLevel").value,
+  };
+  const r = await App.SaveSettings(s);
+  toast(r.message, !r.ok);
+}
+async function applyLevel(){
+  const r = await App.SetLogLevel(document.getElementById("selLevel").value);
+  toast(r.message, !r.ok);
+}
+
+/* 日志轮询 */
+async function pollLogs(){
+  if(curPage!=="logs" || logPaused) return;
+  try{
+    const lines = await App.GetLogs(400);
+    const panel = document.getElementById("logPanel");
+    panel.textContent = (lines||[]).join("\n") || "（暂无日志）";
+    panel.scrollTop = panel.scrollHeight;
+  }catch(e){}
+}
+function startLogTimer(){
+  if(logTimer) clearInterval(logTimer);
+  logTimer = setInterval(pollLogs, logIntervalMs);
+}
+function setLogInterval(v){
+  logIntervalMs = parseInt(v,10)||2000;
+  startLogTimer();
+}
+function toggleLogPause(){
+  logPaused = !logPaused;
+  document.getElementById("btnLogPause").textContent = logPaused ? "恢复刷新" : "暂停刷新";
+  if(!logPaused) pollLogs();
+}
+
+/* ---------- 基础 ---------- */
+function openMask(id){ document.getElementById(id).classList.add("show"); }
+function closeMask(id){ document.getElementById(id).classList.remove("show"); }
+function setBusy(id, busy, text){
+  const el = typeof id==="string" ? document.getElementById(id) : id;
+  if(!el) return;
+  if(busy){ el.dataset.txt = el.textContent; el.textContent = text||"处理中…"; el.classList.add("busy"); }
+  else{ el.textContent = el.dataset.txt||el.textContent; el.classList.remove("busy"); }
+}
+let toastTimer;
+function toast(msg, isErr){
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.className = "toast show" + (isErr?" err":"");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>t.classList.remove("show"), 3000);
+}
+function copyText(s){
+  navigator.clipboard && navigator.clipboard.writeText(String(s));
+  toast("已复制 " + s);
+}
+
+document.querySelectorAll(".nav-item").forEach(n=>{
+  n.onclick = ()=>{
+    document.querySelectorAll(".nav-item").forEach(x=>x.classList.remove("active"));
+    n.classList.add("active");
+    document.querySelectorAll(".page").forEach(p=>p.classList.remove("active"));
+    curPage = n.dataset.page;
+    document.getElementById("page-"+curPage).classList.add("active");
+    document.getElementById("pageTitle").textContent = {vpn:"运维 VPN",logs:"运行日志",settings:"设置"}[curPage];
+    if(curPage==="logs") pollLogs();
+  };
+});
+document.querySelectorAll(".mask").forEach(m=>{
+  m.addEventListener("mousedown", e=>{ if(e.target===m) m.classList.remove("show"); });
+});
+
+init();
+</script>
+</body>
+</html>
