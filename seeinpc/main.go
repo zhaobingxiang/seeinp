@@ -5,7 +5,6 @@ package main
 
 import (
 	"embed"
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -14,6 +13,7 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"golang.org/x/sys/windows"
 )
 
 //go:embed all:frontend
@@ -29,7 +29,11 @@ func main() {
 	elevateAndRestart() // 虚拟网卡需管理员权限（清单声明之外的运行时兜底）
 
 	if _, err := acquireInstanceLock(filepath.Join(exeDir(), "seeinpc.lock")); err != nil {
-		fmt.Fprintln(os.Stderr, "seeinpc 已在运行")
+		// 已有实例在运行：弹窗告知（GUI 子系统下 stderr 不可见，静默退出曾让
+		// 用户误以为新实例的托盘失效，实为旧实例残留图标）
+		title, _ := windows.UTF16PtrFromString("seeinpc")
+		text, _ := windows.UTF16PtrFromString("seeinpc 已在运行（请查看任务栏通知区域图标）。\n如托盘图标无响应，将鼠标悬停其上即可清除失效图标。")
+		_ = windows.MessageBox(0, text, title, windows.MB_OK|windows.MB_ICONINFORMATION)
 		os.Exit(0)
 	}
 
