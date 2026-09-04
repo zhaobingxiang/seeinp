@@ -192,6 +192,7 @@ func (a *App) GetState() StateView {
 		Admin:    isAdmin(),
 		DriverOK: driverReady(),
 		Probing:  a.probing,
+		LogPath:  filepath.Join(logsDir(), "seeinpc.log"),
 		Cards:    make([]CardView, 0, len(a.cfg.Entries)),
 	}
 	if a.session != nil && a.session.engine != nil {

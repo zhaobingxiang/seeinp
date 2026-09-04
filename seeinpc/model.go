@@ -69,6 +69,7 @@ type StateView struct {
 	Admin       bool       `json:"admin"`
 	DriverOK    bool       `json:"driverOk"`
 	Probing     bool       `json:"probing"`
+	LogPath     string     `json:"logPath"`
 }
 
 // OpResult 通用操作结果

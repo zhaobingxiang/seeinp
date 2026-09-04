@@ -262,7 +262,7 @@
           <button class="btn btn-outline btn-sm" id="btnLogPause" onclick="toggleLogPause()">暂停刷新</button>
           <button class="btn btn-outline btn-sm" onclick="App.OpenLogsDir()">打开日志目录</button>
           <div class="spacer" style="flex:1"></div>
-          <div class="summary">logs/seeinpc_YYYYMMDD.log</div>
+          <div class="summary" id="logPath" title="当前实例实际写入的日志文件">-</div>
         </div>
         <div class="page-scroll">
           <div class="log-panel" id="logPanel">（日志加载中…）</div>
@@ -517,6 +517,7 @@ function render(){
   }
   document.getElementById("sbInterval").textContent = `探测间隔 ${state.settings.probeIntervalSec||30}s`;
   document.getElementById("sbLevel").textContent = `日志级别 ${(state.logLevel||"info").toUpperCase()}`;
+  if(state.logPath) document.getElementById("logPath").textContent = state.logPath;
 
   // 探测中状态：工具栏刷新按钮置灰
   const probing = !!state.probing;
