@@ -1,5 +1,6 @@
 ; seeinpc 安装脚本（Inno Setup 6）
-; 编译：ISCC.exe seeinpc\installer\seeinpc.iss
+; 编译：ISCC.exe /DMyAppVersion=<五段版本号> seeinpc\installer\seeinpc.iss
+;       （版本号由 build.ps1 自动传入；手动编译不传参时用下方默认值）
 ; 说明：
 ;   - 需要管理员权限（虚拟网卡与路由操作）
 ;   - wintun.dll 已内嵌于 exe，首次运行时自动释放到 resource/ 并做哈希校验；
@@ -7,7 +8,9 @@
 ;   - 卸载时移除 SeeinpcVpn 虚拟网卡并清理路由
 
 #define MyAppName "seeinpc"
-#define MyAppVersion "1.0.26.0904.1"
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.26.0904.1"
+#endif
 #define MyAppPublisher "seeinp"
 #define MyAppExeName "seeinpc.exe"
 ; 构建产物目录（相对本脚本）：..\..\release\seeinpc
