@@ -13,8 +13,13 @@
 #endif
 #define MyAppPublisher "seeinp"
 #define MyAppExeName "seeinpc.exe"
-; 构建产物目录（相对本脚本）：..\..\release\seeinpc
-#define SrcDir "..\..\release\seeinpc"
+; 构建产物目录（相对本脚本）；build/build-seeinpc.sh 会以 /DSrcDir 传入版本化目录
+#ifndef SrcDir
+  #define SrcDir "..\..\release\seeinpc"
+#endif
+#ifndef OutputDir
+  #define OutputDir ".\output"
+#endif
 
 [Setup]
 AppId={{479852F4-6330-4BFE-89D6-B7F3A6D33A9F}
@@ -24,7 +29,7 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\seeinpc
 DefaultGroupName=seeinpc
 UninstallDisplayIcon={app}\{#MyAppExeName}
-OutputDir=.\output
+OutputDir={#OutputDir}
 OutputBaseFilename=seeinpc-setup-{#MyAppVersion}
 SetupIconFile=..\..\ico\seeinpc.ico
 Compression=lzma2
