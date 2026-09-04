@@ -170,6 +170,27 @@
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   .toast.err{background:var(--red)}
 
+  /* 升级横幅 */
+  .update-banner{
+    display:flex;align-items:center;gap:10px;background:var(--primary-light);
+    border:1px solid #bfdbfe;color:var(--primary);border-radius:var(--radius-sm);
+    padding:8px 14px;margin-bottom:14px;font-size:13px;
+  }
+  .update-banner.hidden{display:none}
+  .update-banner .spacer{flex:1}
+  .banner-close{border:none;background:none;color:var(--text-3);font-size:15px;cursor:pointer;padding:2px 6px;border-radius:6px}
+  .banner-close:hover{background:rgba(37,99,235,.1);color:var(--primary)}
+
+  /* 升级进度 */
+  .upd-progress{display:flex;align-items:center;gap:10px;margin:12px 0 0}
+  .upd-progress .bar{flex:1;height:8px;background:var(--bg);border-radius:999px;overflow:hidden}
+  .upd-progress .bar i{display:block;height:100%;width:0;background:var(--primary);border-radius:999px;transition:width .2s}
+  .upd-progress .pct{font-size:12.5px;color:var(--text-2);min-width:38px;text-align:right}
+  .upd-note{
+    font-size:12.5px;color:var(--text-2);background:var(--bg);border-radius:6px;
+    padding:8px 10px;margin-top:10px;line-height:1.6;white-space:pre-wrap;max-height:120px;overflow:auto;
+  }
+
   .page{display:none;flex:1;min-height:0;flex-direction:column}
   .page.active{display:flex}
   .page-scroll{flex:1;overflow:auto;min-height:0}
@@ -203,6 +224,13 @@
     </div>
 
     <div class="content">
+      <!-- 升级横幅 -->
+      <div class="update-banner hidden" id="updateBanner">
+        <span id="updateBannerText"></span>
+        <span class="spacer"></span>
+        <button class="btn btn-primary btn-sm" onclick="showUpgradeModal()">查看</button>
+        <button class="banner-close" title="关闭提醒" onclick="dismissBanner()">✕</button>
+      </div>
       <!-- 运维 VPN -->
       <div class="page active" id="page-vpn">
         <div class="toolbar">
@@ -265,7 +293,13 @@
             <div class="set-row"><div>版本</div><span id="aboutVer" style="font-size:12.5px;color:var(--text-2)">-</span></div>
             <div class="set-row"><div>管理员权限</div><span id="aboutAdmin" style="font-size:12.5px;color:var(--text-2)">-</span></div>
             <div class="set-row"><div>wintun 驱动</div><span id="aboutDriver" style="font-size:12.5px;color:var(--text-2)">-</span></div>
-            <div class="set-row"><div>升级检查</div><button class="btn btn-outline btn-sm" onclick="toast('将在二期接入官网版本接口（/api/v1/version/check?endpoint=seeinpc）')">敬请期待</button></div>
+            <div class="set-row"><div>升级检查</div>
+              <div style="display:flex;align-items:center;gap:10px">
+                <span id="updCheckResult" style="font-size:12.5px;color:var(--text-3)"></span>
+                <button class="btn btn-primary btn-sm" id="btnCheckUpd" onclick="manualCheckUpdate()">检查更新</button>
+              </div></div>
+            <div class="set-row"><div>已跳过的版本<div class="desc" id="ignoredList">无</div></div>
+              <button class="btn btn-outline btn-sm" id="btnClrIgnore" onclick="clearIgnored()" style="display:none">清除记录</button></div>
           </div>
           <div style="max-width:640px;display:flex;justify-content:flex-end;gap:10px;padding-bottom:20px">
             <button class="btn btn-outline" onclick="App.QuitApp()">退出 seeinpc</button>
@@ -410,6 +444,30 @@
   </div>
 </div>
 
+<!-- 升级弹窗 -->
+<div class="mask" id="maskUpgrade">
+  <div class="dialog">
+    <h3>发现新版本 <span id="updVer" style="color:var(--primary)"></span></h3>
+    <div class="sub" id="updForcedTip" style="display:none;color:var(--yellow)">该版本已标记为<b>强制升级</b>，需完成升级后才能继续使用。</div>
+    <div>
+      <div class="kv"><span class="k">当前版本</span><span class="v" id="updCurrent">-</span></div>
+      <div class="kv"><span class="k">包大小</span><span class="v" id="updSize">-</span></div>
+      <div class="kv"><span class="k">发布时间</span><span class="v" id="updTime">-</span></div>
+    </div>
+    <div class="upd-note hidden" id="updNote"></div>
+    <div class="upd-progress hidden" id="updProgress">
+      <div class="bar"><i id="updBar"></i></div><span class="pct" id="updPct">0%</span>
+    </div>
+    <div class="form-err" id="updError"></div>
+    <div class="dialog-foot" id="updActions">
+      <button class="btn btn-outline" id="updSkip" onclick="skipVersion()">跳过此版本</button>
+      <button class="btn btn-outline" id="updCancel" onclick="cancelUpgradeDownload()" style="display:none">取消下载</button>
+      <button class="btn btn-outline" id="updExit" onclick="App.QuitApp()" style="display:none">退出程序</button>
+      <button class="btn btn-primary" id="updGo" onclick="startUpgradeDownload()">立即升级</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -424,9 +482,13 @@ let logIntervalMs = 2000, logPaused = false;
 async function init(){
   App = window.go.main.App;
   window.runtime.EventsOn("state", s => { state = s; render(); });
+  window.runtime.EventsOn("update-available", res => { updateState = res; onUpdateAvailable(res); });
+  window.runtime.EventsOn("update-progress", p => onUpgradeProgress(p));
+  window.runtime.EventsOn("update-download-done", r => onUpgradeDownloadDone(r));
   state = await App.GetState();
   render();
   startLogTimer();
+  refreshIgnoredList();
 }
 
 /* ---------- 渲染 ---------- */
@@ -761,6 +823,158 @@ function toggleLogPause(){
   if(!logPaused) pollLogs();
 }
 
+/* ---------- 升级 ---------- */
+let updateState = null;   // 最近一次检查结果
+let upgrading = false;    // 下载/安装进行中
+
+function onUpdateAvailable(res){
+  if(res.forced){
+    showUpgradeModal();               // 强制：直接锁屏弹窗
+    return;
+  }
+  const b = document.getElementById("updateBanner");
+  b.classList.remove("hidden");
+  document.getElementById("updateBannerText").textContent =
+    `发现新版本 v${res.version}（当前 v${res.current}），点击「查看」了解详情`;
+}
+
+function dismissBanner(){
+  document.getElementById("updateBanner").classList.add("hidden");
+}
+
+function fmtSizeBytes(n){
+  if(!n && n!==0) return "-";
+  if(n >= 1<<20) return (n/(1<<20)).toFixed(1)+" MB";
+  if(n >= 1<<10) return (n/(1<<10)).toFixed(0)+" KB";
+  return n+" B";
+}
+
+function showUpgradeModal(){
+  const r = updateState;
+  if(!r) return;
+  document.getElementById("updVer").textContent = "v"+r.version;
+  document.getElementById("updCurrent").textContent = "v"+(r.current||"-");
+  document.getElementById("updSize").textContent = fmtSizeBytes(r.size);
+  document.getElementById("updTime").textContent = r.releasedAt||"-";
+  const note = document.getElementById("updNote");
+  if(r.note){ note.textContent = r.note; note.classList.remove("hidden"); }
+  else{ note.classList.add("hidden"); }
+  // 强制模式：隐藏 稍后/跳过，显示退出，禁止遮罩关闭
+  const forced = !!r.forced;
+  document.getElementById("updForcedTip").style.display = forced ? "" : "none";
+  document.getElementById("updSkip").style.display = forced ? "none" : "";
+  document.getElementById("updExit").style.display = forced ? "" : "none";
+  document.getElementById("maskUpgrade").dataset.lock = forced ? "1" : "";
+  resetUpgradeUI();
+  openMask("maskUpgrade");
+}
+
+function resetUpgradeUI(){
+  upgrading = false;
+  document.getElementById("updError").textContent = "";
+  document.getElementById("updProgress").classList.add("hidden");
+  document.getElementById("updBar").style.width = "0%";
+  document.getElementById("updPct").textContent = "0%";
+  document.getElementById("updGo").textContent = "立即升级";
+  document.getElementById("updGo").disabled = false;
+  document.getElementById("updSkip").disabled = false;
+  document.getElementById("updCancel").style.display = "none";
+}
+
+async function manualCheckUpdate(){
+  const btn = document.getElementById("btnCheckUpd");
+  const tip = document.getElementById("updCheckResult");
+  setBusy(btn, true, "检查中…");
+  tip.textContent = "";
+  try{
+    const r = await App.CheckUpdate();
+    if(r.message && !r.available){ tip.textContent = r.message; return; }
+    if(!r.available) { tip.textContent = r.message||"已是最新版本"; return; }
+    tip.textContent = `发现新版本 v${r.version}`;
+    updateState = r;
+    showUpgradeModal();
+  }catch(e){ tip.textContent = String(e); }
+  finally{ setBusy(btn, false, "检查更新"); }
+}
+
+async function refreshIgnoredList(){
+  try{
+    const list = await App.GetIgnoredVersions();
+    const el = document.getElementById("ignoredList");
+    const btn = document.getElementById("btnClrIgnore");
+    el.textContent = (list&&list.length) ? list.join("、") : "无";
+    btn.style.display = (list&&list.length) ? "" : "none";
+  }catch(e){}
+}
+async function clearIgnored(){
+  const r = await App.ClearIgnoredVersions();
+  toast(r.message, !r.ok);
+  refreshIgnoredList();
+}
+
+async function startUpgradeDownload(){
+  if(upgrading) return;
+  const errEl = document.getElementById("updError");
+  errEl.textContent = "";
+  upgrading = true;
+  document.getElementById("updGo").disabled = true;
+  document.getElementById("updSkip").disabled = true;
+  document.getElementById("updCancel").style.display = "";
+  document.getElementById("updProgress").classList.remove("hidden");
+  try{ await App.StartDownload(); }
+  catch(e){ errEl.textContent = String(e); resetUpgradeUI(); }
+}
+
+function onUpgradeProgress(p){
+  const total = p.total||0, done = p.downloaded||0;
+  const pct = total>0 ? Math.min(100, Math.round(done/total*100)) : 0;
+  document.getElementById("updBar").style.width = pct+"%";
+  document.getElementById("updPct").textContent = pct+"%";
+}
+
+function cancelUpgradeDownload(){
+  App.CancelDownload(); // 结果经 update-download-done(canceled) 恢复界面
+}
+
+function onUpgradeDownloadDone(r){
+  const errEl = document.getElementById("updError");
+  if(!r.ok){
+    resetUpgradeUI();
+    if(!r.canceled) errEl.textContent = r.message||"下载失败";
+    return;
+  }
+  // 下载完成 → 确认重启升级（强制版本自动继续）
+  const doApply = async () => {
+    const res = await App.ApplyUpdate();
+    if(!res.ok){ errEl.textContent = res.message; resetUpgradeUI(); return; }
+    toast(res.message||"正在启动升级");
+    upgrading = true; // 应用即将退出，冻结按钮
+    document.getElementById("updGo").disabled = true;
+  };
+  if(updateState && updateState.forced){
+    doApply();
+    return;
+  }
+  if(confirm(`升级包下载完成（已通过 SHA256 校验）。\n点击「确定」后 seeinpc 将退出并自动完成升级，完成后自动启动新版本。`)){
+    doApply();
+  }else{
+    // 保留已下载的包，恢复按钮；再次点"立即升级"会复用已下载的包
+    resetUpgradeUI();
+    document.getElementById("updGo").textContent = "立即安装";
+    errEl.textContent = "升级包已就绪，可随时点击「立即安装」";
+  }
+}
+
+async function skipVersion(){
+  if(!updateState) return;
+  const r = await App.IgnoreVersion(updateState.version);
+  closeMask("maskUpgrade");
+  dismissBanner();
+  toast(r.message||"已跳过该版本");
+  refreshIgnoredList();
+}
+
+
 /* ---------- 基础 ---------- */
 function openMask(id){ document.getElementById(id).classList.add("show"); }
 function closeMask(id){ document.getElementById(id).classList.remove("show"); }
@@ -794,7 +1008,11 @@ document.querySelectorAll(".nav-item").forEach(n=>{
   };
 });
 document.querySelectorAll(".mask").forEach(m=>{
-  m.addEventListener("mousedown", e=>{ if(e.target===m) m.classList.remove("show"); });
+  m.addEventListener("mousedown", e=>{
+    if(e.target!==m) return;
+    if(m.dataset.lock==="1"){ toast("该版本为强制升级，请完成升级或退出程序", true); return; }
+    m.classList.remove("show");
+  });
 });
 
 init();

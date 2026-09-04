@@ -24,8 +24,9 @@ type Settings struct {
 
 // Config 持久化配置（安装目录 conf/config.json）
 type Config struct {
-	Settings Settings `json:"settings"`
-	Entries  []*Entry `json:"entries"`
+	Settings        Settings `json:"settings"`
+	Entries         []*Entry `json:"entries"`
+	IgnoredVersions []string `json:"ignoredVersions,omitempty"` // 跳过的升级版本（服务端不记录）
 }
 
 func defaultSettings() Settings {

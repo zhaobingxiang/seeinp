@@ -30,6 +30,11 @@ type App struct {
 	probes  map[string]*probeInfo
 	probing bool
 
+	updateInfo    *UpdateInfo // 最新检查到的升级信息
+	installerPath string      // 已下载校验的安装包本地路径
+	downloading   atomic.Bool
+	updateCancel  context.CancelFunc
+
 	ring      *logRing
 	quitFlag  atomic.Bool
 	probeOnce chan struct{}
@@ -121,6 +126,21 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.logf("[APP] version=%s banner=%s pid_entries=%d admin=%v", version.Version, version.Banner, len(cfg.Entries), isAdmin())
 	go a.probeLoop()
+	go func() {
+		time.Sleep(3 * time.Second) // 延迟检查，不阻塞启动
+		if a.quitFlag.Load() {
+			return
+		}
+		res := a.CheckUpdate()
+		if res.Message != "" {
+			a.logf("[UPDATE] startup check: %s", res.Message)
+			return
+		}
+		if res.Available && (!res.Ignored || res.Forced) {
+			a.logf("[UPDATE] new version available current=%s new=%s forced=%v", res.Current, res.Version, res.Forced)
+			wruntime.EventsEmit(a.ctx, "update-available", res)
+		}
+	}()
 	a.emitState()
 }
 
@@ -944,4 +964,151 @@ func (r *logRing) tail(n int) []string {
 	out := make([]string, n)
 	copy(out, r.lines[len(r.lines)-n:])
 	return out
+}
+
+// ---------------- 升级 ----------------
+
+// CheckUpdate 检查官网最新版本（设置页"立即检查"与启动检查共用）。
+// 手动检查不受"跳过此版本"影响；启动检查由调用方过滤。
+func (a *App) CheckUpdate() UpdateCheckResult {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	info, err := fetchUpdateInfo(ctx)
+	if err != nil {
+		a.logWarnf("[UPDATE] check failed: %v", err)
+		return UpdateCheckResult{Current: version.Version, Message: err.Error()}
+	}
+	a.mu.Lock()
+	if info.Available {
+		a.updateInfo = info
+		a.installerPath = "" // 有新包，旧的下载结果作废
+	}
+	ignored := false
+	for _, v := range a.cfg.IgnoredVersions {
+		if v == info.Version {
+			ignored = true
+			break
+		}
+	}
+	a.mu.Unlock()
+	res := UpdateCheckResult{UpdateInfo: *info, Current: version.Version, Ignored: ignored}
+	if !info.Available {
+		res.Message = "已是最新版本"
+	}
+	a.logf("[UPDATE] checked current=%s latest=%s available=%v forced=%v", version.Version, info.Version, info.Available, info.Forced)
+	return res
+}
+
+// StartDownload 开始后台下载升级包，进度经 "update-progress"、结果经
+// "update-download-done" 事件推送。
+func (a *App) StartDownload() OpResult {
+	a.mu.Lock()
+	info := a.updateInfo
+	a.mu.Unlock()
+	if info == nil {
+		return OpResult{Message: "请先检查更新"}
+	}
+	if !a.downloading.CompareAndSwap(false, true) {
+		return OpResult{OK: true, Message: "下载进行中"}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.updateCancel = cancel
+	a.mu.Unlock()
+	a.logf("[UPDATE] download start version=%s url=%s", info.Version, info.URL)
+	go func() {
+		defer a.downloading.Store(false)
+		defer cancel()
+		path, err := a.downloadUpdate(ctx, info)
+		if err != nil {
+			if ctx.Err() != nil {
+				a.logf("[UPDATE] download canceled")
+				wruntime.EventsEmit(a.ctx, "update-download-done", map[string]any{"ok": false, "canceled": true, "message": "已取消下载"})
+				return
+			}
+			a.logErrorf("[UPDATE] download failed: %v", err)
+			wruntime.EventsEmit(a.ctx, "update-download-done", map[string]any{"ok": false, "message": err.Error()})
+			return
+		}
+		a.mu.Lock()
+		a.installerPath = path
+		a.mu.Unlock()
+		wruntime.EventsEmit(a.ctx, "update-download-done", map[string]any{"ok": true, "path": path})
+	}()
+	return OpResult{OK: true, Message: "开始下载"}
+}
+
+// CancelDownload 取消进行中的下载
+func (a *App) CancelDownload() {
+	a.mu.Lock()
+	cancel := a.updateCancel
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// ApplyUpdate 启动静默安装并退出本程序。
+// 安装器（/SILENT）会自动结束残留进程、覆盖安装并启动新版本。
+func (a *App) ApplyUpdate() OpResult {
+	a.mu.Lock()
+	path := a.installerPath
+	a.mu.Unlock()
+	if path == "" {
+		return OpResult{Message: "升级包尚未就绪，请先下载"}
+	}
+	a.logf("[UPDATE] apply installer=%s", path)
+	if err := applyUpdateSilently(path); err != nil {
+		a.logErrorf("[UPDATE] launch installer failed: %v", err)
+		return OpResult{Message: "启动安装程序失败: " + err.Error()}
+	}
+	go func() {
+		time.Sleep(800 * time.Millisecond) // 给安装器拉起留出时间
+		a.fullQuit()
+	}()
+	return OpResult{OK: true, Message: "正在启动升级"}
+}
+
+// IgnoreVersion 跳过指定版本（同版本不再自动提醒；手动检查仍会提示）
+func (a *App) IgnoreVersion(ver string) OpResult {
+	if ver == "" {
+		return OpResult{Message: "版本号为空"}
+	}
+	a.mu.Lock()
+	for _, v := range a.cfg.IgnoredVersions {
+		if v == ver {
+			a.mu.Unlock()
+			return OpResult{OK: true, Message: "已跳过"}
+		}
+	}
+	a.cfg.IgnoredVersions = append(a.cfg.IgnoredVersions, ver)
+	err := saveConfig(a.cfg)
+	a.mu.Unlock()
+	if err != nil {
+		return OpResult{Message: "保存失败: " + err.Error()}
+	}
+	a.logf("[UPDATE] version ignored ver=%s", ver)
+	return OpResult{OK: true, Message: "已跳过该版本"}
+}
+
+// GetIgnoredVersions 当前跳过的版本列表（设置页展示）
+func (a *App) GetIgnoredVersions() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, len(a.cfg.IgnoredVersions))
+	copy(out, a.cfg.IgnoredVersions)
+	return out
+}
+
+// ClearIgnoredVersions 清除全部跳过记录（恢复提醒）
+func (a *App) ClearIgnoredVersions() OpResult {
+	a.mu.Lock()
+	a.cfg.IgnoredVersions = nil
+	err := saveConfig(a.cfg)
+	a.mu.Unlock()
+	if err != nil {
+		return OpResult{Message: "保存失败: " + err.Error()}
+	}
+	a.logf("[UPDATE] ignored versions cleared")
+	return OpResult{OK: true, Message: "已清除"}
 }
