@@ -135,7 +135,7 @@ func allowTrayClicksFromLowIL() {
 	// 找本进程的 SystrayClass 托盘窗口
 	cb := windows.NewCallback(func(hwnd windows.HWND, _ uintptr) uintptr {
 		var pid uint32
-		_ = windows.GetWindowThreadProcessId(hwnd, &pid)
+		_, _ = windows.GetWindowThreadProcessId(hwnd, &pid)
 		if pid != uint32(os.Getpid()) {
 			return 1
 		}
@@ -152,7 +152,7 @@ func allowTrayClicksFromLowIL() {
 		}
 		return 0
 	})
-	_ = windows.EnumWindows(cb, 0)
+	_ = windows.EnumWindows(cb, unsafe.Pointer(nil))
 }
 
 // taskbarCreatedName 返回 "TaskbarCreated" 的 UTF16 指针（包级缓存）
