@@ -109,4 +109,7 @@ func setupTray(app *App) {
 	mShow.Click(func() { go app.showWindow() })
 	mDisconn.Click(func() { go app.Disconnect() })
 	mQuit.Click(func() { go app.fullQuit() })
+
+	// 提权运行时放行 Explorer → 托盘窗口的点击消息（UIPI），否则真实点击无响应
+	allowTrayClicksFromLowIL()
 }

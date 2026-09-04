@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -115,3 +116,54 @@ func acquireInstanceLock(path string) (*os.File, error) {
 func openExplorer(path string) {
 	_ = exec.Command("explorer", path).Start()
 }
+
+// allowTrayClicksFromLowIL 解除托盘回调消息的 UIPI 拦截。
+// 应用以管理员（高完整级）运行时，Explorer（中完整级）向托盘窗口投递的
+// 点击回调消息会被 UIPI 静默丢弃——表现为托盘图标可见但真实点击完全无响应
+// （模拟同完整级 PostMessage 的诊断却"正常"，极具迷惑性）。
+// energye/systray 未做此处理，这里对托盘窗口放行回调消息与 TaskbarCreated 广播。
+// 需在托盘窗口创建后调用（setupTray/onReady 中）。
+func allowTrayClicksFromLowIL() {
+	const (
+		msgTrayCallback = 0x0401 // energye/systray: WM_USER+1（nid.CallbackMessage）
+		msgFLTAllow     = 1      // MESSAGE_FILTER_ALLOW
+	)
+	user32 := windows.NewLazySystemDLL("user32.dll")
+	procChangeFilter := user32.NewProc("ChangeWindowMessageFilterEx")
+	procGetClassName := user32.NewProc("GetClassNameW")
+
+	// 找本进程的 SystrayClass 托盘窗口
+	cb := windows.NewCallback(func(hwnd windows.HWND, _ uintptr) uintptr {
+		var pid uint32
+		_ = windows.GetWindowThreadProcessId(hwnd, &pid)
+		if pid != uint32(os.Getpid()) {
+			return 1
+		}
+		buf := make([]uint16, 64)
+		n, _, _ := procGetClassName.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		if n == 0 || windows.UTF16ToString(buf) != "SystrayClass" {
+			return 1
+		}
+		// 放行托盘回调消息
+		_, _, _ = procChangeFilter.Call(uintptr(hwnd), msgTrayCallback, msgFLTAllow, 0)
+		// 放行 Explorer 重启广播（图标自动重建）
+		if v, _, _ := user32.NewProc("RegisterWindowMessageW").Call(uintptr(unsafe.Pointer(taskbarCreatedName()))); v != 0 {
+			_, _, _ = procChangeFilter.Call(uintptr(hwnd), v, msgFLTAllow, 0)
+		}
+		return 0
+	})
+	_ = windows.EnumWindows(cb, 0)
+}
+
+// taskbarCreatedName 返回 "TaskbarCreated" 的 UTF16 指针（包级缓存）
+func taskbarCreatedName() *uint16 {
+	taskbarOnce.Do(func() {
+		taskbarCreatedPtr, _ = windows.UTF16PtrFromString("TaskbarCreated")
+	})
+	return taskbarCreatedPtr
+}
+
+var (
+	taskbarOnce       sync.Once
+	taskbarCreatedPtr *uint16
+)
