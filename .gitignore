@@ -118,5 +118,8 @@ seeinpc/*.syso
 # 回收目录（本地清理用）
 .trash/
 
+# seeinpc 运行时锁文件
+seeinpc/seeinpc.lock
+
 # e2e runtime release packages
 test/e2e/runtime/pm/data/releases/
