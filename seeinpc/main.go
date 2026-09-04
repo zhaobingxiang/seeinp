@@ -7,6 +7,7 @@ import (
 	"embed"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/energye/systray"
 	"github.com/seeinp/seeinp/internal/logx"
@@ -48,10 +49,20 @@ func main() {
 	app := NewApp()
 	app.onQuit = systray.Quit
 
-	// 托盘独立协程运行自身消息循环（energye/systray 内部已 LockOSThread）。
-	// Run 返回即托盘消息循环终止（正常退出时 quitFlag 已置位），此处日志用于
-	// 侦测"图标可见但点击无响应"的循环停摆问题。
+	// 托盘独立协程运行自身消息循环。
+	// 关键：energye/systray 的 Windows 实现只在包 init() 里 LockOSThread 锁了
+	// main goroutine，并未锁 systray.Run 所在 goroutine——而 Win32 窗口（SystrayClass）
+	// 的消息只投递到创建它的线程队列，GetMessage(hWnd=0) 又只取当前线程队列：
+	// 一旦 Go 调度器把本 goroutine 迁移到其他线程，托盘消息循环就会在错误的线程上
+	// 空转 GetMessage——表现为"图标可见但点击无响应"（曾在本项目复现，属概率性事件，
+	// 与 hide/show 等触发 goroutine 调度的操作时序相关）。
+	// 因此在 Run 之前显式锁定当前 goroutine 到其 OS 线程，保证建窗与消息循环
+	// 全程线程亲和；同时该线程被独占后，Wails runtime 内部的 LockOSThread 调用
+	// 也不可能再把托盘循环挤走。Run 返回即托盘消息循环终止（正常退出时 quitFlag
+	// 已置位），此处日志用于侦测"图标可见但点击无响应"的循环停摆问题。
 	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 		systray.Run(func() { setupTray(app) }, func() {})
 		if !app.quitFlag.Load() {
 			logx.Errorf("[TRAY] 托盘消息循环异常退出，托盘将不可用（请重启应用并反馈日志）")

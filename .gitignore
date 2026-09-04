@@ -123,3 +123,9 @@ seeinpc/seeinpc.lock
 
 # e2e runtime release packages
 test/e2e/runtime/pm/data/releases/
+
+# 托盘诊断输出
+seeinpc/debug-tray*-out.txt
+# seeinpc 托盘/权限实验临时输出
+seeinpc/perm-check.txt
+seeinpc/perm2.txt
