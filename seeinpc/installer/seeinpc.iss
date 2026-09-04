@@ -53,7 +53,8 @@ Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 seeinpc"; Flags: n
 
 [UninstallRun]
 ; 移除 SeeinpcVpn 虚拟网卡（pnputil 按设备名匹配；不存在时静默跳过）
-Filename: "powershell.exe"; Parameters: "-NoProfile -Command ""Get-PnpDevice -FriendlyName 'SeeinpcVpn*' -ErrorAction SilentlyContinue | ForEach-Object { pnputil /remove-device $_.InstanceId }"""; Flags: runhidden waituntilterminated
+; 注意：Inno 把 {xxx} 当常量，PowerShell 脚本块的花括号必须写成 {{ }}
+Filename: "powershell.exe"; Parameters: "-NoProfile -Command ""Get-PnpDevice -FriendlyName 'SeeinpcVpn*' -ErrorAction SilentlyContinue | ForEach-Object {{ pnputil /remove-device $_.InstanceId }}"""; Flags: runhidden waituntilterminated
 
 [UninstallDelete]
 ; 清理运行时目录（配置与日志；如需保留用户配置可注释本段）
