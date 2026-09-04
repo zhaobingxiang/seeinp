@@ -44,8 +44,15 @@ func main() {
 	app := NewApp()
 	app.onQuit = systray.Quit
 
-	// 托盘独立协程运行自身消息循环（energye/systray 内部已 LockOSThread）
-	go systray.Run(func() { setupTray(app) }, func() {})
+	// 托盘独立协程运行自身消息循环（energye/systray 内部已 LockOSThread）。
+	// Run 返回即托盘消息循环终止（正常退出时 quitFlag 已置位），此处日志用于
+	// 侦测"图标可见但点击无响应"的循环停摆问题。
+	go func() {
+		systray.Run(func() { setupTray(app) }, func() {})
+		if !app.quitFlag.Load() {
+			logx.Errorf("[TRAY] 托盘消息循环异常退出，托盘将不可用（请重启应用并反馈日志）")
+		}
+	}()
 
 	err := wails.Run(&options.App{
 		Title:     "seeinpc",
@@ -71,15 +78,19 @@ func main() {
 	}
 }
 
-// setupTray 系统托盘：左键单击/双击恢复主界面，右键弹出菜单
+// setupTray 系统托盘：左键单击/双击恢复主界面，右键弹出菜单。
+// 注意：所有回调都运行在 Win32 消息回调的临时 goroutine 上——**禁止**在该栈上
+// 直接调用 Wails runtime（其内部 LockOSThread 会与阻塞在 GetMessage 中的托盘
+// goroutine 争抢线程锁归属，导致托盘消息循环停摆：图标可见但点击无响应）。
+// 应用逻辑必须 go 出去执行。
 func setupTray(app *App) {
 	systray.SetIcon(trayIcon)
 	systray.SetTitle("seeinpc")
 	systray.SetTooltip("seeinpc · 运维 VPN 客户端")
 
-	// 左键单击/双击：恢复主界面；右键：显示菜单
-	systray.SetOnClick(func(systray.IMenu) { app.showWindow() })
-	systray.SetOnDClick(func(systray.IMenu) { app.showWindow() })
+	// 左键单击/双击：恢复主界面；右键：显示菜单（ShowMenu 为库内模态循环，留在回调内）
+	systray.SetOnClick(func(systray.IMenu) { go app.showWindow() })
+	systray.SetOnDClick(func(systray.IMenu) { go app.showWindow() })
 	systray.SetOnRClick(func(menu systray.IMenu) {
 		if err := menu.ShowMenu(); err != nil {
 			logx.Warnf("[TRAY] show menu failed: %v", err)
@@ -91,7 +102,7 @@ func setupTray(app *App) {
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("退出", "清理隧道并退出")
 
-	mShow.Click(func() { app.showWindow() })
-	mDisconn.Click(func() { app.Disconnect() })
-	mQuit.Click(func() { app.fullQuit() })
+	mShow.Click(func() { go app.showWindow() })
+	mDisconn.Click(func() { go app.Disconnect() })
+	mQuit.Click(func() { go app.fullQuit() })
 }
