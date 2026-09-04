@@ -49,7 +49,9 @@ Name: "{autodesktop}\seeinpc"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktop
 Name: "{group}\seeinpc"; Filename: "{app}\{#MyAppExeName}"
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 seeinpc"; Flags: nowait postinstall skipifsilent
+; runascurrentuser：继承安装器的管理员上下文启动（exe 清单要求提权，默认的
+; postinstall 以原始登录用户运行会报 740 CreateProcess 失败）
+Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 seeinpc"; Flags: nowait postinstall runascurrentuser skipifsilent
 
 [UninstallRun]
 ; 移除 SeeinpcVpn 虚拟网卡（pnputil 按设备名匹配；不存在时静默跳过）
