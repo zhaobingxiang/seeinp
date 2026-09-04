@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/seeinp/seeinp/internal/logx"
 	"golang.org/x/sys/windows"
 )
 
@@ -129,10 +130,18 @@ func allowTrayClicksFromLowIL() {
 		msgFLTAllow     = 1      // MESSAGE_FILTER_ALLOW
 	)
 	user32 := windows.NewLazySystemDLL("user32.dll")
-	procChangeFilter := user32.NewProc("ChangeWindowMessageFilterEx")
+	procChangeFilterEx := user32.NewProc("ChangeWindowMessageFilterEx")
+	procChangeFilter := user32.NewProc("ChangeWindowMessageFilter")
 	procGetClassName := user32.NewProc("GetClassNameW")
 
-	// 找本进程的 SystrayClass 托盘窗口
+	// 放行消息集合：托盘回调 + TaskbarCreated 广播（Explorer 重启后图标自动重建）
+	msgs := []uintptr{msgTrayCallback}
+	if v, _, _ := user32.NewProc("RegisterWindowMessageW").Call(uintptr(unsafe.Pointer(taskbarCreatedName()))); v != 0 {
+		msgs = append(msgs, v)
+	}
+
+	// 找本进程的 SystrayClass 托盘窗口，逐消息 Ex 放行
+	found := false
 	cb := windows.NewCallback(func(hwnd windows.HWND, _ uintptr) uintptr {
 		var pid uint32
 		_, _ = windows.GetWindowThreadProcessId(hwnd, &pid)
@@ -144,15 +153,26 @@ func allowTrayClicksFromLowIL() {
 		if n == 0 || windows.UTF16ToString(buf) != "SystrayClass" {
 			return 1
 		}
-		// 放行托盘回调消息
-		_, _, _ = procChangeFilter.Call(uintptr(hwnd), msgTrayCallback, msgFLTAllow, 0)
-		// 放行 Explorer 重启广播（图标自动重建）
-		if v, _, _ := user32.NewProc("RegisterWindowMessageW").Call(uintptr(unsafe.Pointer(taskbarCreatedName()))); v != 0 {
-			_, _, _ = procChangeFilter.Call(uintptr(hwnd), v, msgFLTAllow, 0)
+		found = true
+		for _, m := range msgs {
+			r1, _, _ := procChangeFilterEx.Call(uintptr(hwnd), m, msgFLTAllow, 0)
+			// 双保险：进程级同步放行（Ex 个别场景不生效）
+			r2, _, _ := procChangeFilter.Call(m, msgFLTAllow)
+			logx.Infof("[TRAY] filter allow hwnd=%d msg=0x%x ex_ret=%d proc_ret=%d", hwnd, m, r1, r2)
 		}
 		return 0
 	})
 	_ = windows.EnumWindows(cb, unsafe.Pointer(nil))
+
+	if found {
+		logx.Infof("[TRAY] UIPI filter allowed for tray clicks (msgs=%d)", len(msgs))
+		return
+	}
+	// 兜底：窗口未找到时仅进程级
+	for _, m := range msgs {
+		r1, _, _ := procChangeFilter.Call(m, msgFLTAllow)
+		logx.Warnf("[TRAY] tray window not found, process-wide filter msg=0x%x ret=%d", m, r1)
+	}
 }
 
 // taskbarCreatedName 返回 "TaskbarCreated" 的 UTF16 指针（包级缓存）

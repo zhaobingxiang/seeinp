@@ -567,18 +567,22 @@ func (a *App) SaveSettings(s Settings) OpResult {
 
 // HideWindow 隐藏主窗口到托盘（自定义关闭按钮调用）
 func (a *App) HideWindow() {
+	a.logf("[TRAY] hide requested")
 	if a.ctx != nil {
 		wruntime.WindowHide(a.ctx)
+		a.logf("[TRAY] hide done normal=%v minimised=%v", wruntime.WindowIsNormal(a.ctx), wruntime.WindowIsMinimised(a.ctx))
 	}
 }
 
 // showWindow 恢复并前置主窗口（托盘左键单击/双击、菜单"显示主窗口"）
 func (a *App) showWindow() {
+	a.logf("[TRAY] show requested")
 	if a.ctx == nil {
 		return
 	}
 	wruntime.WindowShow(a.ctx)
 	wruntime.WindowUnminimise(a.ctx)
+	a.logf("[TRAY] show done normal=%v minimised=%v", wruntime.WindowIsNormal(a.ctx), wruntime.WindowIsMinimised(a.ctx))
 }
 
 // QuitApp 完整退出（清理隧道 → 退出）
