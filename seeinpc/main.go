@@ -33,7 +33,7 @@ func main() {
 		// 用户误以为新实例的托盘失效，实为旧实例残留图标）
 		title, _ := windows.UTF16PtrFromString("seeinpc")
 		text, _ := windows.UTF16PtrFromString("seeinpc 已在运行（请查看任务栏通知区域图标）。\n如托盘图标无响应，将鼠标悬停其上即可清除失效图标。")
-		_ = windows.MessageBox(0, text, title, windows.MB_OK|windows.MB_ICONINFORMATION)
+		_, _ = windows.MessageBox(0, text, title, windows.MB_OK|windows.MB_ICONINFORMATION)
 		os.Exit(0)
 	}
 
