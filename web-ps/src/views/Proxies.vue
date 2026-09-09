@@ -1,5 +1,8 @@
 ﻿<template>
   <Layout>
+    <!-- 周期流量用量提醒（配置了配额才显示） -->
+    <QuotaCard />
+
     <!-- 代理列表 -->
     <div class="page-card" style="padding:20px">
       <div class="card-header" style="margin-bottom:16px">
@@ -103,6 +106,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { FormInstance, FormRules } from 'element-plus'
 import { proxyApi } from '@/api'
 import Layout from '@/components/Layout.vue'
+import QuotaCard from '@/components/QuotaCard.vue'
 
 const formRef = ref<FormInstance>()
 const saving = ref(false)
@@ -132,6 +136,7 @@ const form = reactive(emptyForm())
 const rules: FormRules = {
   id: [
     {
+      required: true,
       validator: (_rule: any, value: string, callback: any) => {
         if (!value) return callback(new Error('请输入代理名称'))
         if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/.test(value)) {
@@ -145,11 +150,13 @@ const rules: FormRules = {
       trigger: 'blur'
     }
   ],
+  type: [{ required: true, message: '请选择代理类型', trigger: 'change' }],
   localAddr: [{ required: true, message: '请输入本地地址', trigger: 'blur' }],
   localPort: [{ required: true, message: '请输入本地端口', trigger: 'blur' }],
   proxyUsername: [{ required: true, message: '请输入代理账号', trigger: 'blur' }],
   proxyPassword: [
     {
+      required: true,
       validator: (_rule: any, value: string, callback: any) => {
         if (editingProxy.value && !value) return callback()
         if (!value) return callback(new Error('请输入代理密码'))
@@ -164,6 +171,7 @@ const rules: FormRules = {
   ],
   acl: [
     {
+      required: true,
       validator: (_rule: any, value: string[], callback: any) => {
         if (!value || value.length === 0) return callback(new Error('请至少填写一个 ACL 网段'))
         for (const cidr of value) {

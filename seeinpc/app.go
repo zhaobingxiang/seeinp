@@ -240,88 +240,121 @@ func (a *App) cardViewLocked(e *Entry) CardView {
 	return cv
 }
 
-// AddSeeinps 登录 seeinps（web-ui 外部端口）并拉取运维代理生成卡片。
-// 服务器地址固定（see.timemsee.cn 主 / see.timesee.cn 备，自动回退），不可填写。
-func (a *App) AddSeeinps(port int, user, pwd, captchaID, captchaText string) AddSeeinpsResult {
+// FetchSeeinps 「登录 seeinps 获取」第一步：登录并拉取运维 HTTP 代理列表，不落库。
+// 返回的每个代理带服务端 ACL（预填给用户编辑）；服务端 ACL 为空或仅 0.0.0.0/0 时标记
+// NeedACL，前端必须让用户手动填写网段后才能生成卡片。
+// 服务器地址来自设置中的服务器池（默认 see.timemsee.cn 主 / see.timesee.cn 备，顺序回退）。
+func (a *App) FetchSeeinps(port int, user, pwd, captchaID, captchaText string) FetchSeeinpsResult {
 	if port <= 0 || port > 65535 {
-		return AddSeeinpsResult{OpResult: OpResult{Message: "请填写有效的 web-ui 外部端口（1-65535）"}}
+		return FetchSeeinpsResult{OpResult: OpResult{Message: "请填写有效的 web-ui 外部端口（1-65535）"}}
 	}
-	c, lr, err := loginFallback(fixedServers, port, user, pwd, captchaID, captchaText)
+	c, lr, err := loginFallback(a.serverPool(), port, user, pwd, captchaID, captchaText)
 	if err != nil {
 		a.logErrorf("[AUTH] login failed port=%d err=%v", port, err)
-		return AddSeeinpsResult{OpResult: OpResult{Message: err.Error()}}
+		return FetchSeeinpsResult{OpResult: OpResult{Message: err.Error()}}
 	}
 	src := strings.TrimPrefix(c.base, "http://")
 	if lr.NeedCaptcha && !lr.OK {
 		cid, b64, cerr := c.captcha(context.Background())
 		if cerr != nil {
-			return AddSeeinpsResult{OpResult: OpResult{Message: lr.Message}}
+			return FetchSeeinpsResult{OpResult: OpResult{Message: lr.Message}}
 		}
 		msg := lr.Message
 		if msg == "" {
 			msg = "请输入验证码"
 		}
-		return AddSeeinpsResult{
+		return FetchSeeinpsResult{
 			OpResult:    OpResult{Message: msg},
 			NeedCaptcha: true, CaptchaID: cid, CaptchaB64: b64,
 		}
 	}
 	if !lr.OK {
-		return AddSeeinpsResult{OpResult: OpResult{Message: lr.Message}}
+		return FetchSeeinpsResult{OpResult: OpResult{Message: lr.Message}}
 	}
 	a.logf("[AUTH] login ok src=%s user=%s", src, user)
 
 	proxies, err := c.opsProxies(context.Background(), lr.Token)
 	if err != nil {
-		return AddSeeinpsResult{OpResult: OpResult{Message: err.Error()}}
+		return FetchSeeinpsResult{OpResult: OpResult{Message: err.Error()}}
 	}
 	if len(proxies) == 0 {
-		return AddSeeinpsResult{OpResult: OpResult{Message: "该 seeinps 暂无运维 HTTP 代理（type=ops_http）"}}
+		return FetchSeeinpsResult{OpResult: OpResult{Message: "该 seeinps 暂无运维 HTTP 代理（type=ops_http）"}}
 	}
-
-	a.mu.Lock()
-	added, updated := 0, 0
+	items := make([]FetchOpsItem, 0, len(proxies))
 	for _, p := range proxies {
 		acl := sanitizeACL(p.ACL)
-		if len(acl) != len(p.ACL) {
-			a.logf("[SYNC] acl filtered opsId=%d (0.0.0.0/0 removed)", p.OpsID)
+		items = append(items, FetchOpsItem{
+			OpsID: p.OpsID, ProxyUser: p.ProxyUser,
+			ACL: acl, NeedACL: len(acl) == 0,
+		})
+	}
+	return FetchSeeinpsResult{
+		OpResult: OpResult{OK: true, Message: fmt.Sprintf("已获取 %d 个运维代理，请确认网段后生成卡片", len(items))},
+		SourcePS: src, Items: items,
+	}
+}
+
+// ConfirmSeeinps 「登录 seeinps 获取」第二步：按用户编辑后的列表生成/更新卡片。
+// 名称留空用默认「账号 · 运维ID」；网段必填且经安全过滤（0.0.0.0/0 一律拒绝）。
+func (a *App) ConfirmSeeinps(sourcePS string, items []ConfirmOpsItem) OpResult {
+	if sourcePS == "" || len(items) == 0 {
+		return OpResult{Message: "没有需要生成的卡片"}
+	}
+	for _, it := range items {
+		if it.OpsID <= 0 || it.OpsID > 65535 {
+			return OpResult{Message: "存在无效的运维代理ID（应为 1-65535）"}
 		}
-		if existing := a.findByOpsLocked(src, p.OpsID, p.ProxyUser); existing != nil {
+		if containsFullRoute(it.ACL) {
+			return OpResult{Message: fmt.Sprintf("代理 %d 的目标网段不支持 0.0.0.0/0：会把本机全部流量导入 VPN 导致断网", it.OpsID)}
+		}
+		if len(sanitizeACL(it.ACL)) == 0 {
+			return OpResult{Message: fmt.Sprintf("代理 %d 的目标网段为必填项：该 seeinps 未提供可用 ACL（或为全网段），请手动填写至少一个网段", it.OpsID)}
+		}
+	}
+	a.mu.Lock()
+	added, updated := 0, 0
+	for _, it := range items {
+		acl := sanitizeACL(it.ACL)
+		name := strings.TrimSpace(it.Name)
+		if name == "" {
+			name = fmt.Sprintf("%s · %d", it.ProxyUser, it.OpsID)
+		}
+		if existing := a.findByOpsLocked(sourcePS, it.OpsID, it.ProxyUser); existing != nil {
 			existing.ACL = acl
-			existing.SourcePS = src
+			existing.SourcePS = sourcePS
+			if strings.TrimSpace(it.Name) != "" {
+				existing.Name = name
+			}
 			if existing.ProxyUser == "" {
-				existing.ProxyUser = p.ProxyUser
+				existing.ProxyUser = it.ProxyUser
 			}
 			updated++
 			continue
 		}
 		a.cfg.Entries = append(a.cfg.Entries, &Entry{
-			ID:        newID(),
-			Name:      fmt.Sprintf("%s · %d", p.ProxyUser, p.OpsID),
-			OpsID:     p.OpsID,
-			ProxyUser: p.ProxyUser,
-			ACL:       acl,
-			SourcePS:  src,
+			ID: newID(), Name: name, OpsID: it.OpsID,
+			ProxyUser: it.ProxyUser, ACL: acl, SourcePS: sourcePS,
 		})
 		added++
 	}
-	err = saveConfig(a.cfg)
+	err := saveConfig(a.cfg)
 	a.mu.Unlock()
 	if err != nil {
-		return AddSeeinpsResult{OpResult: OpResult{Message: "保存配置失败: " + err.Error()}}
+		return OpResult{Message: "保存配置失败: " + err.Error()}
 	}
-	a.logf("[SYNC] fetch from=%s proxies=%d added=%d updated=%d", src, len(proxies), added, updated)
+	a.logf("[SYNC] confirm from=%s items=%d added=%d updated=%d", sourcePS, len(items), added, updated)
 	a.triggerProbe()
 	a.emitState()
 	msg := fmt.Sprintf("新增 %d 个运维入口", added)
 	if updated > 0 {
 		msg += fmt.Sprintf("，更新 %d 个已存在入口", updated)
 	}
-	return AddSeeinpsResult{OpResult: OpResult{OK: true, Message: msg}, Added: added}
+	return OpResult{OK: true, Message: msg}
 }
 
-// AddOpsDirect 直接填写运维代理（ID+账号+密码+目标网段）生成单张卡片，无需登录 seeinps。
-func (a *App) AddOpsDirect(opsID int, proxyUser, proxyPass string, acl []string) OpResult {
+// AddOpsDirect 直接填写运维代理（名称可选+ID+账号+密码+目标网段）生成单张卡片，无需登录 seeinps。
+// name 留空时使用默认名「代理账号 · 运维ID」。
+func (a *App) AddOpsDirect(name string, opsID int, proxyUser, proxyPass string, acl []string) OpResult {
 	if opsID <= 0 || opsID > 65535 {
 		return OpResult{Message: "请填写有效的运维代理ID（端口 1-65535）"}
 	}
@@ -344,11 +377,18 @@ func (a *App) AddOpsDirect(opsID int, proxyUser, proxyPass string, acl []string)
 		if proxyPass != "" {
 			existing.ProxyPass = proxyPass
 		}
+		if strings.TrimSpace(name) != "" {
+			existing.Name = strings.TrimSpace(name)
+		}
 		existing.ACL = acl
 	} else {
+		displayName := strings.TrimSpace(name)
+		if displayName == "" {
+			displayName = fmt.Sprintf("%s · %d", proxyUser, opsID)
+		}
 		a.cfg.Entries = append(a.cfg.Entries, &Entry{
 			ID:        newID(),
-			Name:      fmt.Sprintf("%s · %d", proxyUser, opsID),
+			Name:      displayName,
 			OpsID:     opsID,
 			ProxyUser: proxyUser,
 			ProxyPass: proxyPass,
@@ -377,6 +417,10 @@ func (a *App) ManualAdd(name, server string, opsID int, proxyUser, proxyPass str
 	acl = sanitizeACL(acl)
 	if len(acl) == 0 {
 		return OpResult{Message: "目标网段为必填项，请至少添加一个网段"}
+	}
+	probeTarget, probeErr := validateProbeTarget(probeTarget)
+	if probeErr != "" {
+		return OpResult{Message: probeErr}
 	}
 	a.mu.Lock()
 	a.cfg.Entries = append(a.cfg.Entries, &Entry{
@@ -428,6 +472,23 @@ func (a *App) UpdateEntry(id, name, server, probeTarget string, probeIntranet bo
 	cleaned := sanitizeACL(acl)
 	if len(cleaned) == 0 {
 		return OpResult{Message: "目标网段为必填项，请至少添加一个网段"}
+	}
+	probeTarget, probeErr := validateProbeTarget(probeTarget)
+	if probeErr != "" {
+		return OpResult{Message: probeErr}
+	}
+	server = strings.TrimSpace(server)
+	if server != "" {
+		inPool := false
+		for _, s := range a.serverPool() {
+			if s == server {
+				inPool = true
+				break
+			}
+		}
+		if !inPool {
+			return OpResult{Message: "指定的代理服务器不在设置的服务器列表中，请先在设置中添加，或改回“自动（按列表顺序回退）”"}
+		}
 	}
 	a.mu.Lock()
 	e := a.findEntryLocked(id)
@@ -553,6 +614,25 @@ func (a *App) SaveSettings(s Settings) OpResult {
 	if s.LogLevel == "" {
 		s.LogLevel = a.cfg.Settings.LogLevel
 	}
+	// 代理服务器池清洗：去空白、丢弃空地址、无名用地址兜底、按地址去重；全空则回种内置默认
+	seen := map[string]bool{}
+	clean := make([]ServerConf, 0, len(s.Servers))
+	for _, sv := range s.Servers {
+		addr := strings.TrimSpace(sv.Addr)
+		if addr == "" || seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		name := strings.TrimSpace(sv.Name)
+		if name == "" {
+			name = addr
+		}
+		clean = append(clean, ServerConf{Name: name, Addr: addr})
+	}
+	if len(clean) == 0 {
+		clean = defaultServers()
+	}
+	s.Servers = clean
 	a.cfg.Settings = s
 	err := saveConfig(a.cfg)
 	a.mu.Unlock()
@@ -645,7 +725,7 @@ func (a *App) startVPN(e *Entry) error {
 
 	// 4. 启动协议栈引擎
 	dialer := &tunnel.Dialer{
-		Servers: entryServers(e), OpsID: e.OpsID,
+		Servers: a.entryServers(e), OpsID: e.OpsID,
 		Username: e.ProxyUser, Password: e.ProxyPass,
 		Timeout: 15 * time.Second,
 	}
@@ -781,7 +861,7 @@ func (a *App) runProbeCycle() {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		start := time.Now()
 		dialer := &tunnel.Dialer{
-			Servers: entryServers(&e), OpsID: e.OpsID,
+			Servers: a.entryServers(&e), OpsID: e.OpsID,
 			Username: e.ProxyUser, Password: e.ProxyPass, Timeout: 10 * time.Second,
 		}
 
@@ -868,15 +948,59 @@ func (a *App) findByOpsLocked(sourcePS string, opsID int, user string) *Entry {
 	return nil
 }
 
-// fixedServers 固定代理服务器地址（主/备自动回退），用户不可填写
-var fixedServers = []string{"see.timemsee.cn", "see.timesee.cn"}
+// defaultServers 见 model.go：内置主/备地址在设置被清空时兜底
 
-// entryServers 返回入口实际使用的代理服务器列表：手动自定义优先，否则固定地址
-func entryServers(e *Entry) []string {
+// serverPool 返回设置中的代理服务器地址列表（按顺序回退）；被清空时兜底内置主/备
+func (a *App) serverPool() []string {
+	a.mu.Lock()
+	servers := a.cfg.Settings.Servers
+	a.mu.Unlock()
+	out := make([]string, 0, len(servers))
+	for _, s := range servers {
+		if addr := strings.TrimSpace(s.Addr); addr != "" {
+			out = append(out, addr)
+		}
+	}
+	if len(out) == 0 {
+		for _, s := range defaultServers() {
+			out = append(out, s.Addr)
+		}
+	}
+	return out
+}
+
+// entryServers 返回入口实际使用的代理服务器列表：指定了某台则只连该台（失败不回退，
+// 语义明确便于排查），未指定按设置中的服务器池顺序回退
+func (a *App) entryServers(e *Entry) []string {
 	if e.Server != "" {
 		return []string{e.Server}
 	}
-	return fixedServers
+	return a.serverPool()
+}
+
+// validateProbeTarget 校验内网探测目标：留空合法（自动取首个网段地址:443）；
+// 填写时必须是 IPv4:端口。用户最常犯的错误是只填 IP 漏填端口，这里给出明确提示。
+func validateProbeTarget(s string) (string, string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		if net.ParseIP(s) != nil {
+			return s, "探测目标缺少端口：请填写 IP:端口（如 " + s + ":443）"
+		}
+		return s, "探测目标格式错误：应为 IP:端口（如 192.168.10.20:443）"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() == nil {
+		return s, "探测目标的主机部分必须是 IPv4 地址（如 192.168.10.20:443）"
+	}
+	var p int
+	if _, cerr := fmt.Sscanf(port, "%d", &p); cerr != nil || p <= 0 || p > 65535 || fmt.Sprintf("%d", p) != port {
+		return s, "探测目标的端口无效：应为 1-65535 的数字（如 192.168.10.20:443）"
+	}
+	return s, ""
 }
 
 // isFullRoute 判断是否为 0.0.0.0/0 全路由网段
