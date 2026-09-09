@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/seeinp/seeinp/internal/logx"
 )
 
 // checkDiskSpace Windows 跳过磁盘检查（无 statfs 等价 API）
@@ -38,7 +40,7 @@ func applyAndRestart(exePath, tmpPath string) error {
 		return fmt.Errorf("启动重启脚本: %w", err)
 	}
 
-	fmt.Printf("[UPGRADE] staged %s, exiting (service=%v, pid=%d)\n", stagePath, serviceMode, os.Getpid())
+	logx.Infof("[UPGRADE] staged, exiting: path=%s service=%v pid=%d", stagePath, serviceMode, os.Getpid())
 
 	// 3. 等待 PM 侧完成流收尾与状态记录，再退出当前进程
 	time.Sleep(2 * time.Second)

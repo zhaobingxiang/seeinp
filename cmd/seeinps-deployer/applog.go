@@ -28,7 +28,6 @@ func initAppLog() {
 	wr, err := logx.NewRotateWriter(logx.Config{
 		Dir:        filepath.Join(home, "seeinps-deployer-logs"),
 		Name:       "seeinps-deployer",
-		Level:      "debug",
 		MaxBackups: 30,
 	})
 	if err != nil {

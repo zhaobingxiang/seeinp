@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/protocol"
 )
 
@@ -49,7 +50,7 @@ func (c *Client) handleUpgradePush(msg *protocol.Message) *protocol.Message {
 		_ = os.MkdirAll("data", 0755)
 		respData.Stage = "accepted"
 	}
-	fmt.Printf("[UPGRADE] push version=%s %s/%s size=%d accepted=%v\n", d.Version, d.GoOS, d.GoArch, d.Size, code == protocol.CodeOK)
+	logx.Infof("[UPGRADE] push received: version=%s platform=%s/%s size=%d accepted=%v", d.Version, d.GoOS, d.GoArch, d.Size, code == protocol.CodeOK)
 	return &protocol.Message{Type: protocol.TypeUpgradePushResp, ID: msg.ID, Ts: time.Now().Unix(), Code: &code, Data: respData}
 }
 
@@ -65,7 +66,7 @@ func (c *Client) handleUpgradeStream(stream net.Conn) {
 	}
 	hlen := binary.BigEndian.Uint32(lenBuf[:])
 	if hlen == 0 || hlen > 64<<10 {
-		fmt.Printf("[UPGRADE] invalid meta length %d\n", hlen)
+		logx.Warnf("[UPGRADE] invalid meta length: %d", hlen)
 		return
 	}
 	metaBuf := make([]byte, hlen)
@@ -74,11 +75,11 @@ func (c *Client) handleUpgradeStream(stream net.Conn) {
 	}
 	meta := &protocol.UpgradePushData{}
 	if err := json.Unmarshal(metaBuf, meta); err != nil || meta.Size <= 0 || meta.Size > maxUpgradeSize || len(meta.Sha256) != 64 {
-		fmt.Printf("[UPGRADE] invalid stream meta\n")
+		logx.Warnf("[UPGRADE] invalid stream meta")
 		return
 	}
 	if meta.GoOS != runtime.GOOS || meta.GoArch != runtime.GOARCH {
-		fmt.Printf("[UPGRADE] stream platform mismatch: need %s/%s got %s/%s\n", runtime.GOOS, runtime.GOARCH, meta.GoOS, meta.GoArch)
+		logx.Warnf("[UPGRADE] stream platform mismatch: need %s/%s got %s/%s", runtime.GOOS, runtime.GOARCH, meta.GoOS, meta.GoArch)
 		c.sendUpgradeReport("failed", meta.Version, "升级包平台不匹配")
 		c.selfFailed(meta.Version, "升级包平台不匹配")
 		return
@@ -117,7 +118,7 @@ func (c *Client) handleUpgradeStream(stream net.Conn) {
 		c.sendUpgradeReport("failed", meta.Version, "SHA256 校验失败")
 		return
 	}
-	fmt.Printf("[UPGRADE] package %s verified (%d bytes), applying\n", meta.Version, n)
+	logx.Infof("[UPGRADE] package verified, applying: version=%s size=%d", meta.Version, n)
 	c.sendUpgradeReport("downloaded", meta.Version, "")
 	c.selfApplying(meta.Version)
 	time.Sleep(300 * time.Millisecond) // 等日志落盘再重启

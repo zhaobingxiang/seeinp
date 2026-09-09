@@ -50,10 +50,10 @@ func (c *Client) handleLoggingSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := persistLogLevel(c.configPath, logx.GetLevel()); err != nil {
-		logx.Warnf("persist log level to %s failed: %v", c.configPath, err)
+		logx.Warnf("[SYS] persist log level failed: path=%s err=%v", c.configPath, err)
 	}
 	c.config.Logging.Level = logx.GetLevel()
 	c.audit(r, "log_level_update", "", "level="+logx.GetLevel())
-	logx.Infof("log level changed to %s", logx.GetLevel())
+	logx.Infof("[SYS] log level changed: level=%s", logx.GetLevel())
 	writeOK(w, map[string]interface{}{"level": logx.GetLevel()})
 }

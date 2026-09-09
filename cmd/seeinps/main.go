@@ -194,7 +194,7 @@ func (l *controlLink) readLoop() {
 					}
 				}
 			}
-			fmt.Printf("[CTRL] SESSION_REVOKE received (reason=%s), disconnecting\n", reason)
+			logx.Infof("[CTRL] session revoke received, disconnecting: reason=%s", reason)
 			if l.onRevoke != nil {
 				l.onRevoke(reason)
 			}
@@ -212,7 +212,7 @@ func (l *controlLink) readLoop() {
 					reason = v
 				}
 			}
-			fmt.Printf("[CTRL] PROXY_REVOKE received (proxy=%s, reason=%s)\n", proxyID, reason)
+			logx.Infof("[CTRL] proxy revoke received: proxy=%s reason=%s", proxyID, reason)
 			if l.onProxyRevoke != nil {
 				l.onProxyRevoke(proxyID, reason)
 			}
@@ -319,7 +319,7 @@ func (c *Client) loadProxies() error {
 		if p.Type == "ops_http" {
 			nets, err := parseOpsACL(p.ACL)
 			if err != nil {
-				fmt.Printf("[PROXY] %s acl invalid (%v), fallback to default\n", p.ProxyID, err)
+				logx.Warnf("[PROXY] acl invalid, fallback to default: proxy=%s err=%v", p.ProxyID, err)
 				nets, _ = parseOpsACL("")
 			}
 			proxy.aclNets = nets
@@ -343,7 +343,7 @@ func (c *Client) registerCredentials() (string, string) {
 func (c *Client) connectOnce(ctx context.Context) error {
 	tlsConfig := &tls.Config{InsecureSkipVerify: c.config.TLS.SkipVerify}
 	addr := c.config.Server.ServerAddr
-	fmt.Printf("[seeinps] Connecting to %s...\n", addr)
+	logx.Infof("[CTRL] connecting to %s", addr)
 	conn, err := tls.Dial("tcp", addr, tlsConfig)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -372,7 +372,7 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	if helloResp.Code == nil || *helloResp.Code != protocol.CodeOK {
 		return fmt.Errorf("HELLO failed")
 	}
-	fmt.Println("[seeinps] Handshake OK")
+	logx.Infof("[CTRL] handshake ok")
 
 	regUser, regCode := c.registerCredentials()
 	registerMsg := protocol.NewMessage(protocol.TypeRegister, &protocol.RegisterData{Username: regUser, AuthHash: regCode})
@@ -406,9 +406,9 @@ func (c *Client) connectOnce(ctx context.Context) error {
 		}
 		return fmt.Errorf("register deferred (code=%d)", code)
 	}
-	fmt.Println("[seeinps] Registered OK")
+	logx.Infof("[CTRL] registered ok")
 	if err := c.store.MarkLocalUserRegistered(); err != nil {
-		fmt.Printf("[INIT] mark registered: %v\n", err)
+		logx.Warnf("[INIT] mark registered error: %v", err)
 	}
 	sessionID := ""
 	if registerResp.Data != nil {
@@ -470,22 +470,22 @@ func (c *Client) runControlLoop(ctx context.Context, epoch int64) {
 		}
 		// 授权码被重置：停止重连，进程保持运行，等待 B端 rebind 新授权码
 		if c.revoked.Load() {
-			fmt.Println("[CTRL] Auth code reset by seeinpm; stop reconnecting. Re-bind the new auth code on the web console.")
+			logx.Infof("[CTRL] auth code reset by seeinpm; stop reconnecting, re-bind the new auth code on the web console")
 			return
 		}
 		if err != nil {
 			if errors.Is(err, errUserDisabled) {
-				fmt.Printf("[CTRL] %v; user disabled, slow retry every %s (re-enables automatically once admin enables the user)\n", err, slowRetryBackoff)
+				logx.Warnf("[CTRL] %v; user disabled, slow retry every %s (re-enables automatically once admin enables the user)", err, slowRetryBackoff)
 				backoff = slowRetryBackoff
 			} else {
 				// 授权码被拒：置重绑提示（B端横幅），继续退避重试；重绑后自动恢复
 				if errors.Is(err, errAuthCodeRejected) {
 					if !c.revoked.Load() {
-						fmt.Println("[CTRL] Auth code rejected by seeinpm; it may have been reset. Re-bind the new auth code on the web console.")
+						logx.Warnf("[CTRL] auth code rejected by seeinpm; it may have been reset, re-bind the new auth code on the web console")
 					}
 					c.revoked.Store(true)
 				}
-				fmt.Printf("[CTRL] %v; retry in %s\n", err, backoff)
+				logx.Warnf("[CTRL] %v; retry in %s", err, backoff)
 				backoff *= 2
 				if backoff > maxBackoff {
 					backoff = maxBackoff
@@ -527,7 +527,7 @@ func (c *Client) syncProxies(link *controlLink) {
 	c.proxiesMu.RUnlock()
 	for _, p := range list {
 		if _, err := c.allocProxy(link, p); err != nil {
-			fmt.Printf("[ALLOC] %s failed: %v\n", p.ID, err)
+			logx.Warnf("[ALLOC] alloc failed: proxy=%s err=%v", p.ID, err)
 		}
 	}
 }
@@ -553,7 +553,7 @@ func (c *Client) resyncLoop(ctx context.Context, link *controlLink) {
 			c.proxiesMu.RUnlock()
 			for _, p := range pending {
 				if _, err := c.allocProxy(link, p); err != nil {
-					fmt.Printf("[RESYNC] %s alloc failed: %v\n", p.ID, err)
+					logx.Warnf("[ALLOC] resync alloc failed: proxy=%s err=%v", p.ID, err)
 				}
 			}
 		}
@@ -597,9 +597,9 @@ func (c *Client) allocProxy(link *controlLink, p *Proxy) (int, error) {
 	p.ForwardPort = d.Port
 	c.proxiesMu.Unlock()
 	if err := c.store.UpdateProxyPort(p.ID, d.Port); err != nil {
-		fmt.Printf("[ALLOC] save port: %v\n", err)
+		logx.Warnf("[ALLOC] save port error: proxy=%s err=%v", p.ID, err)
 	}
-	fmt.Printf("[ALLOC] %s: local %s:%d -> forward %d\n", p.ID, p.LocalAddr, p.LocalPort, d.Port)
+	logx.Infof("[ALLOC] allocated: proxy=%s local=%s:%d forward=%d", p.ID, p.LocalAddr, p.LocalPort, d.Port)
 	return d.Port, nil
 }
 
@@ -609,9 +609,9 @@ func (c *Client) releaseProxy(link *controlLink, p *Proxy) {
 	}
 	msg := protocol.NewMessage(protocol.TypeReleasePort, &protocol.ReleasePortData{ProxyID: p.ID, Port: p.ForwardPort})
 	if _, err := link.request(msg, 5*time.Second); err != nil {
-		fmt.Printf("[RELEASE] %s notify error: %v\n", p.ID, err)
+		logx.Warnf("[RELEASE] notify error: proxy=%s err=%v", p.ID, err)
 	}
-	fmt.Printf("[RELEASE] %s port %d\n", p.ID, p.ForwardPort)
+	logx.Infof("[RELEASE] released: proxy=%s port=%d", p.ID, p.ForwardPort)
 }
 
 func (c *Client) heartbeatLoop(ctx context.Context, link *controlLink) error {
@@ -663,7 +663,7 @@ func (c *Client) handleDataStream(stream net.Conn) {
 	}
 	idLen := int(idLenByte[0])
 	if idLen < 1 || idLen > 128 {
-		fmt.Printf("[DATA] invalid proxyIdLen %d\n", idLen)
+		logx.Warnf("[DATA] invalid proxyIdLen: %d", idLen)
 		return
 	}
 	idBuf := make([]byte, idLen)
@@ -675,7 +675,7 @@ func (c *Client) handleDataStream(stream net.Conn) {
 	proxy, ok := c.proxies[proxyID]
 	c.proxiesMu.RUnlock()
 	if !ok {
-		fmt.Printf("[DATA] unknown proxyID %q\n", proxyID)
+		logx.Warnf("[DATA] unknown proxyID: %q", proxyID)
 		return
 	}
 	switch stype[0] {
@@ -686,14 +686,14 @@ func (c *Client) handleDataStream(stream net.Conn) {
 	case protocol.StreamTypeUDP:
 		c.handleUDPStream(stream, proxy)
 	default:
-		fmt.Printf("[DATA] unsupported stype %d for %s\n", stype[0], proxyID)
+		logx.Warnf("[DATA] unsupported stype %d for proxy %s", stype[0], proxyID)
 	}
 }
 
 func (c *Client) handleTCPStream(stream net.Conn, proxy *Proxy) {
 	targetConn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", proxy.LocalAddr, proxy.LocalPort), 5*time.Second)
 	if err != nil {
-		fmt.Printf("[DATA] dial %s fail: %v\n", proxy.ID, err)
+		logx.Errorf("[DATA] dial local target failed: proxy=%s err=%v", proxy.ID, err)
 		return
 	}
 	defer targetConn.Close()
@@ -729,7 +729,7 @@ func (c *Client) handleUDPStream(stream net.Conn, proxy *Proxy) {
 	}
 	uconn, err := net.DialUDP("udp", nil, dst)
 	if err != nil {
-		fmt.Printf("[UDP] dial %s fail: %v\n", proxy.ID, err)
+		logx.Errorf("[UDP] dial local target failed: proxy=%s err=%v", proxy.ID, err)
 		stream.Close()
 		return
 	}
@@ -782,11 +782,13 @@ func main() {
 
 // runForeground 前台模式：信号驱动，保持进程运行直到收到中断/终止。
 func runForeground(confPath string) {
-	ctx, cancel, err := startWorker(confPath)
+	ctx, cancel, restore, err := startWorker(confPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	// LIFO：先 cancel 触发关停，后 restore 冲刷日志落盘
+	defer restore()
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -795,30 +797,32 @@ func runForeground(confPath string) {
 }
 
 // startWorker 加载配置并启动 seeinps 后台工作协程（配置、锁、日志、存储、控制循环、B端服务）。
-// 返回生命周期上下文与取消函数；平台模式（前台/服务）各自负责触发 cancel。
-func startWorker(confPath string) (context.Context, context.CancelFunc, error) {
+// 返回生命周期上下文、取消函数与日志冲刷函数；平台模式（前台/服务）各自负责按序调用。
+func startWorker(confPath string) (context.Context, context.CancelFunc, func(), error) {
 	cfg, err := config.LoadPSConfig(confPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// 单实例锁：重复启动会互踢（1002）并抢占 B 端端口，直接拒绝第二个实例
 	if err := os.MkdirAll("data", 0755); err != nil {
-		return nil, nil, fmt.Errorf("create data dir: %v", err)
+		return nil, nil, nil, fmt.Errorf("create data dir: %v", err)
 	}
 	instanceLock, err := acquireInstanceLock("data/seeinps.lock")
 	if err != nil {
-		return nil, nil, fmt.Errorf("another seeinps instance is running (%v), exiting", err)
+		return nil, nil, nil, fmt.Errorf("another seeinps instance is running (%v), exiting", err)
 	}
-	logx.Install(cfg.Logging.Path, "seeinps", cfg.Logging.Level, cfg.Logging.MaxSize, cfg.Logging.MaxBackups)
+	restore := logx.Install(cfg.Logging.Path, "seeinps", cfg.Logging.Level, cfg.Logging.MaxSize, cfg.Logging.MaxBackups)
 	psStore, err := store.NewPS("data/seeinps.db")
 	if err != nil {
 		instanceLock.Close()
-		return nil, nil, err
+		restore()
+		return nil, nil, nil, err
 	}
 	jwtSecret, err := auth.GenerateJWTSecret()
 	if err != nil {
 		instanceLock.Close()
-		return nil, nil, err
+		restore()
+		return nil, nil, nil, err
 	}
 	jwt := auth.NewJWTManager(jwtSecret, 24*time.Hour, 48*time.Hour)
 
@@ -833,8 +837,9 @@ func startWorker(confPath string) (context.Context, context.CancelFunc, error) {
 	client.configPath = confPath
 	client.rootCtx = ctx
 	if err := client.loadProxies(); err != nil {
-		instanceLock.Close()
-		return nil, nil, fmt.Errorf("load proxies: %w", err)
+		cancel() // 触发 AfterFunc 释放单实例锁并关闭存储
+		restore()
+		return nil, nil, nil, fmt.Errorf("load proxies: %w", err)
 	}
 	client.migrateLegacyLocalUser()
 
@@ -842,7 +847,7 @@ func startWorker(confPath string) (context.Context, context.CancelFunc, error) {
 	// startLocalServer 内部每 5s 重试绑定，端口释放后管理页自动恢复
 	go func() {
 		if err := client.startLocalServer(); err != nil {
-			fmt.Printf("[B端] local server error: %v\n", err)
+			logx.Infof("[WEB] local server exited: %v", err)
 		}
 	}()
 
@@ -859,13 +864,13 @@ func startWorker(confPath string) (context.Context, context.CancelFunc, error) {
 				return
 			case <-ticker.C:
 				if n, err := psStore.CleanupAuditLogs(time.Now().Add(-90 * 24 * time.Hour).Unix()); err != nil {
-					fmt.Printf("[CLEANUP] audit logs: %v\n", err)
+					logx.Warnf("[CLEANUP] audit logs cleanup error: %v", err)
 				} else if n > 0 {
-					fmt.Printf("[CLEANUP] Removed %d audit logs over 90 days\n", n)
+					logx.Infof("[CLEANUP] removed %d audit logs over 90 days", n)
 				}
 			}
 		}
 	}()
 
-	return ctx, cancel, nil
+	return ctx, cancel, restore, nil
 }

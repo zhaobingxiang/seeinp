@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/seeinp/seeinp/internal/auth"
+	"github.com/seeinp/seeinp/internal/logx"
 )
 
 const opsHeadLimit = 32 * 1024
@@ -249,5 +250,5 @@ func writeOpsResponse(w io.Writer, code int, msg string, extraHeaders ...string)
 
 // logOps 访问日志（F-P8）：不含密码/凭据
 func logOps(proxyID, user, target, result string) {
-	fmt.Printf("[OPS] proxy=%s user=%q target=%s result=%s\n", proxyID, user, target, result)
+	logx.Infof("[OPS] access: proxy=%s user=%q target=%s result=%s", proxyID, user, target, result)
 }

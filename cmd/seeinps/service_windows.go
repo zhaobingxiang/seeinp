@@ -43,12 +43,14 @@ func (s *psService) Execute(args []string, r <-chan svc.ChangeRequest, status ch
 		}
 	}
 
-	ctx, cancel, err := startWorker(s.confPath)
+	ctx, cancel, restore, err := startWorker(s.confPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "start worker failed: %v\n", err)
 		status <- svc.Status{State: svc.StopPending}
 		return false, 1
 	}
+	// LIFO：先 cancel 触发关停，后 restore 冲刷日志落盘
+	defer restore()
 	defer cancel()
 
 	status <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}

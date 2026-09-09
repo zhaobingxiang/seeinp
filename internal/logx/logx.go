@@ -2,8 +2,10 @@
 //
 // 文件命名策略：
 //   - 当前活动文件始终为 <name>.log（如 seeinpm.log），兼容现有日志 API/前端；
-//   - 跨天或大小超限时，将活动文件归档为 <name>_YYYYMMDD.log；
-//   - 同一天内多次超限，追加序号 <name>_YYYYMMDD.1.log / .2.log ...；
+//   - 跨天或大小超限时，将活动文件归档为 <name>_<内容末次写入时刻>.log
+//     （如 seeinpm_20260902-235958.log）：时间取归档内容的末次写入时刻，
+//     日期即内容所属日（跨天轮转不张冠李戴），文件名字典序即时间序，同日多次轮转也不冲突；
+//   - 极端情况下归档时刻重名时追加序号 .1/.2 ... 兜底；
 //   - 轮转后按 <name>_*.log 清理，仅保留最近 maxBackups 份。
 package logx
 
@@ -23,7 +25,6 @@ import (
 type Config struct {
 	Dir        string // 日志目录（不存在自动创建）
 	Name       string // 日志基础名，如 seeinpm / seeinps
-	Level      string // debug/info/warn/error；空按 info
 	MaxSizeMB  int    // 单文件大小上限（MB），<=0 表示仅按天轮转
 	MaxBackups int    // 保留的轮转文件份数（含当前活动文件），<=0 表示不清理
 }
@@ -79,15 +80,9 @@ func currentThreshold() int {
 	return threshold
 }
 
-// shouldKeep 判断一行日志是否应输出（基于该 Config 实例的级别，供单元测试与单实例使用）。
+// globalShouldKeep 基于全局运行时级别判断一行日志是否输出（SetLevel 即时生效）。
 // 只有行首明确带 [DEBUG]/[INFO]/[WARN]/[ERROR] 级别标记的行才参与过滤；
 // 未标记或未知标记（如 [CTRL]/[ALLOC]）的行始终保留，保证现有日志不被误滤。
-// 说明：Install 接入的 stdout 过滤使用 globalShouldKeep（读全局运行时级别）。
-func (c *Config) shouldKeep(line string) bool {
-	return lineShouldKeep(line, strings.ToLower(c.Level))
-}
-
-// globalShouldKeep 基于全局运行时级别判断一行日志是否输出（SetLevel 即时生效）。
 func globalShouldKeep(line string) bool {
 	levelMu.RLock()
 	lv := curLevel
@@ -114,7 +109,8 @@ func lineShouldKeep(line, level string) bool {
 
 // -------------------- 分级日志便捷函数 --------------------
 // 输出带标准级别标记（[DEBUG]/[INFO]/[WARN]/[ERROR]）的日志，经 Install 接管的
-// os.Stdout 写入，从而真正受 SetLevel 级别过滤。写前也做阈值判断，双保险。
+// os.Stdout 写入。级别过滤在写入时刻判定（SetLevel 对之后的新行即时生效，
+// 不追溯已入管道的行）。
 func taggedPrintf(tag, format string, args ...interface{}) {
 	if currentThreshold() > levelRank[strings.ToLower(tag)] {
 		return
@@ -139,11 +135,12 @@ func Errorf(format string, args ...interface{}) { taggedPrintf("ERROR", format, 
 type RotateWriter struct {
 	cfg Config
 
-	mu      sync.Mutex
-	file    *os.File
-	day     string
-	size    int64
-	maxSize int64
+	mu        sync.Mutex
+	file      *os.File
+	day       string
+	size      int64
+	maxSize   int64
+	lastWrite time.Time // 最近一次成功写入的时刻，归档文件名据此命名
 }
 
 // NewRotateWriter 创建轮转写入器，立即打开活动文件（不存在则创建）
@@ -184,6 +181,7 @@ func (w *RotateWriter) openActive() error {
 	w.file = f
 	w.day = time.Now().Format("20060102")
 	w.size = size
+	w.lastWrite = time.Now()
 	return nil
 }
 
@@ -200,6 +198,9 @@ func (w *RotateWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.file.Write(p)
 	w.size += int64(n)
+	if n > 0 {
+		w.lastWrite = now
+	}
 	return n, err
 }
 
@@ -211,7 +212,7 @@ func (w *RotateWriter) rotateArchive(now time.Time) {
 	}
 	// 归档仅当活动文件已存在内容（避免产生空归档）
 	if info, err := os.Stat(w.activePath()); err == nil && info.Size() > 0 {
-		archive := w.nextArchivePath(now)
+		archive := w.nextArchivePath()
 		_ = os.Rename(w.activePath(), archive)
 	}
 	if err := w.openActive(); err != nil {
@@ -221,15 +222,17 @@ func (w *RotateWriter) rotateArchive(now time.Time) {
 	w.cleanup()
 }
 
-// nextArchivePath 计算归档文件名：<name>_YYYYMMDD[.N].log（N 从 1 起，避开已存在文件）
-func (w *RotateWriter) nextArchivePath(now time.Time) string {
-	day := now.Format("20060102")
-	for seq := 0; ; seq++ {
-		suffix := ""
-		if seq > 0 {
-			suffix = fmt.Sprintf(".%d", seq)
-		}
-		candidate := filepath.Join(w.cfg.Dir, fmt.Sprintf("%s_%s%s.log", w.cfg.Name, day, suffix))
+// nextArchivePath 计算归档文件名：<name>_<末次写入时刻 YYYYMMDD-HHMMSS>.log。
+// 时间取归档内容（活动文件）的末次写入时刻：跨天轮转时日期即内容所属日；
+// 字典序即时间序，天然避免同日多份归档的排序错乱。极端重名时追加 .1/.2 兜底。
+func (w *RotateWriter) nextArchivePath() string {
+	base := filepath.Join(w.cfg.Dir, w.cfg.Name+"_"+w.lastWrite.Format("20060102-150405"))
+	candidate := base + ".log"
+	if _, err := os.Stat(candidate); os.IsNotExist(err) {
+		return candidate
+	}
+	for seq := 1; ; seq++ {
+		candidate := fmt.Sprintf("%s.%d.log", base, seq)
 		if _, err := os.Stat(candidate); os.IsNotExist(err) {
 			return candidate
 		}
@@ -276,9 +279,10 @@ func (w *RotateWriter) Close() error {
 	return nil
 }
 
-// Install 将 os.Stdout / os.Stderr 替换为「级别过滤 + 行首时间戳 + 轮转」写入器，并接管 log 包输出。
-// 原理：os.Stdout/Stderr 换成 pipe 写端，后台协程按行加时间戳（并按级别过滤）后写入 RotateWriter。
-// 返回的 restore 可还原。
+// Install 将 os.Stdout / os.Stderr 替换为「行首时间戳 + 轮转」写入器，并接管 log 包输出。
+// 原理：os.Stdout/Stderr 换成 pipe 写端，后台协程按行加时间戳后写入 RotateWriter。
+// 级别过滤发生在写入侧（logx.Debugf 等与 log 包的 filteredWriter），SetLevel 即时生效。
+// 返回的 restore 可还原（关闭管道、冲刷残留日志、恢复标准输出）。
 // 过滤级别以 level 初始化为全局运行时级别（之后可通过 SetLevel 在线调整），传入非法级别时按 info 兜底。
 func Install(dir, name, level string, maxSizeMB, maxBackups int) (restore func()) {
 	rw, err := NewRotateWriter(Config{Dir: dir, Name: name, MaxSizeMB: maxSizeMB, MaxBackups: maxBackups})
@@ -313,15 +317,15 @@ func Install(dir, name, level string, maxSizeMB, maxBackups int) (restore func()
 
 	done := make(chan struct{})
 	var wg sync.WaitGroup
-	// 统一把一行（含结尾换行）按全局级别过滤后写入 rw（在线 SetLevel 即时生效）
+	// 统一把一行（含结尾换行）加时间戳后写入 rw。
+	// 注意：级别过滤在写入侧完成（taggedPrintf/filteredWriter 按写入时刻的级别判定），
+	// 泵内不再二次过滤——否则 SetLevel 会追溯丢弃已入管道但尚未泵出的行（时序竞态）。
+	// 未带级别标记的行（如 panic 堆栈）始终保留。
 	writeLine := func(b []byte) {
 		if len(b) == 0 {
 			return
 		}
-		if !globalShouldKeep(string(b)) {
-			return
-		}
-		ts := time.Now().Format("2006-01-02 15:04:05")
+		ts := time.Now().Format("2006-01-02 15:04:05.000")
 		rw.Write([]byte(ts + " " + string(b)))
 	}
 	pump := func(r *os.File) {
@@ -365,7 +369,7 @@ func (w *filteredWriter) Write(p []byte) (int, error) {
 		if !globalShouldKeep(line) {
 			continue
 		}
-		ts := time.Now().Format("2006-01-02 15:04:05")
+		ts := time.Now().Format("2006-01-02 15:04:05.000")
 		w.rw.Write([]byte(ts + " " + line + "\n"))
 	}
 	return len(p), nil

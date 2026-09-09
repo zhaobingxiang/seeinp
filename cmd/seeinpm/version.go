@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/protocol"
 	"github.com/seeinp/seeinp/internal/store"
 	versionpkg "github.com/seeinp/seeinp/internal/version"
@@ -384,7 +385,7 @@ func (s *Server) handleVersionUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, 5000, "保存版本记录失败")
 		return
 	}
-	fmt.Printf("[VERSION] uploaded %s %s %s/%s (%d bytes, sha256=%s) by %s\n", endpoint, version, goos, goarch, size, v.Sha256[:12], v.ReleasedBy)
+	logx.Infof("[VERSION] uploaded: endpoint=%s version=%s platform=%s/%s size=%d sha256=%s by=%s", endpoint, version, goos, goarch, size, v.Sha256[:12], v.ReleasedBy)
 	s.audit(r, "version_upload", version, fmt.Sprintf("endpoint=%s platform=%s/%s size=%d sha256=%s", endpoint, goos, goarch, size, v.Sha256[:16]))
 	writeOK(w, map[string]interface{}{"id": v.ID, "version": v.Version, "sha256": v.Sha256, "fileSize": size})
 }
@@ -407,7 +408,7 @@ func (s *Server) handleVersionDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	os.RemoveAll(filepath.Join(releaseDir, v.Endpoint, v.Version, v.GoOS+"-"+v.GoArch))
-	fmt.Printf("[VERSION] deleted %s %s %s/%s\n", v.Endpoint, v.Version, v.GoOS, v.GoArch)
+	logx.Infof("[VERSION] deleted: endpoint=%s version=%s platform=%s/%s", v.Endpoint, v.Version, v.GoOS, v.GoArch)
 	s.audit(r, "version_delete", v.Version, fmt.Sprintf("endpoint=%s platform=%s/%s file=%s", v.Endpoint, v.GoOS, v.GoArch, v.FileName))
 	writeOK(w, nil)
 }
@@ -477,14 +478,14 @@ func (s *Server) handleClientUpgrade(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = recover() }()
 		upgradeStage(username, "transferring", "")
 		if err := s.sendUpgradeStream(client, v); err != nil {
-			fmt.Printf("[UPGRADE] %s stream send error: %v\n", username, err)
+			logx.Errorf("[UPGRADE] stream send error: user=%s err=%v", username, err)
 			// 节点收完全部字节并校验通过后会立即重启（旧连接关闭 → session shutdown），
 			// 此时 UPGRADE_REPORT 已把状态推进为 verified，不能再覆盖为 failed
 			upgradeFailIfNotVerified(username, "传输升级包失败: "+err.Error())
 			return
 		}
 		upgradeStage(username, "sent", "")
-		fmt.Printf("[UPGRADE] %s package %s sent, waiting for node restart\n", username, v.Version)
+		logx.Infof("[UPGRADE] package sent, waiting for node restart: user=%s version=%s", username, v.Version)
 	}()
 	s.audit(r, "client_upgrade", username, fmt.Sprintf("version=%s sha256=%s", v.Version, v.Sha256[:16]))
 	writeOK(w, map[string]interface{}{"started": true, "version": v.Version, "totalBytes": v.FileSize})
@@ -563,12 +564,12 @@ func (s *Server) handleUpgradeReport(msg *protocol.Message, client *Client) {
 	d := &protocol.UpgradeReportData{}
 	json.Unmarshal(b, d)
 	if d.Stage == "failed" {
-		fmt.Printf("[UPGRADE] %s FAILED: %s\n", client.username, d.Error)
+		logx.Errorf("[UPGRADE] failed: user=%s err=%s", client.username, d.Error)
 		upgradeStage(client.username, "failed", d.Error)
 		s.store.InsertAuditLog(client.username, "upgrade_failed", d.Version, d.Error)
 		return
 	}
-	fmt.Printf("[UPGRADE] %s package %s verified, node restarting\n", client.username, d.Version)
+	logx.Infof("[UPGRADE] package verified, node restarting: user=%s version=%s", client.username, d.Version)
 	upgradeStage(client.username, "verified", "")
 	s.store.InsertAuditLog(client.username, "client_upgrade", d.Version, "via=publish verified")
 }
@@ -601,10 +602,10 @@ func (s *Server) handleVersionPullReq(msg *protocol.Message, client *Client) {
 	respData := &protocol.UpgradePushData{}
 	if err != nil {
 		code = int(protocol.CodeBadRequest)
-		fmt.Printf("[VERSION] %s pull %s: not found\n", client.username, d.Version)
+		logx.Warnf("[VERSION] pull not found: user=%s version=%s", client.username, d.Version)
 	} else {
 		respData = &protocol.UpgradePushData{ReleaseID: v.ID, Version: v.Version, GoOS: v.GoOS, GoArch: v.GoArch, Sha256: v.Sha256, Size: v.FileSize}
-		fmt.Printf("[VERSION] %s pulls %s (%d bytes)\n", client.username, v.Version, v.FileSize)
+		logx.Infof("[VERSION] pull: user=%s version=%s size=%d", client.username, v.Version, v.FileSize)
 		s.store.InsertAuditLog(client.username, "client_upgrade", v.Version, fmt.Sprintf("via=self-pull size=%d", v.FileSize))
 	}
 	client.writeControl(&protocol.Message{Type: protocol.TypeVersionPullResp, ID: msg.ID, Ts: time.Now().Unix(), Code: &code, Data: respData})
@@ -612,7 +613,7 @@ func (s *Server) handleVersionPullReq(msg *protocol.Message, client *Client) {
 		go func() {
 			defer func() { _ = recover() }()
 			if err := s.sendUpgradeStream(client, v); err != nil {
-				fmt.Printf("[VERSION] %s pull stream error: %v\n", client.username, err)
+				logx.Errorf("[VERSION] pull stream error: user=%s err=%v", client.username, err)
 			}
 		}()
 	}

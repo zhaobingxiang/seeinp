@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/protocol"
 	versionpkg "github.com/seeinp/seeinp/internal/version"
 )
@@ -151,7 +152,7 @@ func (c *Client) handleSelfUpgrade(w http.ResponseWriter, r *http.Request) {
 
 	sha := hex.EncodeToString(hash.Sum(nil))
 	selfSet(version, "applying", "", size, size)
-	fmt.Printf("[SELF-UPGRADE] uploaded %s (%d bytes, sha256=%s), applying\n", version, size, sha[:12])
+	logx.Infof("[UPGRADE] self-upgrade uploaded, applying: version=%s size=%d sha256=%s", version, size, sha[:12])
 	// 后台应用：校验已随接收完成，直接换二进制重启（失败回滚并置 failed）
 	go func() {
 		defer func() { _ = recover() }()
@@ -163,7 +164,7 @@ func (c *Client) handleSelfUpgrade(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := applyAndRestart(exe, upgradeTmpPath); err != nil {
 			os.Remove(upgradeTmpPath)
-			fmt.Printf("[SELF-UPGRADE] %s failed: %v\n", version, err)
+			logx.Errorf("[UPGRADE] self-upgrade failed: version=%s err=%v", version, err)
 			selfSet(version, "failed", err.Error(), -1, -1)
 			return
 		}

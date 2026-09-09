@@ -19,6 +19,7 @@ import (
 	"github.com/seeinp/seeinp/internal/auth"
 	"github.com/seeinp/seeinp/internal/guard"
 	"github.com/seeinp/seeinp/internal/gzhttp"
+	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/protocol"
 	"github.com/seeinp/seeinp/internal/store"
 	"github.com/seeinp/seeinp/internal/version"
@@ -77,11 +78,11 @@ func (c *Client) migrateLegacyLocalUser() {
 		SeeinpmUser:  legacy.SeeinpmUser,
 		AuthCode:     legacy.AuthCode,
 	}); err != nil {
-		fmt.Printf("[INIT] migrate legacy user: %v\n", err)
+		logx.Warnf("[INIT] migrate legacy user error: %v", err)
 		return
 	}
 	os.Rename(legacyLocalUserPath, legacyLocalUserPath+".bak")
-	fmt.Printf("[INIT] Migrated legacy local user: %s\n", legacy.Username)
+	logx.Infof("[INIT] migrated legacy local user: user=%s", legacy.Username)
 }
 
 func (c *Client) startLocalServer() error {
@@ -116,7 +117,7 @@ func (c *Client) startLocalServer() error {
 
 	// 前端内嵌于二进制（internal/webui），与后端版本严格一致，随一键升级同步更新
 	mux.HandleFunc("/", webui.SPAHandler(webui.PS()))
-	fmt.Printf("[B端] Serving embedded web (version %s)\n", version.Version)
+	logx.Infof("[WEB] serving embedded web: version=%s", version.Version)
 
 	addr := c.config.Local.BendAddr
 
@@ -133,12 +134,12 @@ func (c *Client) startLocalServer() error {
 	// 绑定失败（如端口被残留实例占用）不退出进程：代理与控制通道不受影响，
 	// 每 5s 重试绑定，端口释放后管理页自动恢复
 	for {
-		fmt.Printf("[B端] Listening on %s\n", addr)
+		logx.Infof("[WEB] listening on %s", addr)
 		err := server.ListenAndServe()
 		if err == http.ErrServerClosed {
 			return err
 		}
-		fmt.Printf("[B端] Listen failed: %v, retry in 5s\n", err)
+		logx.Warnf("[WEB] listen failed, retry in 5s: %v", err)
 		time.Sleep(5 * time.Second)
 	}
 }
@@ -200,7 +201,7 @@ func clientIP(r *http.Request) string {
 // auditRecord 落库本地审计并异步上报 seeinpm（AUDIT_SYNC）
 func (c *Client) auditRecord(username, action, target, detail string, createdAt int64) {
 	if err := c.store.InsertAuditLog(username, action, target, detail); err != nil {
-		fmt.Printf("[AUDIT] insert error: %v\n", err)
+		logx.Warnf("[AUDIT] insert error: %v", err)
 	}
 	// 混合架构：本地已落库，控制连接可用时异步上报，失败不影响主流程（PM 端可按 username 区分来源）
 	go func() {
@@ -215,7 +216,7 @@ func (c *Client) auditRecord(username, action, target, detail string, createdAt 
 				}},
 			})
 			if err := link.send(msg); err != nil {
-				fmt.Printf("[AUDIT] sync to seeinpm error: %v\n", err)
+				logx.Warnf("[AUDIT] sync to seeinpm error: %v", err)
 			}
 		}
 	}()
@@ -278,7 +279,7 @@ func (c *Client) handleAuthInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, 5000, "保存账号失败")
 		return
 	}
-	fmt.Printf("[INIT] Local user initialized: %s\n", req.Username)
+	logx.Infof("[INIT] local user initialized: user=%s", req.Username)
 	c.auditPlain(req.Username, "auth_init", "ip="+r.RemoteAddr, r)
 	token, _ := c.jwt.GenerateAccessToken(req.Username, "ps")
 	// 授权码可能是在离线/被吊销状态下更新的：立即重启控制循环用新凭证注册
@@ -308,7 +309,7 @@ func (c *Client) handleAuthRebind(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, 5000, "保存授权码失败")
 		return
 	}
-	fmt.Println("[REBIND] Auth code updated via web console; restarting control loop")
+	logx.Infof("[AUTH] auth code updated via web console; restarting control loop")
 	c.audit(r, "auth_rebind", "", "ip="+r.RemoteAddr)
 	c.restartControl()
 	writeOK(w, map[string]interface{}{"restarted": true})
@@ -699,7 +700,7 @@ func (c *Client) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, 5000, "删除代理失败")
 		return
 	}
-	fmt.Printf("[PROXY] Deleted: %s\n", id)
+	logx.Infof("[PROXY] deleted: proxy=%s", id)
 	detail := ""
 	if p.ForwardPort > 0 {
 		detail = fmt.Sprintf("type=%s forward_port=%d", p.Type, p.ForwardPort)

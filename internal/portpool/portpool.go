@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/store"
 )
 
@@ -86,7 +87,7 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, u
 	// Check if this (user, proxy) already has an active allocation.
 	// 复合键定位：proxyID 并非全局唯一（不同用户的 web-ui 同名），只按 proxyID 会误复用他人端口
 	if existing, err := p.store.GetPortByUserProxy(userID, proxyID); err == nil {
-		fmt.Printf("[POOL] Reusing port %d for user=%s proxy=%s\n", existing.Port, userID, proxyID)
+		logx.Debugf("[POOL] reusing port: port=%d user=%s proxy=%s", existing.Port, userID, proxyID)
 		return &Allocation{
 			Port:    existing.Port,
 			UserID:  existing.UserID,
@@ -113,13 +114,13 @@ func (p *Pool) Allocate(userID, proxyID, proxyType string, preferredPort *int, u
 				if inRanges(last.Port, userRanges) {
 					if err := p.checkSystemPort(last.Port, proxyType); err == nil {
 						port = last.Port
-						fmt.Printf("[POOL] Restoring port %d for proxy %s\n", port, proxyID)
+						logx.Infof("[POOL] restoring port: port=%d proxy=%s", port, proxyID)
 					}
 				} else {
-					fmt.Printf("[POOL] Historical port %d for proxy %s outside user pool, re-allocating\n", last.Port, proxyID)
+					logx.Infof("[POOL] historical port outside user pool, re-allocating: port=%d proxy=%s", last.Port, proxyID)
 				}
 			} else {
-				fmt.Printf("[POOL] Historical port %d for proxy %s outside current pool, re-allocating\n", last.Port, proxyID)
+				logx.Infof("[POOL] historical port outside current pool, re-allocating: port=%d proxy=%s", last.Port, proxyID)
 			}
 		}
 		if port == 0 {

@@ -51,11 +51,11 @@ func (s *Server) handleLoggingSet(w http.ResponseWriter, r *http.Request) {
 	}
 	// 持久化；失败不影响运行时生效，但需告警
 	if err := persistLogLevel(s.configPath, logx.GetLevel()); err != nil {
-		logx.Warnf("persist log level to %s failed: %v", s.configPath, err)
+		logx.Warnf("[SYS] persist log level failed: path=%s err=%v", s.configPath, err)
 	}
 	// 同步内存配置，便于后续 GET 与展示
 	s.config.Logging.Level = logx.GetLevel()
 	s.audit(r, "log_level_update", "", "level="+logx.GetLevel())
-	logx.Infof("log level changed to %s", logx.GetLevel())
+	logx.Infof("[SYS] log level changed: level=%s", logx.GetLevel())
 	writeOK(w, map[string]interface{}{"level": logx.GetLevel()})
 }

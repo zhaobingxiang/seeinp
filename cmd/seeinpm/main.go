@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -63,6 +62,8 @@ type Server struct {
 	traffic          map[string]*proxyTraffic
 	trafficMu        sync.Mutex
 	lastProxyCleanup time.Time
+	// fatal 上抛致命错误（如控制监听失败），Start 收到后优雅关停并以错误退出
+	fatal chan error
 }
 
 // proxyTraffic 代理流量内存计数：in/out 为进程启动以来累计（含未落库部分），
@@ -156,9 +157,9 @@ func NewServer(config *config.PMConfig) (*Server, error) {
 		for _, r := range dbRanges {
 			ranges = append(ranges, portpool.Range{Start: r.Start, End: r.End})
 		}
-		fmt.Printf("[PORT-POOL] Loaded config from DB: %v\n", dbRanges)
+		logx.Infof("[POOL] loaded config from DB: %v", dbRanges)
 	} else if err != nil {
-		fmt.Printf("[PORT-POOL] Read db config error (fallback to toml): %v\n", err)
+		logx.Warnf("[POOL] read db config error (fallback to toml): %v", err)
 	}
 
 	return &Server{
@@ -172,6 +173,7 @@ func NewServer(config *config.PMConfig) (*Server, error) {
 		publicConns:        make(map[int]*PublicListener),
 		publicConnsByProxy: make(map[string]*PublicListener),
 		traffic:            make(map[string]*proxyTraffic),
+		fatal:              make(chan error, 2),
 	}, nil
 }
 
@@ -189,7 +191,7 @@ func (s *Server) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("generate cert: %w", err)
 		}
-		fmt.Printf("[TLS] Fingerprint: %s\n", fp)
+		logx.Infof("[TLS] fingerprint: %s", fp)
 	}
 
 	cert, err := tlsutil.LoadCert(certFile, keyFile)
@@ -209,20 +211,31 @@ func (s *Server) Start(ctx context.Context) error {
 	go s.trafficSampler(ctx)
 	go s.trafficFlusher(ctx)
 
-	fmt.Println("[seeinpm] Started - control :99, api :90")
+	httpAddr := s.config.Server.HTTPAddr
+	if httpAddr == "" {
+		httpAddr = ":90"
+	}
+	logx.Infof("[SYS] started: control %s, api %s", s.config.Server.Addr, httpAddr)
 
-	<-ctx.Done()
+	// 致命错误（控制监听失败）立即关停并上抛；信号/ctx 取消走正常关停
+	var fatalErr error
+	select {
+	case <-ctx.Done():
+	case fatalErr = <-s.fatal:
+	}
 	s.shutdown()
-	return nil
+	return fatalErr
 }
 
 func (s *Server) startControlListener(ctx context.Context) {
 	ln, err := tls.Listen("tcp", s.config.Server.Addr, s.tlsConfig)
 	if err != nil {
-		log.Fatalf("[FATAL] Control listener: %v", err)
+		logx.Errorf("[CTRL] control listener failed: %v", err)
+		s.fatal <- fmt.Errorf("control listener: %w", err)
+		return
 	}
 	defer ln.Close()
-	fmt.Printf("[CTRL] Listening on %s\n", s.config.Server.Addr)
+	logx.Infof("[CTRL] listening on %s", s.config.Server.Addr)
 
 	for {
 		select {
@@ -232,7 +245,7 @@ func (s *Server) startControlListener(ctx context.Context) {
 		}
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("[CTRL] Accept error: %v", err)
+			logx.Warnf("[CTRL] accept error: %v", err)
 			continue
 		}
 		go s.handleControlConnection(conn)
@@ -284,7 +297,7 @@ func (s *Server) startHTTPListener() {
 	if addr == "" {
 		addr = ":90"
 	}
-	fmt.Printf("[HTTP] Listening on %s\n", addr)
+	logx.Infof("[HTTP] listening on %s", addr)
 	// 文件下载接口用独立 mux 注册，完全不经过 gzip 中间件（io.Copy + 大文件与 gzip 管道有交互问题）。
 	// 其余请求（前端/JSON API）走 gzip 压缩。
 	downloadMux := http.NewServeMux()
@@ -293,7 +306,7 @@ func (s *Server) startHTTPListener() {
 	topMux.Handle("/api/v1/ps-release/download", downloadMux)
 	topMux.Handle("/", gzhttp.Handler(mux))
 	if err := http.ListenAndServe(addr, topMux); err != nil {
-		log.Printf("[HTTP] Error: %v", err)
+		logx.Errorf("[HTTP] listener error: %v", err)
 	}
 }
 
@@ -349,14 +362,14 @@ func (s *Server) audit(r *http.Request, action, target, detail string) {
 	}
 	detail += "ip=" + clientIP(r)
 	if err := s.store.InsertAuditLog(operatorFrom(r), action, target, detail); err != nil {
-		log.Printf("[AUDIT] insert error: %v", err)
+		logx.Warnf("[AUDIT] insert error: %v", err)
 	}
 }
 
 // auditLogin 登录成败审计（无 JWT，操作者取自请求体）
 func (s *Server) auditLogin(username, action string, r *http.Request) {
 	if err := s.store.InsertAuditLog(username, action, "", "ip="+clientIP(r)); err != nil {
-		log.Printf("[AUDIT] insert error: %v", err)
+		logx.Warnf("[AUDIT] insert error: %v", err)
 	}
 }
 
@@ -408,7 +421,7 @@ func (s *Server) checkExpiredUsers() {
 			continue
 		}
 		if _, active := s.isClientActive(u.Username); active {
-			fmt.Printf("[USER] %s expired, kicking (reason=user_expired)\n", u.Username)
+			logx.Infof("[USER] expired, kicking: user=%s reason=user_expired", u.Username)
 			s.kickClient(u.Username, "user_expired")
 			s.store.InsertAuditLog(u.Username, "user_expired", "", "account expired, active connection kicked")
 		}
@@ -418,7 +431,7 @@ func (s *Server) checkExpiredUsers() {
 func (s *Server) cleanupStaleAllocations() {
 	stale, err := s.store.GetStaleAllocations()
 	if err != nil {
-		log.Printf("[CLEANUP] Error: %v", err)
+		logx.Warnf("[CLEANUP] get stale allocations error: %v", err)
 		return
 	}
 
@@ -426,15 +439,15 @@ func (s *Server) cleanupStaleAllocations() {
 		s.stopPublicListener(alloc.Port)
 		s.flushTraffic(alloc.UserID, alloc.ProxyID)
 		if err := s.store.MarkProxyOffline(alloc.UserID, alloc.ProxyID); err != nil {
-			log.Printf("[CLEANUP] Mark proxy offline error: %v", err)
+			logx.Warnf("[CLEANUP] mark proxy offline error: %v", err)
 		}
 		// 方案B：离线只停公网转发，端口仍预留给该代理；只有代理或用户被删除才放回公共池，
 		// 避免重连前端口被其他用户（如新部署的 web-ui 映射）抢占。
-		fmt.Printf("[CLEANUP] proxy=%s user=%s offline, port %d kept reserved\n", alloc.ProxyID, alloc.UserID, alloc.Port)
+		logx.Infof("[CLEANUP] proxy offline, port kept reserved: proxy=%s user=%s port=%d", alloc.ProxyID, alloc.UserID, alloc.Port)
 	}
 
 	if len(stale) > 0 {
-		fmt.Printf("[CLEANUP] Cleaned up %d stale allocations\n", len(stale))
+		logx.Infof("[CLEANUP] cleaned up %d stale allocations", len(stale))
 	}
 
 	// 代理记录清理每小时执行一次：删除离线超 7 天且未禁用的代理（含会话历史），
@@ -444,21 +457,21 @@ func (s *Server) cleanupStaleAllocations() {
 		s.lastProxyCleanup = time.Now()
 		cutoff := time.Now().Add(-7 * 24 * time.Hour).Unix()
 		if n, err := s.store.CleanupOfflineProxies(cutoff); err != nil {
-			log.Printf("[CLEANUP] Cleanup offline proxies error: %v", err)
+			logx.Warnf("[CLEANUP] cleanup offline proxies error: %v", err)
 		} else if n > 0 {
-			fmt.Printf("[CLEANUP] Removed %d proxies offline over 7 days\n", n)
+			logx.Infof("[CLEANUP] removed %d proxies offline over 7 days", n)
 		}
 		if proxies, err := s.store.ListProxies(); err == nil {
 			for _, p := range proxies {
 				if err := s.store.TrimProxySessions(p.Username, p.ProxyID, 50); err != nil {
-					log.Printf("[CLEANUP] Trim sessions error: %v", err)
+					logx.Warnf("[CLEANUP] trim sessions error: %v", err)
 				}
 			}
 		}
 		if n, err := s.store.CleanupAuditLogs(time.Now().Add(-90 * 24 * time.Hour).Unix()); err != nil {
-			log.Printf("[CLEANUP] Cleanup audit logs error: %v", err)
+			logx.Warnf("[CLEANUP] cleanup audit logs error: %v", err)
 		} else if n > 0 {
-			fmt.Printf("[CLEANUP] Removed %d audit logs over 90 days\n", n)
+			logx.Infof("[CLEANUP] removed %d audit logs over 90 days", n)
 		}
 	}
 }
@@ -481,14 +494,14 @@ func (s *Server) startPublicListener(port int, proxyID, proxyType string, client
 		}
 		pl.UdpConn = pc
 		pl.udpSessions = make(map[string]*udpPMSession)
-		fmt.Printf("[PUBLIC] Listening UDP on :%d for proxy %s\n", port, proxyID)
+		logx.Infof("[PUBLIC] listening udp on :%d for proxy %s", port, proxyID)
 	} else {
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
 			return fmt.Errorf("listen on port %d: %w", port, err)
 		}
 		pl.Ln = ln
-		fmt.Printf("[PUBLIC] Listening on :%d for proxy %s\n", port, proxyID)
+		logx.Infof("[PUBLIC] listening on :%d for proxy %s", port, proxyID)
 	}
 
 	s.publicMu.Lock()
@@ -524,7 +537,7 @@ func (s *Server) stopPublicListener(port int) {
 		pl.udpCloseAllSessions()
 		pl.UdpConn.Close()
 	}
-	fmt.Printf("[PUBLIC] Stopped listening on :%d\n", port)
+	logx.Infof("[PUBLIC] stopped listening on :%d", port)
 }
 
 func (s *Server) acceptPublicConnections(pl *PublicListener) {
@@ -613,7 +626,7 @@ func (s *Server) routeUDPPacket(pl *PublicListener, addr net.Addr, payload []byt
 	if !ok {
 		stream, err := pl.Client.session.Open()
 		if err != nil {
-			log.Printf("[UDP] open stream error: %v", err)
+			logx.Errorf("[UDP] open stream error: %v", err)
 			pl.udpMu.Unlock()
 			return
 		}
@@ -628,7 +641,7 @@ func (s *Server) routeUDPPacket(pl *PublicListener, addr net.Addr, payload []byt
 		copy(header[h+1:], ca)
 		if _, err := stream.Write(header); err != nil {
 			stream.Close()
-			log.Printf("[UDP] write header error: %v", err)
+			logx.Errorf("[UDP] write header error: %v", err)
 			pl.udpMu.Unlock()
 			return
 		}
@@ -672,11 +685,11 @@ func (s *Server) handlePublicConnection(pl *PublicListener, conn net.Conn) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(connIdleTimeout))
 
-	fmt.Printf("[PUBLIC] New connection on :%d from %s\n", pl.Port, conn.RemoteAddr())
+	logx.Debugf("[PUBLIC] new connection on :%d from %s", pl.Port, conn.RemoteAddr())
 
 	stream, err := pl.Client.session.Open()
 	if err != nil {
-		log.Printf("[PUBLIC] Open stream error: %v", err)
+		logx.Errorf("[PUBLIC] open stream error: %v", err)
 		return
 	}
 	defer stream.Close()
@@ -695,7 +708,7 @@ func (s *Server) handlePublicConnection(pl *PublicListener, conn net.Conn) {
 	header[1] = byte(len(pl.ProxyID))
 	copy(header[2:], pl.ProxyID)
 	if _, err := stream.Write(header); err != nil {
-		log.Printf("[PUBLIC] Write header error: %v", err)
+		logx.Errorf("[PUBLIC] write header error: %v", err)
 		return
 	}
 
@@ -749,7 +762,7 @@ func (s *Server) flushTraffic(username, proxyID string) {
 		return
 	}
 	if err := s.store.AddProxyTraffic(username, proxyID, dIn, dOut); err != nil {
-		log.Printf("[TRAFFIC] Flush %s error: %v", key, err)
+		logx.Warnf("[TRAFFIC] flush error: key=%s err=%v", key, err)
 		return
 	}
 	tr.flushedIn.Store(in)
@@ -1070,7 +1083,7 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		s.kickClient(username, "user_config_changed")
 		kicked = true
 	}
-	fmt.Printf("[USER] %s updated (expire=%s maxPorts=%d ranges=%v kicked=%v)\n", username, req.ExpireDate, maxPorts, ranges, kicked)
+	logx.Infof("[USER] updated: user=%s expire=%s maxPorts=%d ranges=%v kicked=%v", username, req.ExpireDate, maxPorts, ranges, kicked)
 	s.audit(r, "user_update", username, fmt.Sprintf("expire=%s maxPorts=%d portRanges=%v kicked=%v", req.ExpireDate, maxPorts, ranges, kicked))
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"kicked":%v}}`, kicked)
 }
@@ -1176,7 +1189,7 @@ func (s *Server) handleUserDisable(w http.ResponseWriter, r *http.Request) {
 	if req.DisconnectNow {
 		s.kickClient(username, "user_disabled")
 	}
-	fmt.Printf("[USER] %s disabled (disconnectNow=%v)\n", username, req.DisconnectNow)
+	logx.Infof("[USER] disabled: user=%s disconnectNow=%v", username, req.DisconnectNow)
 	s.audit(r, "user_disable", username, fmt.Sprintf("disconnectNow=%v", req.DisconnectNow))
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
@@ -1195,7 +1208,7 @@ func (s *Server) handleUserEnable(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"code":2004,"message":"user not found"}`)
 		return
 	}
-	fmt.Printf("[USER] %s enabled\n", username)
+	logx.Infof("[USER] enabled: user=%s", username)
 	s.audit(r, "user_enable", username, "status=1")
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
@@ -1221,7 +1234,7 @@ func (s *Server) handleUserResetCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.kickClient(username, "auth_code_reset")
-	fmt.Printf("[USER] %s auth code reset\n", username)
+	logx.Infof("[USER] auth code reset: user=%s", username)
 	s.audit(r, "user_reset_code", username, "新授权码已下发，旧码吊销，在线 seeinps 已断开等待重新绑定")
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"username":"%s","authCode":"%s"}}`, username, code)
 }
@@ -1580,9 +1593,9 @@ func (s *Server) handleProxyDisable(w http.ResponseWriter, r *http.Request) {
 	}
 	s.flushTraffic(username, proxyID)
 	if err := s.store.MarkProxyOffline(username, proxyID); err != nil {
-		log.Printf("[PROXY] Mark offline error: %v", err)
+		logx.Warnf("[PROXY] mark offline error: %v", err)
 	}
-	fmt.Printf("[PROXY] %s.%s disabled\n", username, proxyID)
+	logx.Infof("[PROXY] disabled: proxy=%s.%s", username, proxyID)
 	s.audit(r, "proxy_disable", username+"."+proxyID, "status=0; 已断开连接，端口保留")
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
@@ -1603,7 +1616,7 @@ func (s *Server) handleProxyEnable(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"code":2004,"message":"proxy not found"}`)
 		return
 	}
-	fmt.Printf("[PROXY] %s.%s enabled\n", username, proxyID)
+	logx.Infof("[PROXY] enabled: proxy=%s.%s", username, proxyID)
 	s.audit(r, "proxy_enable", username+"."+proxyID, "status=1; 等待 seeinps 重试分配端口后自动上线")
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
@@ -1878,14 +1891,14 @@ func (s *Server) handleControlConnection(conn net.Conn) {
 
 	session, err := mux.Server(conn, mux.DefaultConfig())
 	if err != nil {
-		log.Printf("[CTRL] yamux error: %v", err)
+		logx.Warnf("[CTRL] yamux error: %v", err)
 		return
 	}
 	defer session.Close()
 
 	controlStream, err := session.Accept()
 	if err != nil {
-		log.Printf("[CTRL] Accept stream error: %v", err)
+		logx.Warnf("[CTRL] accept stream error: %v", err)
 		return
 	}
 	defer controlStream.Close()
@@ -1894,13 +1907,13 @@ func (s *Server) handleControlConnection(conn net.Conn) {
 
 	helloMsg, err := codec.ReadMessage(controlStream)
 	if err != nil || helloMsg.Type != protocol.TypeHello {
-		log.Printf("[CTRL] Expected HELLO")
+		logx.Warnf("[CTRL] expected HELLO")
 		return
 	}
 	helloDataBytes, _ := json.Marshal(helloMsg.Data)
 	helloData := &protocol.HelloData{}
 	json.Unmarshal(helloDataBytes, helloData)
-	fmt.Printf("[HELLO] %s v%s (%s/%s)\n", conn.RemoteAddr(), helloData.Version, helloData.OS, helloData.Arch)
+	logx.Infof("[CTRL] hello: addr=%s version=%s platform=%s/%s", conn.RemoteAddr(), helloData.Version, helloData.OS, helloData.Arch)
 
 	resp := protocol.NewResponse(helloMsg, protocol.CodeOK, &protocol.HelloRespData{
 		ServerVersion: version.Version,
@@ -1910,16 +1923,16 @@ func (s *Server) handleControlConnection(conn net.Conn) {
 
 	registerMsg, err := codec.ReadMessage(controlStream)
 	if err != nil || registerMsg.Type != protocol.TypeRegister {
-		log.Printf("[CTRL] Expected REGISTER")
+		logx.Warnf("[CTRL] expected REGISTER")
 		return
 	}
 
 	client, err := s.handleRegister(controlStream, registerMsg, session, helloData)
 	if err != nil {
-		log.Printf("[CTRL] Register error: %v", err)
+		logx.Warnf("[CTRL] register error: %v", err)
 		return
 	}
-	fmt.Printf("[+] Client registered: %s (session: %s)\n", client.username, client.sessionID)
+	logx.Infof("[CTRL] client registered: user=%s session=%s", client.username, client.sessionID)
 	// 版本管理：升级后节点重连上报的版本与目标一致时推进升级状态（校验回报可能在重启瞬间丢失）
 	completeUpgradeIfMatches(client.username, client.version)
 	s.handleHeartbeat(controlStream, client)
@@ -1984,7 +1997,7 @@ func (s *Server) handleRegister(stream net.Conn, msg *protocol.Message, session 
 		}
 		// online_session 为残留值（seeinpm 重启后无人清理，或旧连接已死但心跳协程尚未退出）：
 		// 踢掉旧连接并清除状态后放行注册，否则 seeinps 会永远被 1002 拒绝
-		fmt.Printf("[CTRL] Replacing stale session for %s\n", regData.Username)
+		logx.Infof("[CTRL] replacing stale session for %s", regData.Username)
 		if old != nil && old.session != nil {
 			old.session.Close()
 		}
@@ -2094,7 +2107,7 @@ func (s *Server) handleAuditSync(msg *protocol.Message, client *Client) {
 			createdAt = time.Now().Unix()
 		}
 		if err := s.store.InsertAuditLogFromPS(username, it.Action, it.Target, it.Detail, createdAt); err != nil {
-			log.Printf("[AUDIT] ps-sync insert error: %v", err)
+			logx.Warnf("[AUDIT] ps-sync insert error: %v", err)
 		}
 	}
 }
@@ -2139,7 +2152,7 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 
 	// 代理被禁用：拒绝分配（1006），seeinps 转入低速重试，启用后自动恢复
 	if p, err := s.store.GetProxy(client.username, d.ProxyID); err == nil && p.Status != 1 {
-		fmt.Printf("[ALLOC] proxy=%s rejected: disabled (user=%s)\n", d.ProxyID, client.username)
+		logx.Warnf("[ALLOC] rejected, proxy disabled: proxy=%s user=%s", d.ProxyID, client.username)
 		client.writeControl(protocol.NewResponse(msg, protocol.CodeProxyDisabled, nil))
 		return
 	}
@@ -2151,7 +2164,7 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 	}
 	// 用户已过期：拒绝分配并断开（30s 过期定时器也会兜底踢线）
 	if userExpired(user) {
-		fmt.Printf("[ALLOC] proxy=%s rejected: user %s expired\n", d.ProxyID, client.username)
+		logx.Warnf("[ALLOC] rejected, user expired: proxy=%s user=%s", d.ProxyID, client.username)
 		client.writeControl(protocol.NewResponse(msg, protocol.CodeSessionRevoked, map[string]string{"reason": "user_expired"}))
 		return
 	}
@@ -2159,7 +2172,7 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 	if user.MaxPorts > 0 {
 		if _, err := s.store.GetPortByUserProxy(client.username, d.ProxyID); err != nil {
 			if n, err := s.store.CountActiveAllocationsByUser(client.username); err == nil && n >= user.MaxPorts {
-				fmt.Printf("[ALLOC] proxy=%s rejected: port quota %d reached (user=%s)\n", d.ProxyID, user.MaxPorts, client.username)
+				logx.Warnf("[ALLOC] rejected, port quota reached: proxy=%s user=%s quota=%d", d.ProxyID, client.username, user.MaxPorts)
 				client.writeControl(protocol.NewResponse(msg, protocol.CodePortPoolExhausted, map[string]string{"reason": "port_quota"}))
 				return
 			}
@@ -2181,13 +2194,13 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 	}
 	alloc, err := s.portPool.Allocate(client.username, d.ProxyID, d.Type, d.Port, userRanges)
 	if err != nil {
-		log.Printf("[ALLOC] Error: %v", err)
+		logx.Errorf("[ALLOC] allocate error: proxy=%s user=%s err=%v", d.ProxyID, client.username, err)
 		client.writeControl(protocol.NewResponse(msg, protocol.CodePortConflict, nil))
 		return
 	}
 
 	if err := s.startPublicListener(alloc.Port, d.ProxyID, d.Type, client); err != nil {
-		log.Printf("[ALLOC] Start listener error: %v", err)
+		logx.Errorf("[ALLOC] start listener error: port=%d proxy=%s err=%v", alloc.Port, d.ProxyID, err)
 		s.portPool.Release(client.username, d.ProxyID)
 		client.writeControl(protocol.NewResponse(msg, protocol.CodeInternal, nil))
 		return
@@ -2195,13 +2208,13 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 
 	// 代理上线登记：创建/更新代理记录并开启一条会话（重连复用时不重复开会话）
 	if _, err := s.store.MarkProxyOnline(client.username, d.ProxyID, d.Type, client.remoteAddr); err != nil {
-		log.Printf("[ALLOC] Mark proxy online error: %v", err)
+		logx.Warnf("[ALLOC] mark proxy online error: %v", err)
 	}
 	if err := s.store.TrimProxySessions(client.username, d.ProxyID, 50); err != nil {
-		log.Printf("[ALLOC] Trim sessions error: %v", err)
+		logx.Warnf("[ALLOC] trim sessions error: %v", err)
 	}
 
-	fmt.Printf("[ALLOC] proxy=%s type=%s -> port=%d (user=%s)\n", d.ProxyID, d.Type, alloc.Port, client.username)
+	logx.Infof("[ALLOC] allocated: proxy=%s type=%s port=%d user=%s", d.ProxyID, d.Type, alloc.Port, client.username)
 	client.writeControl(protocol.NewResponse(msg, protocol.CodeOK, &protocol.AllocPortRespData{ProxyID: d.ProxyID, Port: alloc.Port}))
 }
 
@@ -2216,9 +2229,9 @@ func (s *Server) handleReleasePort(msg *protocol.Message, client *Client) {
 	s.portPool.Release(client.username, d.ProxyID)
 	s.flushTraffic(client.username, d.ProxyID)
 	if err := s.store.MarkProxyOffline(client.username, d.ProxyID); err != nil {
-		log.Printf("[RELEASE] Mark proxy offline error: %v", err)
+		logx.Warnf("[RELEASE] mark proxy offline error: %v", err)
 	}
-	fmt.Printf("[RELEASE] proxy=%s\n", d.ProxyID)
+	logx.Infof("[RELEASE] released: proxy=%s user=%s", d.ProxyID, client.username)
 	client.writeControl(protocol.NewResponse(msg, protocol.CodeOK, nil))
 }
 
@@ -2237,7 +2250,7 @@ func (s *Server) kickClient(username, reason string) {
 		if c.session != nil {
 			c.session.Close()
 		}
-		fmt.Printf("[USER] Kicked %s (reason=%s)\n", username, reason)
+		logx.Infof("[USER] kicked: user=%s reason=%s", username, reason)
 	} else {
 		// 无活跃连接也要清 DB 残留在线状态，否则重连被 1002 语义误判
 		s.store.ClearUserOnlineStatus(username)
@@ -2250,14 +2263,14 @@ func (s *Server) kickClient(username, reason string) {
 func (s *Server) stopUserForwarding(username string) {
 	allocs, err := s.store.GetAllocationsByUser(username)
 	if err != nil {
-		log.Printf("[USER] Stop forwarding for %s error: %v", username, err)
+		logx.Warnf("[USER] stop forwarding error: user=%s err=%v", username, err)
 		return
 	}
 	for _, a := range allocs {
 		s.stopPublicListener(a.Port)
 		s.flushTraffic(a.UserID, a.ProxyID)
 		if err := s.store.MarkProxyOffline(a.UserID, a.ProxyID); err != nil {
-			log.Printf("[USER] Mark proxy offline error: %v", err)
+			logx.Warnf("[USER] mark proxy offline error: %v", err)
 		}
 	}
 }
@@ -2266,7 +2279,7 @@ func (s *Server) stopUserForwarding(username string) {
 func (s *Server) releaseUserPorts(username string) {
 	allocs, err := s.store.GetAllocationsByUser(username)
 	if err != nil {
-		log.Printf("[USER] Release ports for %s error: %v", username, err)
+		logx.Warnf("[USER] release ports error: user=%s err=%v", username, err)
 		return
 	}
 	for _, a := range allocs {
@@ -2274,7 +2287,7 @@ func (s *Server) releaseUserPorts(username string) {
 		s.portPool.Release(a.UserID, a.ProxyID)
 		s.flushTraffic(a.UserID, a.ProxyID)
 		if err := s.store.MarkProxyOffline(a.UserID, a.ProxyID); err != nil {
-			log.Printf("[USER] Mark proxy offline error: %v", err)
+			logx.Warnf("[USER] mark proxy offline error: %v", err)
 		}
 	}
 }
@@ -2296,20 +2309,20 @@ func (s *Server) removeClientIfCurrent(c *Client) {
 		// seeinps 断开：其全部代理转为离线并关闭会话，流量落库
 		s.flushUserTraffic(c.username)
 		if err := s.store.MarkUserProxiesOffline(c.username); err != nil {
-			log.Printf("[CTRL] Mark user proxies offline error: %v", err)
+			logx.Warnf("[CTRL] mark user proxies offline error: %v", err)
 		}
-		fmt.Printf("[-] Client disconnected: %s\n", c.username)
+		logx.Infof("[CTRL] client disconnected: user=%s", c.username)
 	}
 }
 
 func (s *Server) shutdown() {
-	fmt.Println("[seeinpm] Shutting down...")
+	logx.Infof("[SYS] shutting down")
 
 	s.flushAllTraffic()
 
 	s.publicMu.Lock()
 	for port, pl := range s.publicConns {
-		fmt.Printf("[seeinpm] Stopping listener on :%d\n", port)
+		logx.Infof("[SYS] stopping listener on :%d", port)
 		if pl.Ln != nil {
 			pl.Ln.Close()
 		}
@@ -2320,7 +2333,7 @@ func (s *Server) shutdown() {
 
 	s.clientsMu.RLock()
 	for username, c := range s.clients {
-		fmt.Printf("[seeinpm] Disconnecting client: %s\n", username)
+		logx.Infof("[SYS] disconnecting client: user=%s", username)
 		if c.session != nil {
 			c.session.Close()
 		}
@@ -2335,7 +2348,7 @@ func (s *Server) shutdown() {
 	s.sessions = make(map[string]*Session)
 	s.sessionsMu.Unlock()
 
-	fmt.Println("[seeinpm] Stopped")
+	logx.Infof("[SYS] stopped")
 }
 
 func main() {
@@ -2348,8 +2361,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 运行日志：级别过滤 + 行首时间戳 + 按天/大小轮转（conf [logging] level/max_size/max_backups 生效）
-	logx.Install(cfg.Logging.Path, "seeinpm", cfg.Logging.Level, cfg.Logging.MaxSize, cfg.Logging.MaxBackups)
+	// 运行日志：级别过滤 + 行首时间戳 + 按天/大小轮转（conf [logging] level/max_size/max_backups 生效）。
+	// restore 负责冲刷管道内残留日志到磁盘，退出前必须执行（defer 兜底 + 显式调用）
+	restore := logx.Install(cfg.Logging.Path, "seeinpm", cfg.Logging.Level, cfg.Logging.MaxSize, cfg.Logging.MaxBackups)
+	defer restore()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2358,19 +2373,21 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\nShutting down...")
+		logx.Infof("[SYS] shutdown signal received")
 		cancel()
 	}()
 
 	srv, err := NewServer(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Init error: %v\n", err)
+		logx.Errorf("[SYS] init error: %v", err)
+		restore()
 		os.Exit(1)
 	}
 	srv.configPath = *confPath
 
 	if err := srv.Start(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		logx.Errorf("[SYS] fatal: %v", err)
+		restore()
 		os.Exit(1)
 	}
 }

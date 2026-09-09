@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 大小触发轮转 + 归档命名 + max_backups 清理
@@ -30,7 +31,7 @@ func TestRotateBySize(t *testing.T) {
 	if !fileExists(filepath.Join(dir, "app.log")) {
 		t.Fatal("active file app.log missing")
 	}
-	// 轮转文件形如 app_YYYYMMDD.log / app_YYYYMMDD.1.log ...
+	// 轮转文件形如 app_YYYYMMDD-HHMMSS.log（极端重名时 app_YYYYMMDD-HHMMSS.1.log）
 	var archives []string
 	for _, e := range entries {
 		if strings.HasPrefix(e, "app_") {
@@ -96,32 +97,99 @@ func TestInstallWritesTimestamped(t *testing.T) {
 
 // 级别过滤：info 拦截 [DEBUG]，warn 拦截 [INFO] 但放行无标记行
 func TestLevelFilter(t *testing.T) {
-	cfg := &Config{Level: "info"}
-	if cfg.shouldKeep("[DEBUG] detail\n") {
+	if lineShouldKeep("[DEBUG] detail\n", "info") {
 		t.Fatal("info should drop [DEBUG]")
 	}
-	if !cfg.shouldKeep("[INFO] ok\n") {
+	if !lineShouldKeep("[INFO] ok\n", "info") {
 		t.Fatal("info should keep [INFO]")
 	}
-	if !cfg.shouldKeep("[CTRL] Connecting...\n") {
+	if !lineShouldKeep("[CTRL] Connecting...\n", "info") {
 		t.Fatal("unmarked lines should be kept at info")
 	}
-	cfg = &Config{Level: "warn"}
-	if cfg.shouldKeep("[INFO] ok\n") {
+	if lineShouldKeep("[INFO] ok\n", "warn") {
 		t.Fatal("warn should drop [INFO]")
 	}
-	if !cfg.shouldKeep("[WARN] slow\n") {
+	if !lineShouldKeep("[WARN] slow\n", "warn") {
 		t.Fatal("warn should keep [WARN]")
 	}
-	if !cfg.shouldKeep("[ERROR] boom\n") {
+	if !lineShouldKeep("[ERROR] boom\n", "warn") {
 		t.Fatal("warn should keep [ERROR]")
 	}
-	if !cfg.shouldKeep("[CTRL] Connecting...\n") {
+	if !lineShouldKeep("[CTRL] Connecting...\n", "warn") {
 		t.Fatal("unmarked lines should be kept at warn")
 	}
-	cfg = &Config{Level: "debug"}
-	if !cfg.shouldKeep("[DEBUG] detail\n") {
+	if !lineShouldKeep("[DEBUG] detail\n", "debug") {
 		t.Fatal("debug should keep [DEBUG]")
+	}
+}
+
+// 分级便捷函数输出 "[LEVEL] msg" 行：带级别标记可被过滤，且行首时间戳精确到毫秒
+func TestLeveledFormatAndFilter(t *testing.T) {
+	dir := t.TempDir()
+	restore := Install(dir, "app", "info", 0, 0)
+	Infof("[CTRL] listening on :99")
+	Warnf("[ALLOC] quota reached")
+	SetLevel("error")
+	Infof("[CTRL] should be dropped")
+	Errorf("[DATA] dial fail")
+	SetLevel("info")
+	restore()
+
+	b, err := os.ReadFile(filepath.Join(dir, "app.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if !strings.Contains(s, "[INFO] [CTRL] listening on :99") {
+		t.Fatalf("info line missing: %q", s)
+	}
+	if !strings.Contains(s, "[WARN] [ALLOC] quota reached") {
+		t.Fatalf("warn line missing: %q", s)
+	}
+	if strings.Contains(s, "should be dropped") {
+		t.Fatalf("level=error must drop [INFO] lines: %q", s)
+	}
+	if !strings.Contains(s, "[ERROR] [DATA] dial fail") {
+		t.Fatalf("error line missing: %q", s)
+	}
+	// 时间戳前缀：2006-01-02 15:04:05.000
+	line := s[:strings.IndexByte(s, '\n')]
+	if len(line) < 23 || line[4] != '-' || line[10] != ' ' || line[19] != '.' {
+		t.Fatalf("expected millisecond timestamp prefix, got line: %q", line)
+	}
+}
+
+// 跨天轮转：归档文件名使用内容所属日（末次写入时刻），而不是轮转发生的新日期
+func TestDayCrossingArchiveName(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewRotateWriter(Config{Dir: dir, Name: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	w.Write([]byte("yesterday content\n"))
+	// 模拟跨天：内容属于 2026-01-01，轮转发生在之后的某一天
+	w.mu.Lock()
+	w.day = "20260101"
+	w.lastWrite = time.Date(2026, 1, 1, 23, 59, 58, 0, time.Local)
+	w.mu.Unlock()
+	w.Write([]byte("today content\n"))
+
+	var archive string
+	for _, e := range listLogs(dir) {
+		if strings.HasPrefix(e, "app_") {
+			archive = e
+		}
+	}
+	if archive == "" {
+		t.Fatal("expected an archive file")
+	}
+	if !strings.HasPrefix(archive, "app_20260101-") {
+		t.Fatalf("archive must use content's own date 20260101, got %s", archive)
+	}
+	if !strings.Contains(archive, "-235958") {
+		t.Fatalf("archive must use last-write time 235958, got %s", archive)
 	}
 }
 

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"time"
+
+	"github.com/seeinp/seeinp/internal/logx"
 )
 
 // checkDiskSpace 检查工作目录所在文件系统的剩余空间
@@ -39,6 +42,7 @@ func applyAndRestart(exePath, tmpPath string) error {
 	if err := os.Chmod(exePath, 0755); err != nil {
 		return fmt.Errorf("chmod: %w", err)
 	}
-	fmt.Printf("[UPGRADE] exec new binary %s\n", exePath)
+	logx.Infof("[UPGRADE] exec new binary: %s", exePath)
+	time.Sleep(200 * time.Millisecond) // 等该行日志经管道落盘，exec 后进程映像即被替换
 	return syscall.Exec(exePath, os.Args, os.Environ())
 }
