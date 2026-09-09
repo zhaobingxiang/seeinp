@@ -20,6 +20,12 @@ const routes = [
     meta: { requiresAuth: true, title: '用户管理' }
   },
   {
+    path: '/pm/user-groups',
+    name: 'UserGroups',
+    component: () => import('@/views/UserGroups.vue'),
+    meta: { requiresAuth: true, title: '分组管理' }
+  },
+  {
     path: '/pm/proxies',
     name: 'Proxies',
     component: () => import('@/views/Proxies.vue'),

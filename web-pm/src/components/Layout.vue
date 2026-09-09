@@ -8,6 +8,7 @@
       <el-menu :default-active="route.path" router class="side-menu">
         <el-menu-item index="/pm/dashboard"><el-icon><DataBoard /></el-icon><span>仪表盘</span></el-menu-item>
         <el-menu-item index="/pm/users"><el-icon><User /></el-icon><span>用户管理</span></el-menu-item>
+        <el-menu-item index="/pm/user-groups"><el-icon><FolderOpened /></el-icon><span>分组管理</span></el-menu-item>
         <el-menu-item index="/pm/proxies"><el-icon><Share /></el-icon><span>代理管理</span></el-menu-item>
         <el-menu-item index="/pm/ports"><el-icon><Connection /></el-icon><span>端口池</span></el-menu-item>
         <el-menu-item index="/pm/versions"><el-icon><Box /></el-icon><span>版本管理</span></el-menu-item>
@@ -37,7 +38,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from "vue"
 import { useRoute, useRouter } from "vue-router"
-import { DataBoard, User, Share, Connection, Box, Tickets, Document, SwitchButton } from "@element-plus/icons-vue"
+import { DataBoard, User, FolderOpened, Share, Connection, Box, Tickets, Document, SwitchButton } from "@element-plus/icons-vue"
 import { healthApi } from "@/api"
 const route = useRoute()
 const router = useRouter()

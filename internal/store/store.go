@@ -100,7 +100,46 @@ func (s *Store) migrate() error {
 			}
 		}
 	}
+
+	// v5: 用户分组——user_groups 树表（根分组唯一、同级内名称唯一）+ users.group_id。
+	// 老库回填：确保根分组「默认分组」存在后，把尚未归组的用户全部挂到根分组下。
+	if _, err := s.db.Exec("CREATE TABLE IF NOT EXISTS user_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL, is_root INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"); err != nil {
+		return fmt.Errorf("migrate user_groups: %w", err)
+	}
+	if _, err := s.db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_user_groups_parent_name ON user_groups(parent_id, name)"); err != nil {
+		return fmt.Errorf("migrate user_groups index: %w", err)
+	}
+	if _, err := s.db.Exec("ALTER TABLE users ADD COLUMN group_id INTEGER NOT NULL DEFAULT 0"); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate users.group_id: %w", err)
+		}
+	}
+	rootID, err := s.ensureRootGroup()
+	if err != nil {
+		return fmt.Errorf("ensure root group: %w", err)
+	}
+	if _, err := s.db.Exec("UPDATE users SET group_id = ? WHERE group_id = 0", rootID); err != nil {
+		return fmt.Errorf("backfill users.group_id: %w", err)
+	}
 	return nil
+}
+
+// ensureRootGroup 返回根分组 id，不存在则创建「默认分组」（幂等，供 migrate 与运行期默认归组共用）
+func (s *Store) ensureRootGroup() (int64, error) {
+	var id int64
+	err := s.db.QueryRow("SELECT id FROM user_groups WHERE is_root = 1 ORDER BY id LIMIT 1").Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return 0, err
+	}
+	now := time.Now().Unix()
+	res, err := s.db.Exec("INSERT INTO user_groups (parent_id, name, is_root, created_at, updated_at) VALUES (0, '默认分组', 1, ?, ?)", now, now)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
 type AdminUser struct {
@@ -144,19 +183,20 @@ type User struct {
 	ExpiresAt     int64 // 有效期截止时间（unix 秒；0=不过期），到期断开并拒绝注册
 	MaxPorts      int   // 端口数量配额（0=不限）
 	PortRanges    []PortRange
+	GroupID       int64 // 所属用户分组（user_groups.id，恒 >0：未显式指定时归根分组）
 	CreatedAt     int64
 	UpdatedAt     int64
 }
 
-func (s *Store) CreateUser(username, authCodeHash, authCodeSalt string, expiresAt int64, maxPorts int, portRanges []PortRange) error {
+func (s *Store) CreateUser(username, authCodeHash, authCodeSalt string, expiresAt int64, maxPorts int, portRanges []PortRange, groupID int64) error {
 	now := time.Now().Unix()
 	rj := "[]"
 	if len(portRanges) > 0 {
 		b, _ := json.Marshal(portRanges)
 		rj = string(b)
 	}
-	_, err := s.db.Exec("INSERT INTO users (username, auth_code, auth_code_salt, status, expires_at, max_ports, port_ranges, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)",
-		username, authCodeHash, authCodeSalt, expiresAt, maxPorts, rj, now, now)
+	_, err := s.db.Exec("INSERT INTO users (username, auth_code, auth_code_salt, status, expires_at, max_ports, port_ranges, group_id, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+		username, authCodeHash, authCodeSalt, expiresAt, maxPorts, rj, groupID, now, now)
 	return err
 }
 
@@ -191,8 +231,8 @@ func (s *Store) GetUserByUsername(username string) (*User, error) {
 	var onlineSession sql.NullString
 	var onlineSince sql.NullInt64
 	var portRanges string
-	err := s.db.QueryRow("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), created_at, updated_at FROM users WHERE username = ?", username).
-		Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.CreatedAt, &u.UpdatedAt)
+	err := s.db.QueryRow("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), COALESCE(group_id,0), created_at, updated_at FROM users WHERE username = ?", username).
+		Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.GroupID, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +248,7 @@ func (s *Store) GetUserByUsername(username string) (*User, error) {
 }
 
 func (s *Store) ListUsers() ([]*User, error) {
-	rows, err := s.db.Query("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), created_at, updated_at FROM users ORDER BY created_at DESC")
+	rows, err := s.db.Query("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), COALESCE(group_id,0), created_at, updated_at FROM users ORDER BY created_at DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +259,7 @@ func (s *Store) ListUsers() ([]*User, error) {
 		var onlineSession sql.NullString
 		var onlineSince sql.NullInt64
 		var portRanges string
-		if err := rows.Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.GroupID, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if onlineSession.Valid {

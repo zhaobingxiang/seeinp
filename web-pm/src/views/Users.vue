@@ -3,9 +3,35 @@
     <div class="page-card">
       <div class="card-header" style="padding:16px 20px;border-bottom:1px solid var(--app-border-light)">
         <span>seeinps 用户列表</span>
-        <el-button type="primary" @click="openCreate">创建用户</el-button>
+        <span class="header-actions">
+          <el-button v-if="selectedUsers.length" type="primary" plain @click="openBatchMove">批量修改分组（{{ selectedUsers.length }}）</el-button>
+          <el-button type="primary" @click="openCreate">创建用户</el-button>
+        </span>
       </div>
-      <div style="padding:12px 20px 20px">
+      <div class="users-layout">
+        <aside class="group-side">
+          <div class="group-side-head">
+            <span class="group-side-title">分组筛选</span>
+            <el-checkbox v-model="includeSub" size="small" @change="onFilterChange">包含下级</el-checkbox>
+          </div>
+          <el-tree
+            :data="sideTreeData"
+            node-key="id"
+            :props="{ label: 'name', children: 'children' }"
+            default-expand-all
+            highlight-current
+            :expand-on-click-node="false"
+            @node-click="onGroupNodeClick"
+          >
+            <template #default="{ data }">
+              <span class="side-node">
+                <span>{{ data.name }}</span>
+                <span v-if="data.id !== 0" class="side-node-count">{{ data.userCount }}</span>
+              </span>
+            </template>
+          </el-tree>
+        </aside>
+        <div class="user-main" style="padding:12px 20px 20px">
         <div class="filter-bar">
           <el-input v-model="filters.username" placeholder="用户名" clearable style="width:150px" @input="onFilterChange" />
           <el-select v-model="filters.status" placeholder="账号状态" clearable style="width:110px" @change="onFilterChange">
@@ -23,10 +49,16 @@
           </el-select>
           <el-input v-model="filters.port" placeholder="端口(匹配用户端口池)" clearable style="width:180px" @input="onFilterChange" />
         </div>
-        <el-table :data="pageUsers" v-loading="loading" @sort-change="onSortChange">
+        <el-table ref="tableRef" :data="pageUsers" v-loading="loading" @sort-change="onSortChange" @selection-change="(rows: any[]) => selectedUsers = rows">
+          <el-table-column type="selection" width="42" />
           <el-table-column prop="id" label="ID" width="60" />
           <el-table-column prop="username" label="用户名" min-width="110" sortable="custom" />
           <el-table-column prop="remark" label="备注" min-width="110" />
+          <el-table-column label="所属分组" min-width="100">
+            <template #default="{row}">
+              <el-tag size="small" type="info" effect="plain">{{ groupNameMap[row.groupId] || '-' }}</el-tag>
+            </template>
+          </el-table-column>
           <el-table-column prop="status" label="账号" width="80" sortable="custom"><template #default="{row}"><el-tag :type="row.status === 1 ? 'success' : 'danger'" size="small">{{ row.status === 1 ? '启用' : '禁用' }}</el-tag></template></el-table-column>
           <el-table-column prop="online" label="在线" width="80" sortable="custom"><template #default="{row}"><el-tag :type="row.online ? 'success' : 'info'" size="small">{{ row.online ? '在线' : '离线' }}</el-tag></template></el-table-column>
           <el-table-column prop="expireDate" label="有效期" width="150" sortable="custom">
@@ -65,6 +97,7 @@
         </el-table>
         <el-empty v-if="pageUsers.length === 0" :description="users.length && !filteredUsers.length ? '无匹配的用户' : '暂无用户'" />
         <PaginationBar v-if="sortedUsers.length > 0" v-model:page="page" v-model:pageSize="pageSize" :total="sortedUsers.length" />
+        </div>
       </div>
     </div>
 
@@ -72,6 +105,10 @@
       <el-form :model="form" :rules="rules" ref="formRef" label-width="90px">
         <el-form-item label="用户名" prop="username"><el-input v-model="form.username" :disabled="!!editing" placeholder="至少 3 个字符" /></el-form-item>
         <el-form-item label="备注"><el-input v-model="form.remark" /></el-form-item>
+        <el-form-item label="所属分组">
+          <el-tree-select v-model="form.groupId" :data="groupSelectData" check-strictly :render-after-expand="false" default-expand-all placeholder="选择分组" style="width:100%" />
+          <div class="form-tip">用户归属的分组（可在“分组管理”维护）；新建默认归入根分组</div>
+        </el-form-item>
         <el-form-item label="有效期">
           <el-date-picker v-model="form.expireDate" type="date" value-format="YYYY-MM-DD" placeholder="选择日期（留空为永久有效）" style="width:100%" clearable />
           <div class="form-tip">到期后该用户的 seeinps 连接与全部代理将被断开；改回今天或以后，seeinps 自动重连恢复</div>
@@ -105,15 +142,24 @@
       <el-alert v-else type="warning" :closable="false" style="margin-top:16px">请妥善保存此认证码，关闭后将不再显示！</el-alert>
       <template #footer><el-button type="primary" @click="showAuthCode = false">确定</el-button></template>
     </el-dialog>
+    <el-dialog v-model="showBatchMove" title="批量修改分组" width="440px" :close-on-click-modal="false">
+      <div style="margin-bottom:12px">已将 {{ selectedUsers.length }} 个用户移动到：</div>
+      <el-tree-select v-model="batchGroupId" :data="groupSelectData" check-strictly :render-after-expand="false" default-expand-all placeholder="选择目标分组" style="width:100%" />
+      <template #footer>
+        <el-button :disabled="batchSaving" @click="showBatchMove = false">取消</el-button>
+        <el-button type="primary" :loading="batchSaving" @click="handleBatchMove">确定</el-button>
+      </template>
+    </el-dialog>
   </Layout>
 </template>
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from "vue"
 import { ElMessage, ElMessageBox } from "element-plus"
 import type { FormInstance, FormRules } from "element-plus"
-import { userApi, portApi } from "@/api"
+import { userApi, portApi, userGroupApi } from "@/api"
 import Layout from "@/components/Layout.vue"
 import PaginationBar from "@/components/PaginationBar.vue"
+import { buildGroupTree, collectDescendantIds, toTreeSelectData, type UserGroupNode } from "@/utils/userGroups"
 
 const users = ref<any[]>([])
 const loading = ref(true)
@@ -126,6 +172,63 @@ const createdAuthCode = ref("")
 const authCodeInputRef = ref()
 const formRef = ref<FormInstance>()
 const globalRanges = ref<any[]>([])
+
+// ===== 用户分组 =====
+const groupTree = ref<UserGroupNode[]>([])
+const includeSub = ref(false)
+const groupFilter = ref(0) // 0=全部用户（侧树顶级节点）
+const tableRef = ref()
+const selectedUsers = ref<any[]>([])
+const showBatchMove = ref(false)
+const batchGroupId = ref(0)
+const batchSaving = ref(false)
+
+// 侧栏树：顶级“全部用户”节点 + 分组树
+const sideTreeData = computed(() => [{ id: 0, name: "全部用户", userCount: users.value.length, children: groupTree.value } as any])
+// el-tree-select 数据源（分组树，可任意层级选择）
+const groupSelectData = computed(() => toTreeSelectData(groupTree.value))
+// id → 分组名映射（表格“所属分组”列展示）
+const groupNameMap = computed(() => {
+  const m: Record<number, string> = {}
+  const walk = (nodes: UserGroupNode[]) => nodes.forEach((n) => { m[n.id] = n.name; walk(n.children) })
+  walk(groupTree.value)
+  return m
+})
+const rootGroupId = computed(() => groupTree.value.find((n) => n.isRoot)?.id || 0)
+
+const loadGroups = async () => {
+  try {
+    const res: any = await userGroupApi.list()
+    if (res.code === 0) groupTree.value = buildGroupTree(res.data || [])
+  } catch (e) { console.error(e) }
+}
+const onGroupNodeClick = (data: any) => {
+  groupFilter.value = data.id ?? 0
+  page.value = 1
+}
+const openBatchMove = () => {
+  if (!selectedUsers.value.length) { ElMessage.warning("请先勾选用户"); return }
+  batchGroupId.value = 0
+  showBatchMove.value = true
+}
+const handleBatchMove = async () => {
+  if (!batchGroupId.value) { ElMessage.warning("请选择目标分组"); return }
+  batchSaving.value = true
+  try {
+    const names = selectedUsers.value.map((u: any) => u.username)
+    const res: any = await userApi.batchMoveGroup(names, batchGroupId.value)
+    if (res.code === 0) {
+      ElMessage.success(`已移动 ${res.data?.moved ?? names.length} 个用户`)
+      showBatchMove.value = false
+      tableRef.value?.clearSelection()
+      loadUsers(); loadGroups()
+    } else ElMessage.error(res.message || "操作失败")
+  } catch (e: any) {
+    ElMessage.error(e.response?.data?.message || "操作失败")
+  } finally {
+    batchSaving.value = false
+  }
+}
 
 // ===== 分页 / 筛选 / 排序 =====
 const filters = reactive({ username: "", status: "", online: "", expire: "", port: "" })
@@ -154,6 +257,12 @@ const filteredUsers = computed(() => {
   if (!isNaN(port)) {
     // 端口筛选：仅匹配有固定用户端口池且包含该端口的用户（不含「不限」）
     arr = arr.filter((u: any) => (u.portRanges || []).some((r: any) => r.start <= port && port <= r.end))
+  }
+  if (groupFilter.value > 0) {
+    const allowed = includeSub.value
+      ? collectDescendantIds(groupTree.value, groupFilter.value)
+      : new Set<number>([groupFilter.value])
+    arr = arr.filter((u: any) => allowed.has(u.groupId))
   }
   return arr
 })
@@ -184,7 +293,7 @@ const sortedUsers = computed(() => {
 const pageUsers = computed(() => sortedUsers.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
 
 const form = reactive({
-  username: "", remark: "", expireDate: "", maxPorts: 0,
+  username: "", remark: "", expireDate: "", maxPorts: 0, groupId: 0,
   portRanges: [] as { start: number; end: number }[]
 })
 
@@ -213,7 +322,7 @@ const loadGlobalRanges = async () => { try { const res: any = await portApi.getP
 
 const openCreate = () => {
   editing.value = null
-  Object.assign(form, { username: "", remark: "", expireDate: "", maxPorts: 0, portRanges: [] })
+  Object.assign(form, { username: "", remark: "", expireDate: "", maxPorts: 0, groupId: rootGroupId.value, portRanges: [] })
   showEdit.value = true
 }
 const openEdit = (row: any) => {
@@ -221,6 +330,7 @@ const openEdit = (row: any) => {
   Object.assign(form, {
     username: row.username, remark: row.remark || "",
     expireDate: row.expireDate || "", maxPorts: row.maxPorts || 0,
+    groupId: row.groupId || rootGroupId.value,
     portRanges: (row.portRanges || []).map((r: any) => ({ start: r.start, end: r.end }))
   })
   showEdit.value = true
@@ -235,27 +345,27 @@ const handleSave = async () => {
     try {
       if (editing.value) {
         const res: any = await userApi.update(editing.value.username, {
-          expireDate: form.expireDate || "", maxPorts: form.maxPorts, portRanges: form.portRanges
+          expireDate: form.expireDate || "", maxPorts: form.maxPorts, portRanges: form.portRanges, groupId: form.groupId
         })
         if (res.code === 0) {
           ElMessage.success(res.data?.kicked ? "已保存，配置收紧已断开该用户连接，将按新配置自动恢复" : "保存成功")
           showEdit.value = false
-          loadUsers()
+          loadUsers(); loadGroups()
         } else ElMessage.error(res.message || "操作失败")
       } else {
         const res: any = await userApi.create({
           username: form.username, remark: form.remark,
-          expireDate: form.expireDate || "", maxPorts: form.maxPorts, portRanges: form.portRanges
+          expireDate: form.expireDate || "", maxPorts: form.maxPorts, portRanges: form.portRanges, groupId: form.groupId
         })
         if (res.code === 0) {
-          createdAuthCode.value = res.data.authCode; authCodeIsNew.value = false; showEdit.value = false; showAuthCode.value = true; loadUsers(); ElMessage.success("创建成功")
+          createdAuthCode.value = res.data.authCode; authCodeIsNew.value = false; showEdit.value = false; showAuthCode.value = true; loadUsers(); loadGroups(); ElMessage.success("创建成功")
         } else ElMessage.error(res.message || "操作失败")
       }
     } catch (e: any) { ElMessage.error(e.response?.data?.message || "操作失败") } finally { saving.value = false }
   })
 }
 
-const deleteUser = async (username: string) => { try { await ElMessageBox.confirm("确定删除用户 " + username + " 吗？", "确认", { type: "warning" }); const res: any = await userApi.delete(username); if (res.code === 0) { ElMessage.success("已删除"); loadUsers() } else ElMessage.error(res.message || "操作失败") } catch (e) { if (e !== "cancel") ElMessage.error("操作失败") } }
+const deleteUser = async (username: string) => { try { await ElMessageBox.confirm("确定删除用户 " + username + " 吗？", "确认", { type: "warning" }); const res: any = await userApi.delete(username); if (res.code === 0) { ElMessage.success("已删除"); loadUsers(); loadGroups() } else ElMessage.error(res.message || "操作失败") } catch (e) { if (e !== "cancel") ElMessage.error("操作失败") } }
 const disableUser = (row: any) => {
   if (row.online) {
     ElMessageBox.confirm(`禁用用户 ${row.username}，是否同时断开其已建立的全部连接？`, "禁用用户", {
@@ -304,9 +414,59 @@ const copyAuthCode = async () => {
     ElMessage.warning("自动复制未成功，授权码已全选，请按 Ctrl+C 手动复制")
   }
 }
-onMounted(() => { loadUsers(); loadGlobalRanges() })
+onMounted(() => { loadUsers(); loadGlobalRanges(); loadGroups() })
 </script>
 <style scoped>
+.header-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.users-layout {
+  display: flex;
+  align-items: stretch;
+}
+
+.group-side {
+  flex: 0 0 230px;
+  border-right: 1px solid var(--app-border-light);
+  padding: 12px 8px 20px 16px;
+  overflow: auto;
+  max-height: calc(100vh - 200px);
+}
+
+.group-side-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  padding-right: 8px;
+}
+
+.group-side-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.side-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding-right: 4px;
+}
+
+.side-node-count {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--app-text-tertiary);
+}
+
+.user-main {
+  flex: 1;
+  min-width: 0;
+}
+
 .filter-bar {
   display: flex;
   align-items: center;

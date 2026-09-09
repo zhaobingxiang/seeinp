@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hashicorp/yamux"
 	"github.com/seeinp/seeinp/internal/auth"
@@ -261,9 +263,14 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("/api/v1/auth/refresh", s.handleAuthRefresh)
 	mux.HandleFunc("/api/v1/users", s.authMiddleware(s.handleUsers))
 	mux.HandleFunc("PUT /api/v1/users/{username}", s.authMiddleware(s.handleUpdateUser))
+	mux.HandleFunc("POST /api/v1/users/batch-move-group", s.authMiddleware(s.handleUsersBatchMoveGroup))
 	mux.HandleFunc("POST /api/v1/users/{username}/disable", s.authMiddleware(s.handleUserDisable))
 	mux.HandleFunc("POST /api/v1/users/{username}/enable", s.authMiddleware(s.handleUserEnable))
 	mux.HandleFunc("POST /api/v1/users/{username}/reset-code", s.authMiddleware(s.handleUserResetCode))
+	// 用户分组（树状，根分组不可删可改名，最多 5 层）
+	mux.HandleFunc("/api/v1/user-groups", s.authMiddleware(s.handleUserGroups))
+	mux.HandleFunc("PUT /api/v1/user-groups/{id}", s.authMiddleware(s.handleUserGroupRename))
+	mux.HandleFunc("DELETE /api/v1/user-groups/{id}", s.authMiddleware(s.handleUserGroupDelete))
 	mux.HandleFunc("/api/v1/clients", s.authMiddleware(s.handleClientsAPI))
 	mux.HandleFunc("POST /api/v1/clients/{username}/upgrade", s.authMiddleware(s.handleClientUpgrade))
 	mux.HandleFunc("GET /api/v1/clients/{username}/upgrade-status", s.authMiddleware(s.handleUpgradeStatus))
@@ -992,13 +999,14 @@ func (s *Server) handleListUsers(w http.ResponseWriter) {
 		MaxPorts   int               `json:"maxPorts"`
 		PortRanges []store.PortRange `json:"portRanges"`
 		UsedPorts  int               `json:"usedPorts"`
+		GroupID    int64             `json:"groupId"`
 	}
 	list := make([]userResp, 0, len(users))
 	for _, u := range users {
 		_, active := s.isClientActive(u.Username)
 		used, _ := s.store.CountActiveAllocationsByUser(u.Username)
 		item := userResp{ID: u.ID, Username: u.Username, Remark: u.Remark, Status: u.Status, Online: active,
-			MaxPorts: u.MaxPorts, PortRanges: u.PortRanges, UsedPorts: used}
+			MaxPorts: u.MaxPorts, PortRanges: u.PortRanges, UsedPorts: used, GroupID: u.GroupID}
 		if u.ExpiresAt > 0 {
 			item.ExpireDate = time.Unix(u.ExpiresAt, 0).Format("2006-01-02")
 			item.Expired = userExpired(u)
@@ -1016,6 +1024,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		ExpireDate string            `json:"expireDate"`
 		MaxPorts   int               `json:"maxPorts"`
 		PortRanges []store.PortRange `json:"portRanges"`
+		GroupID    int64             `json:"groupId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1033,23 +1042,37 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
 		return
 	}
+	// 分组：未指定时归根分组；指定了必须存在
+	groupID := req.GroupID
+	if groupID == 0 {
+		if groupID, err = s.store.RootGroupID(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"code":5000,"message":"resolve root group failed"}`)
+			return
+		}
+	} else if _, err := s.store.GetUserGroup(groupID); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":"分组不存在"}`)
+		return
+	}
 	code, salt, _ := auth.GenerateAuthCode()
 	authCodeHash := auth.HashAuthCode(code, salt)
-	if err := s.store.CreateUser(req.Username, authCodeHash, salt, expiresAt, maxPorts, ranges); err != nil {
+	if err := s.store.CreateUser(req.Username, authCodeHash, salt, expiresAt, maxPorts, ranges, groupID); err != nil {
 		w.WriteHeader(http.StatusConflict)
 		fmt.Fprintf(w, `{"code":3001,"message":"username already exists"}`)
 		return
 	}
-	s.audit(r, "user_create", req.Username, fmt.Sprintf("remark=%s expire=%s maxPorts=%d portRanges=%v", req.Remark, req.ExpireDate, maxPorts, ranges))
+	s.audit(r, "user_create", req.Username, fmt.Sprintf("remark=%s expire=%s maxPorts=%d portRanges=%v group=%d", req.Remark, req.ExpireDate, maxPorts, ranges, groupID))
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"username":"%s","authCode":"%s","remark":"%s"}}`, req.Username, code, req.Remark)
 }
 
-// handleUpdateUser PUT /api/v1/users/{username}：修改有效期/端口数量/用户端口池。
+// handleUpdateUser PUT /api/v1/users/{username}：修改有效期/端口数量/用户端口池/所属分组（groupId=0 表示不改分组）。
 // 配置收紧导致现有分配违规（池外或超配额）时踢线重连，seeinps 30s 内按新约束重新分配端口。
 func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	username := r.PathValue("username")
-	if _, err := s.store.GetUserByUsername(username); err != nil {
+	user, err := s.store.GetUserByUsername(username)
+	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		fmt.Fprintf(w, `{"code":2004,"message":"user not found"}`)
 		return
@@ -1058,6 +1081,7 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		ExpireDate string            `json:"expireDate"`
 		MaxPorts   int               `json:"maxPorts"`
 		PortRanges []store.PortRange `json:"portRanges"`
+		GroupID    int64             `json:"groupId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1069,6 +1093,20 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
 		return
+	}
+	groupChanged := false
+	if req.GroupID != 0 && req.GroupID != user.GroupID {
+		if _, err := s.store.GetUserGroup(req.GroupID); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"code":2002,"message":"分组不存在"}`)
+			return
+		}
+		if _, err := s.store.SetUsersGroup([]string{username}, req.GroupID); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"code":5000,"message":"update group failed"}`)
+			return
+		}
+		groupChanged = true
 	}
 	if err := s.store.UpdateUserLimits(username, expiresAt, maxPorts, ranges); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -1083,9 +1121,178 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		s.kickClient(username, "user_config_changed")
 		kicked = true
 	}
-	logx.Infof("[USER] updated: user=%s expire=%s maxPorts=%d ranges=%v kicked=%v", username, req.ExpireDate, maxPorts, ranges, kicked)
-	s.audit(r, "user_update", username, fmt.Sprintf("expire=%s maxPorts=%d portRanges=%v kicked=%v", req.ExpireDate, maxPorts, ranges, kicked))
+	logx.Infof("[USER] updated: user=%s expire=%s maxPorts=%d ranges=%v group=%d kicked=%v", username, req.ExpireDate, maxPorts, ranges, req.GroupID, kicked)
+	s.audit(r, "user_update", username, fmt.Sprintf("expire=%s maxPorts=%d portRanges=%v group=%d groupChanged=%v kicked=%v", req.ExpireDate, maxPorts, ranges, req.GroupID, groupChanged, kicked))
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"kicked":%v}}`, kicked)
+}
+
+// validateGroupName 分组名校验：去首尾空白后非空且不超过 30 个字符；返回归一化后的名称
+func validateGroupName(raw string) (string, string) {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return "", "分组名称不能为空"
+	}
+	if utf8.RuneCountInString(name) > 30 {
+		return "", "分组名称不能超过 30 个字符"
+	}
+	return name, ""
+}
+
+// handleUserGroups /api/v1/user-groups：GET 返回全部分组（平铺+直属人数/子组数），POST 在 parentId 下新建分组（parentId=0 归根分组）
+func (s *Server) handleUserGroups(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch r.Method {
+	case "GET":
+		groups, err := s.store.ListUserGroups()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		type groupResp struct {
+			ID         int64  `json:"id"`
+			ParentID   int64  `json:"parentId"`
+			Name       string `json:"name"`
+			IsRoot     bool   `json:"isRoot"`
+			UserCount  int    `json:"userCount"`
+			ChildCount int    `json:"childCount"`
+		}
+		list := make([]groupResp, 0, len(groups))
+		for _, g := range groups {
+			list = append(list, groupResp{ID: g.ID, ParentID: g.ParentID, Name: g.Name, IsRoot: g.IsRoot, UserCount: g.UserCount, ChildCount: g.ChildCount})
+		}
+		data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": list})
+		w.Write(data)
+	case "POST":
+		var req struct {
+			ParentID int64  `json:"parentId"`
+			Name     string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"code":2001,"message":"invalid request"}`)
+			return
+		}
+		name, msg := validateGroupName(req.Name)
+		if msg != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"code":2002,"message":%q}`, msg)
+			return
+		}
+		parentID := req.ParentID
+		if parentID == 0 {
+			rid, rerr := s.store.RootGroupID()
+			if rerr != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, `{"code":5000,"message":"resolve root group failed"}`)
+				return
+			}
+			parentID = rid
+		}
+		g, err := s.store.CreateUserGroup(parentID, name)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
+			return
+		}
+		s.audit(r, "user_group_create", g.Name, fmt.Sprintf("groupId=%d parentId=%d", g.ID, parentID))
+		data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": map[string]interface{}{"id": g.ID, "parentId": g.ParentID, "name": g.Name, "isRoot": false}})
+		w.Write(data)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// handleUserGroupRename PUT /api/v1/user-groups/{id}：重命名分组（根分组也可改名）
+func (s *Server) handleUserGroupRename(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":"invalid group id"}`)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2001,"message":"invalid request"}`)
+		return
+	}
+	name, msg := validateGroupName(req.Name)
+	if msg != "" {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":%q}`, msg)
+		return
+	}
+	g, err := s.store.GetUserGroup(id)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `{"code":2004,"message":"分组不存在"}`)
+		return
+	}
+	if err := s.store.RenameUserGroup(id, name); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
+		return
+	}
+	s.audit(r, "user_group_rename", g.Name, fmt.Sprintf("groupId=%d to=%s", id, name))
+	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
+}
+
+// handleUserGroupDelete DELETE /api/v1/user-groups/{id}：删除分组；根分组与仍有子分组/用户的分组禁止删除
+func (s *Server) handleUserGroupDelete(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":"invalid group id"}`)
+		return
+	}
+	g, err := s.store.GetUserGroup(id)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `{"code":2004,"message":"分组不存在"}`)
+		return
+	}
+	if err := s.store.DeleteUserGroup(id); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, store.ErrRootGroupUndeletable) {
+			status = http.StatusForbidden
+		}
+		w.WriteHeader(status)
+		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
+		return
+	}
+	s.audit(r, "user_group_delete", g.Name, fmt.Sprintf("groupId=%d", id))
+	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
+}
+
+// handleUsersBatchMoveGroup POST /api/v1/users/batch-move-group：批量把用户移动到指定分组
+func (s *Server) handleUsersBatchMoveGroup(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var req struct {
+		Usernames []string `json:"usernames"`
+		GroupID   int64    `json:"groupId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2001,"message":"invalid request"}`)
+		return
+	}
+	if len(req.Usernames) == 0 || req.GroupID == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":"请先勾选用户并选择目标分组"}`)
+		return
+	}
+	moved, err := s.store.SetUsersGroup(req.Usernames, req.GroupID)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
+		return
+	}
+	s.audit(r, "user_batch_move_group", fmt.Sprintf("%d users", moved), fmt.Sprintf("groupId=%d moved=%d", req.GroupID, moved))
+	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"moved":%d}}`, moved)
 }
 
 // parseUserLimits 校验并归一化用户配置：有效期（YYYY-MM-DD，取当天 23:59:59 本地时间，留空=不过期）、

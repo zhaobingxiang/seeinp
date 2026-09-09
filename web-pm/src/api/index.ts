@@ -44,7 +44,16 @@ export const userApi = {
   delete: (username: string) => api.delete('/users?username=' + username),
   disable: (username: string, disconnectNow: boolean) => api.post(`/users/${username}/disable`, { disconnectNow }),
   enable: (username: string) => api.post(`/users/${username}/enable`),
-  resetCode: (username: string) => api.post(`/users/${username}/reset-code`)
+  resetCode: (username: string) => api.post(`/users/${username}/reset-code`),
+  batchMoveGroup: (usernames: string[], groupId: number) => api.post('/users/batch-move-group', { usernames, groupId })
+}
+
+// 用户分组：树状，根分组不可删可改名，最多 5 层
+export const userGroupApi = {
+  list: () => api.get('/user-groups'),
+  create: (data: { parentId: number; name: string }) => api.post('/user-groups', data),
+  rename: (id: number, name: string) => api.put('/user-groups/' + id, { name }),
+  remove: (id: number) => api.delete('/user-groups/' + id)
 }
 
 export const portApi = {
