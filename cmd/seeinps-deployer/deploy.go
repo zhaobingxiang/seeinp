@@ -133,6 +133,7 @@ func (a *API) runDeploy(stream *sseWriter, req *installReq, pc *pmClient) (*depl
 
 	// seeinps 配置的 server_addr 必须指向 seeinpm 主机的信令端口，而非部署目标主机
 	pmHost, apiPort := parsePMBase(pc)
+	bendPort, prober := pickBendPort(stream, remote)
 	pack := &installPackage{
 		version:     latest.Version,
 		goos:        goos,
@@ -143,7 +144,8 @@ func (a *API) runDeploy(stream *sseWriter, req *installReq, pc *pmClient) (*depl
 		pmHost:      pmHost,
 		apiPort:     apiPort,
 		controlPort: defaultPMControlPort,
-		bendPort:    pickBendPort(stream, remote),
+		bendPort:    bendPort,
+		prober:      prober,
 		fileSize:    latest.FileSize,
 		sha256:      latest.Sha256,
 	}
@@ -189,42 +191,121 @@ func parsePMBase(pc *pmClient) (string, int) {
 	return host, port
 }
 
-// pickBendPort 从 65443 起递进探测第一个未被占用的端口，作为 seeinps 管理页（B端）监听端口。
-// remote 为 nil 时检测本机，否则经 SSH 在目标机上检测（ss/netstat 查看监听列表）。
-func pickBendPort(stream *sseWriter, remote *remoteSSH) int {
+// pickBendPort 从 65443 起递进探测第一个未被占用的端口，作为 seeinps 管理页（B端）监听端口；
+// 同时返回可复用的探测器（写配置前的端口复查沿用同一探测方式，避免重复告警）。
+// 探测手段完全不可用时不再静默按“未占用”放行：明确 warn 后仍先试该端口，交由启动前复查兜底。
+func pickBendPort(stream *sseWriter, remote *remoteSSH) (int, *portProber) {
 	const base, maxTries = 65443, 50
+	prober := newPortProber(stream, remote)
 	for i := 0; i < maxTries; i++ {
 		port := base + i
-		if !bendPortInUse(remote, port) {
+		inUse, err := prober.inUse(port)
+		if err != nil {
+			stream.warn(fmt.Sprintf("无法探测确认端口可用性（%v），暂先使用 %d；若启动初始化失败，请检查该端口是否被其他进程占用", err, port))
+			return port, prober
+		}
+		if !inUse {
 			if i > 0 {
 				stream.info(fmt.Sprintf("管理页端口 %d 已被占用，自动改用 %d", base, port))
 			} else {
 				stream.info(fmt.Sprintf("管理页端口：%d", port))
 			}
-			return port
+			return port, prober
 		}
 	}
 	stream.warn(fmt.Sprintf("%d-%d 端口探测均被占用，仍默认使用 %d", base, base+maxTries-1, base))
-	return base
+	return base, prober
 }
 
-// bendPortInUse 检测目标主机上端口是否已被监听：本机用回环连接测试；
-// 远程经 SSH 查询监听列表（兼容无 ss仅有 netstat 的旧系统）。
-func bendPortInUse(remote *remoteSSH, port int) bool {
-	if remote == nil {
+// recheckBendPort 写配置前复查选定管理页端口是否仍空闲。
+// 递进探测与实际启动之间隔着可能长达数分钟的下载环节，端口可能在这个窗口内被其他进程抢占；
+// 一旦发现被占，自动顺延到下一个空闲端口（必须在写 seeinps.toml 之前更新 pack.bendPort，bend_addr 才会同步）。
+func recheckBendPort(stream *sseWriter, pack *installPackage) {
+	if pack.prober == nil {
+		pack.prober = newPortProber(stream, nil)
+	}
+	inUse, err := pack.prober.inUse(pack.bendPort)
+	if err != nil {
+		stream.warn(fmt.Sprintf("启动前管理页端口 %d 复查失败（%v），沿用原端口", pack.bendPort, err))
+		return
+	}
+	if !inUse {
+		return
+	}
+	const maxTries = 50
+	old := pack.bendPort
+	for i := 1; i <= maxTries; i++ {
+		port := old + i
+		used, err := pack.prober.inUse(port)
+		if err != nil {
+			stream.warn(fmt.Sprintf("顺延探测端口 %d 时失败（%v），沿用原端口 %d", port, err, old))
+			return
+		}
+		if !used {
+			stream.info(fmt.Sprintf("启动前发现管理页端口 %d 已被占用（下载窗口期内出现的新占用），自动改用 %d", old, port))
+			pack.bendPort = port
+			return
+		}
+	}
+	stream.warn(fmt.Sprintf("%d 起连续 %d 个端口均被占用，沿用原端口 %d", old, maxTries, old))
+}
+
+// 探测方式状态：远端优先 ss/netstat 列表，失败降级 bash /dev/tcp，再失败标记不可用
+const (
+	probeList = iota
+	probeDevTCP
+	probeDead
+)
+
+// portProber 探测目标主机 TCP 端口占用情况，并记忆可用的探测方式。
+// 旧实现把探测失败静默当作“未占用”，在缺少 ss 与 netstat 的精简系统（如 HikvisionOS）上
+// 会选中已被占用的端口，表现为“服务 active 但管理页永远绑定不上”。现在任何探测失效都会显式告警。
+type portProber struct {
+	stream *sseWriter
+	remote *remoteSSH // nil = 本机（Windows 部署场景），直接回环 dial 测试
+	mode   int
+}
+
+func newPortProber(stream *sseWriter, remote *remoteSSH) *portProber {
+	return &portProber{stream: stream, remote: remote, mode: probeList}
+}
+
+// inUse 返回 (是否被占用, 错误)。错误非 nil 表示“无法判定”，调用方不得按未占用静默处理。
+// 注意：/dev/tcp 兜底只能测出绑在 127.0.0.1/0.0.0.0 上的监听，仅绑特定网卡 IP 的占用会漏检（可接受的兜底精度）。
+func (p *portProber) inUse(port int) (bool, error) {
+	if p.remote == nil {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 500*time.Millisecond)
 		if err != nil {
-			return false
+			return false, nil
 		}
 		conn.Close()
-		return true
+		return true, nil
 	}
-	out, err := remote.run(fmt.Sprintf(
-		"(ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -qE '[:.]%d[[:space:]]' && echo USED || echo FREE", port))
-	if err != nil {
-		return false // 探测失败按未占用处理
+	for {
+		switch p.mode {
+		case probeList:
+			out, err := p.remote.run(fmt.Sprintf(
+				"if command -v ss >/dev/null 2>&1; then ss -tln 2>/dev/null | grep -qE '[:.]%d[[:space:]]' && echo USED || echo FREE; "+
+					"elif command -v netstat >/dev/null 2>&1; then netstat -tln 2>/dev/null | grep -qE '[:.]%d[[:space:]]' && echo USED || echo FREE; "+
+					"else echo NOCMD; fi", port, port))
+			if err == nil && !strings.Contains(string(out), "NOCMD") {
+				return strings.Contains(string(out), "USED"), nil
+			}
+			p.mode = probeDevTCP
+			p.stream.warn("目标机 ss/netstat 列表探测不可用（精简系统可能未安装），改用 bash /dev/tcp 回环连接探测端口占用")
+			continue
+		case probeDevTCP:
+			out, err := p.remote.run(fmt.Sprintf(
+				"if command -v bash >/dev/null 2>&1; then bash -c 'exec 3<>/dev/tcp/127.0.0.1/%d' 2>/dev/null && echo USED || echo FREE; else echo NOCMD; fi", port))
+			if err == nil && !strings.Contains(string(out), "NOCMD") {
+				return strings.Contains(string(out), "USED"), nil
+			}
+			p.mode = probeDead
+			continue
+		default:
+			return false, fmt.Errorf("目标机端口探测手段均不可用（ss/netstat 列表与 /dev/tcp 兜底均失败），无法判定端口 %d 是否被占用", port)
+		}
 	}
-	return strings.Contains(string(out), "USED")
 }
 
 // bendLogin 登录 seeinps B 端，返回 JWT
@@ -314,13 +395,14 @@ type installPackage struct {
 	username         string
 	authCode         string
 	password         string
-	pmHost           string // seeinpm 服务器主机（生成 seeinps 配置 server_addr 用）
-	controlPort      int    // seeinpm 信令/控制端口（99）
-	bendPort         int    // seeinps 管理页（B端）监听端口（65443 起递进探测）
-	createWebMapping bool   // 部署成功后是否为管理页创建 TCP 映射
-	apiPort          int    // seeinpm B端 Web/API 端口（目标机直连下载用）
-	fileSize         int64  // 安装包大小（目标机直连下载的进度总大小）
-	sha256           string // 安装包 sha256（目标机下载后校验）
+	pmHost           string      // seeinpm 服务器主机（生成 seeinps 配置 server_addr 用）
+	controlPort      int         // seeinpm 信令/控制端口（99）
+	bendPort         int         // seeinps 管理页（B端）监听端口（65443 起递进探测）
+	prober           *portProber // 端口占用探测器（pickBendPort 创建，写配置前复查端口时复用同一探测方式）
+	createWebMapping bool        // 部署成功后是否为管理页创建 TCP 映射
+	apiPort          int         // seeinpm B端 Web/API 端口（目标机直连下载用）
+	fileSize         int64       // 安装包大小（目标机直连下载的进度总大小）
+	sha256           string      // 安装包 sha256（目标机下载后校验）
 }
 
 // humanSize 友好显示字节大小

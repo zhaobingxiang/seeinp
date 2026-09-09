@@ -37,6 +37,9 @@ func (a *API) deployWindows(stream *sseWriter, pack *installPackage, req *instal
 		return nil, fmt.Errorf("复制可执行文件失败: %v", err)
 	}
 
+	// 写配置前复查端口（探测在部署最开始，下载环节可能耗时数分钟，端口可能被抢占后自动顺延）
+	recheckBendPort(stream, pack)
+
 	// 写 seeinps.toml（server_addr 指向 seeinpm 控制端口）
 	serverAddr := fmt.Sprintf("%s:%d", pack.pmHost, pack.controlPort)
 	confContent := seeinpsConfigTemplate(pack, serverAddr, fmt.Sprintf(":%d", pack.bendPort))

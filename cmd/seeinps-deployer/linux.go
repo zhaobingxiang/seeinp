@@ -489,6 +489,10 @@ func (a *API) deployLinux(stream *sseWriter, pack *installPackage, remote *remot
 	}
 downloadDone:
 
+	// 写配置前复查端口：递进探测在部署最开始，之后下载可能耗时数分钟，端口可能已被新进程抢占；
+	// 被占则自动顺延（必须在写 seeinps.toml 之前完成，bend_addr 才会同步）
+	recheckBendPort(stream, pack)
+
 	// 写 seeinps.toml（server_addr 指向 seeinpm 控制端口）
 	serverAddr := fmt.Sprintf("%s:%d", pack.pmHost, pack.controlPort)
 	confContent := seeinpsConfigTemplate(pack, serverAddr, fmt.Sprintf(":%d", pack.bendPort))
@@ -621,7 +625,18 @@ func (a *API) remoteInit(stream *sseWriter, pack *installPackage, remote *remote
 		time.Sleep(2 * time.Second)
 	}
 	if !ready {
-		return fmt.Errorf("管理页端口 %d 在 60 秒内未就绪，服务状态/日志摘录：%s", pack.bendPort, truncateStr(journalDump(), 500))
+		// journal 里没有 seeinps 的运行日志（logx 写文件），补抓 [WEB] 绑定相关行：
+		// B端绑定失败不退进程（5s 重试），最常见原因就是端口被占，只报 journal 摘录会误导排查
+		webLog := ""
+		if out, err := remote.runAsRoot(fmt.Sprintf(
+			"tail -n 300 %s/logs/seeinps_*.log 2>/dev/null | grep -iE '\\[WEB\\]|bind|listen|address already' | tail -4", sshInstallDir)); err == nil {
+			webLog = strings.TrimSpace(string(out))
+		}
+		detail := truncateStr(journalDump(), 400)
+		if webLog != "" {
+			detail += "；seeinps 日志摘录：" + truncateStr(webLog, 300)
+		}
+		return fmt.Errorf("管理页端口 %d 在 60 秒内未就绪（若端口被其他进程占用，seeinps 会持续 5 秒重试绑定但不退出，服务仍显示 active），服务状态/日志：%s", pack.bendPort, detail)
 	}
 	time.Sleep(2 * time.Second)
 
