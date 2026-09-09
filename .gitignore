@@ -83,7 +83,7 @@ cmd/seeinps-deployer/web/build/
 .workbuddy/
 
 # 含服务器凭据的文件，禁止入库（服务器地址/账号/密码）
-/README.md
+/README.internal.md
 /test/测试服务器信息.txt
 /test/e2e/test_upgrade_linux_scratch.py
 /test/legacy-scripts/
