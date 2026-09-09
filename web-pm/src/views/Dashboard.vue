@@ -4,7 +4,7 @@
     <div class="stat-grid">
       <div class="stat-card">
         <div class="stat-value">{{ health.clients || 0 }}</div>
-        <div class="stat-label">在线客户端</div>
+        <div class="stat-label">在线 seeinps（服务端）</div>
         <div class="stat-sub">控制通道连接数</div>
       </div>
       <div class="stat-card">
@@ -139,7 +139,7 @@ const actions = [
   { value: "proxy_disable", label: "禁用代理" },
   { value: "proxy_enable", label: "启用代理" },
   { value: "port_pool_update", label: "修改端口池" },
-  { value: "auth_init", label: "初始化B端账号" },
+  { value: "auth_init", label: "初始化 seeinps（服务端）账号" },
   { value: "auth_rebind", label: "重新绑定授权码" },
   { value: "proxy_create", label: "创建代理" },
   { value: "proxy_update", label: "修改代理" },

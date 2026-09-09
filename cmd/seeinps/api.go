@@ -101,6 +101,7 @@ func (c *Client) startLocalServer() error {
 	mux.HandleFunc("DELETE /api/v1/proxies/{id}", c.requireAuth(c.handleProxyDelete))
 	mux.HandleFunc("GET /api/v1/status", c.requireAuth(c.handleStatus))
 	mux.HandleFunc("GET /api/v1/stats", c.requireAuth(c.handleStats))
+	mux.HandleFunc("GET /api/v1/quota", c.requireAuth(c.handleQuota))
 	mux.HandleFunc("GET /api/v1/audit-logs", c.requireAuth(c.handleAuditLogs))
 	mux.HandleFunc("GET /api/v1/logs", c.requireAuth(c.handleListLogFiles))
 	mux.HandleFunc("GET /api/v1/logs/content", c.requireAuth(c.handleLogFileContent))
@@ -738,6 +739,17 @@ func (c *Client) handleStats(w http.ResponseWriter, r *http.Request) {
 	n := len(c.proxies)
 	c.proxiesMu.RUnlock()
 	writeOK(w, map[string]interface{}{"connections": 0, "traffic": 0, "proxies": n})
+}
+
+// handleQuota 返回 A 端同步的周期流量配额状态缓存（进度/重置日期/超额标志）。
+// 数据随 B 端心跳响应（约 10s）与 A 端状态跃迁推送刷新；从未同步过时 enabled=false。
+func (c *Client) handleQuota(w http.ResponseWriter, r *http.Request) {
+	q, syncedAt := c.quotaSnapshot()
+	writeOK(w, map[string]interface{}{
+		"enabled": q.Enabled, "period": q.Period, "used": q.Used, "limit": q.Limit,
+		"periodStart": q.PeriodStart, "periodEnd": q.PeriodEnd, "exceeded": q.Exceeded,
+		"syncedAt": syncedAt,
+	})
 }
 
 // handleAuditLogs 分页查询本地操作审计日志（?username=&action=&keyword=&start_time=&end_time=&page=&page_size=）

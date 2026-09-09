@@ -121,6 +121,28 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec("UPDATE users SET group_id = ? WHERE group_id = 0", rootID); err != nil {
 		return fmt.Errorf("backfill users.group_id: %w", err)
 	}
+
+	// v6: 带宽限制与周期流量配额。
+	//   max_mbps     用户所有代理共享的瞬时带宽上限（Mbps，双向合计；0=不限；web-ui 豁免）
+	//   quota_bytes  周期内总流量上限（字节，in+out 合计；0=不限）
+	//   quota_period 周期类型 month/quarter/year（''=未启用）
+	//   quota_start  首个周期起点（本地 0 点 unix 秒），此后按同日期滚动重置
+	// user_quota_usage 按用户维护当前周期用量，周期滚动时清零（不依赖代理行的生命周期）。
+	for _, col := range []string{
+		"ALTER TABLE users ADD COLUMN max_mbps INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE users ADD COLUMN quota_bytes INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE users ADD COLUMN quota_period TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE users ADD COLUMN quota_start INTEGER NOT NULL DEFAULT 0",
+	} {
+		if _, err := s.db.Exec(col); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("migrate users limits v6: %w", err)
+			}
+		}
+	}
+	if _, err := s.db.Exec("CREATE TABLE IF NOT EXISTS user_quota_usage (username TEXT PRIMARY KEY, period_start INTEGER NOT NULL DEFAULT 0, period_end INTEGER NOT NULL DEFAULT 0, bytes_used INTEGER NOT NULL DEFAULT 0)"); err != nil {
+		return fmt.Errorf("migrate user_quota_usage: %w", err)
+	}
 	return nil
 }
 
@@ -184,32 +206,49 @@ type User struct {
 	MaxPorts      int   // 端口数量配额（0=不限）
 	PortRanges    []PortRange
 	GroupID       int64 // 所属用户分组（user_groups.id，恒 >0：未显式指定时归根分组）
+	MaxMbps       int64 // 所有代理共享的瞬时带宽上限（Mbps，双向合计；0=不限；web-ui 豁免）
+	QuotaBytes    int64 // 周期内总流量上限（字节，in+out；0=不限）
+	QuotaPeriod   string // 周期类型 month/quarter/year（''=未启用）
+	QuotaStart    int64 // 首个周期起点（本地 0 点 unix 秒）
 	CreatedAt     int64
 	UpdatedAt     int64
 }
 
-func (s *Store) CreateUser(username, authCodeHash, authCodeSalt string, expiresAt int64, maxPorts int, portRanges []PortRange, groupID int64) error {
+// UserLimits 用户可编辑的资源限制集合（创建与更新共用）。GroupID 仅在创建时写入，
+// 更新走 SetUsersGroup；此处保留字段以便列表/详情一次性读取。
+type UserLimits struct {
+	ExpiresAt   int64
+	MaxPorts    int
+	PortRanges  []PortRange
+	GroupID     int64
+	MaxMbps     int64
+	QuotaBytes  int64
+	QuotaPeriod string
+	QuotaStart  int64
+}
+
+func (s *Store) CreateUser(username, authCodeHash, authCodeSalt string, limits UserLimits) error {
 	now := time.Now().Unix()
 	rj := "[]"
-	if len(portRanges) > 0 {
-		b, _ := json.Marshal(portRanges)
+	if len(limits.PortRanges) > 0 {
+		b, _ := json.Marshal(limits.PortRanges)
 		rj = string(b)
 	}
-	_, err := s.db.Exec("INSERT INTO users (username, auth_code, auth_code_salt, status, expires_at, max_ports, port_ranges, group_id, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
-		username, authCodeHash, authCodeSalt, expiresAt, maxPorts, rj, groupID, now, now)
+	_, err := s.db.Exec("INSERT INTO users (username, auth_code, auth_code_salt, status, expires_at, max_ports, port_ranges, group_id, max_mbps, quota_bytes, quota_period, quota_start, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		username, authCodeHash, authCodeSalt, limits.ExpiresAt, limits.MaxPorts, rj, limits.GroupID, limits.MaxMbps, limits.QuotaBytes, limits.QuotaPeriod, limits.QuotaStart, now, now)
 	return err
 }
 
-// UpdateUserLimits 更新用户有效期/端口数量配额/用户端口池
-func (s *Store) UpdateUserLimits(username string, expiresAt int64, maxPorts int, portRanges []PortRange) error {
+// UpdateUserLimits 更新用户有效期/端口配额/用户端口池/带宽/周期流量配额（不含分组归属）
+func (s *Store) UpdateUserLimits(username string, limits UserLimits) error {
 	now := time.Now().Unix()
 	rj := "[]"
-	if len(portRanges) > 0 {
-		b, _ := json.Marshal(portRanges)
+	if len(limits.PortRanges) > 0 {
+		b, _ := json.Marshal(limits.PortRanges)
 		rj = string(b)
 	}
-	res, err := s.db.Exec("UPDATE users SET expires_at = ?, max_ports = ?, port_ranges = ?, updated_at = ? WHERE username = ?",
-		expiresAt, maxPorts, rj, now, username)
+	res, err := s.db.Exec("UPDATE users SET expires_at = ?, max_ports = ?, port_ranges = ?, max_mbps = ?, quota_bytes = ?, quota_period = ?, quota_start = ?, updated_at = ? WHERE username = ?",
+		limits.ExpiresAt, limits.MaxPorts, rj, limits.MaxMbps, limits.QuotaBytes, limits.QuotaPeriod, limits.QuotaStart, now, username)
 	if err != nil {
 		return err
 	}
@@ -231,8 +270,8 @@ func (s *Store) GetUserByUsername(username string) (*User, error) {
 	var onlineSession sql.NullString
 	var onlineSince sql.NullInt64
 	var portRanges string
-	err := s.db.QueryRow("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), COALESCE(group_id,0), created_at, updated_at FROM users WHERE username = ?", username).
-		Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.GroupID, &u.CreatedAt, &u.UpdatedAt)
+	err := s.db.QueryRow("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), COALESCE(group_id,0), COALESCE(max_mbps,0), COALESCE(quota_bytes,0), COALESCE(quota_period,''), COALESCE(quota_start,0), created_at, updated_at FROM users WHERE username = ?", username).
+		Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.GroupID, &u.MaxMbps, &u.QuotaBytes, &u.QuotaPeriod, &u.QuotaStart, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +287,7 @@ func (s *Store) GetUserByUsername(username string) (*User, error) {
 }
 
 func (s *Store) ListUsers() ([]*User, error) {
-	rows, err := s.db.Query("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), COALESCE(group_id,0), created_at, updated_at FROM users ORDER BY created_at DESC")
+	rows, err := s.db.Query("SELECT id, username, COALESCE(remark,''), auth_code, auth_code_salt, status, online_session, online_since, COALESCE(expires_at,0), COALESCE(max_ports,0), COALESCE(port_ranges,'[]'), COALESCE(group_id,0), COALESCE(max_mbps,0), COALESCE(quota_bytes,0), COALESCE(quota_period,''), COALESCE(quota_start,0), created_at, updated_at FROM users ORDER BY created_at DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +298,7 @@ func (s *Store) ListUsers() ([]*User, error) {
 		var onlineSession sql.NullString
 		var onlineSince sql.NullInt64
 		var portRanges string
-		if err := rows.Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.GroupID, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Remark, &u.AuthCodeHash, &u.AuthCodeSalt, &u.Status, &onlineSession, &onlineSince, &u.ExpiresAt, &u.MaxPorts, &portRanges, &u.GroupID, &u.MaxMbps, &u.QuotaBytes, &u.QuotaPeriod, &u.QuotaStart, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if onlineSession.Valid {
@@ -301,11 +340,12 @@ func (s *Store) DeleteUser(username string) error {
 		return err
 	}
 	defer tx.Rollback()
-	// 级联删除：会话、代理记录与端口分配（端口分配删除后即放回公共池）
+	// 级联删除：会话、代理记录与端口分配（端口分配删除后即放回公共池）、周期配额用量
 	stmts := []string{
 		"DELETE FROM proxy_sessions WHERE username = ?",
 		"DELETE FROM proxies WHERE username = ?",
 		"DELETE FROM port_allocations WHERE user_id = ?",
+		"DELETE FROM user_quota_usage WHERE username = ?",
 		"DELETE FROM users WHERE username = ?",
 	}
 	for _, q := range stmts {

@@ -6,6 +6,8 @@
       description="代理数据已保留，输入新授权码绑定后即可自动恢复全部代理。"
       show-icon />
 
+    <QuotaCard />
+
     <!-- 连接状态横幅 -->
     <div class="conn-banner">
       <div class="conn-left">
@@ -92,6 +94,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { proxyApi, statusApi, authApi } from '@/api'
 import Layout from '@/components/Layout.vue'
+import QuotaCard from '@/components/QuotaCard.vue'
 
 const router = useRouter()
 const proxies = ref<any[]>([])

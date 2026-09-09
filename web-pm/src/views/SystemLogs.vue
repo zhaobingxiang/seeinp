@@ -4,9 +4,9 @@
       <div class="card-header" style="padding:14px 20px;border-bottom:1px solid var(--app-border-light)">
         <div class="filters">
           <span class="filter-label">来源：</span>
-          <el-select v-model="source" style="width:170px" @change="onSourceChange">
-            <el-option label="本机 (seeinpm)" value="__local__" />
-            <el-option v-for="c in clients" :key="c.username" :label="`${c.username} (seeinps)`" :value="c.username" />
+          <el-select v-model="source" style="width:230px" @change="onSourceChange">
+            <el-option label="seeinpm（中心端）" value="__local__" />
+            <el-option v-for="c in clients" :key="c.username" :label="`${c.username} · seeinps（服务端）`" :value="c.username" />
           </el-select>
           <el-input v-model="keyword" placeholder="关键词搜索日志内容" clearable style="width:200px" @keyup.enter="loadContent">
             <template #prefix><el-icon><Search /></el-icon></template>
@@ -25,7 +25,7 @@
             </el-select>
             <el-button type="warning" plain :loading="changingLevel" @click="onLevelChange">保存</el-button>
           </template>
-          <el-tooltip :content="source === '__local__' ? '本机(seeinpm)运行日志级别' : '该 seeinps 的日志级别请在对应 seeinps 管理台设置'" placement="top">
+          <el-tooltip :content="source === '__local__' ? 'seeinpm（中心端）运行日志级别' : '该 seeinps（服务端）的日志级别请在对应 seeinps 管理台设置'" placement="top">
             <span class="level-hint">{{ levelHint }}</span>
           </el-tooltip>
         </div>
@@ -71,7 +71,7 @@ const logLevel = ref("info")
 const changingLevel = ref(false)
 const levelHint = computed(() => {
   if (source.value === "__local__") return "当前级别: " + logLevel.value.toUpperCase()
-  return "B 端级别请至对应 seeinps 管理台修改"
+  return "seeinps（服务端）级别请至对应 seeinps 管理台修改"
 })
 const formatTime = (ts?: number) => { if (!ts) return "-"; return new Date(ts * 1000).toLocaleString() }
 const formatSize = (n?: number) => {
@@ -163,7 +163,7 @@ const download = async () => {
       URL.revokeObjectURL(a.href)
     } catch (e) { console.error(e) }
   } else {
-    alert("B 端 (seeinps) 运行日志请登录对应 seeinps 管理台下载")
+    alert("seeinps（服务端）运行日志请登录对应 seeinps 管理台下载")
   }
 }
 const renderContent = () => {

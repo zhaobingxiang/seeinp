@@ -67,6 +67,11 @@ export const statusApi = {
   getStats: () => api.get('/stats')
 }
 
+// 周期流量配额（A 端经控制通道同步到本地缓存，此接口读取缓存展示进度/重置日期/超额）
+export const quotaApi = {
+  get: () => api.get('/quota')
+}
+
 export const auditApi = {
   list: (params: { username?: string; action?: string; keyword?: string; start_time?: number; end_time?: number; page?: number; page_size?: number }) => api.get('/audit-logs', { params })
 }

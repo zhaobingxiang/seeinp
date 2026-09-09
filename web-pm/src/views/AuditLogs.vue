@@ -3,9 +3,9 @@
     <div class="page-card">
       <div class="card-header" style="padding:14px 20px;border-bottom:1px solid var(--app-border-light)">
         <div class="filters">
-          <el-select v-model="filterSource" placeholder="全部来源" clearable style="width:110px">
-            <el-option label="PM 管理端" value="pm" />
-            <el-option label="B 端 (seeinps)" value="ps" />
+          <el-select v-model="filterSource" placeholder="全部来源" clearable style="width:160px">
+            <el-option label="seeinpm（中心端）" value="pm" />
+            <el-option label="seeinps（服务端）" value="ps" />
           </el-select>
           <el-select v-model="filterAction" placeholder="全部动作" clearable style="width:150px">
             <el-option v-for="a in actions" :key="a.value" :label="a.label" :value="a.value" />
@@ -27,8 +27,8 @@
       <div style="padding:12px 20px 20px">
         <el-table :data="list" v-loading="loading">
           <el-table-column label="时间" width="175"><template #default="{row}">{{ formatTime(row.createdAt) }}</template></el-table-column>
-          <el-table-column label="来源" width="110"><template #default="{row}">
-            <el-tag size="small" :type="row.source === 'ps' ? 'primary' : 'info'">{{ row.source === 'ps' ? 'B端 seeinps' : 'PM 管理端' }}</el-tag>
+          <el-table-column label="来源" width="150"><template #default="{row}">
+            <el-tag size="small" :type="row.source === 'ps' ? 'primary' : 'info'">{{ row.source === 'ps' ? 'seeinps（服务端）' : 'seeinpm（中心端）' }}</el-tag>
           </template></el-table-column>
           <el-table-column prop="username" label="操作者" width="120" />
           <el-table-column label="动作" width="130"><template #default="{row}"><el-tag size="small" :type="actionTag(row.action)">{{ actionLabel(row.action) }}</el-tag></template></el-table-column>
@@ -73,20 +73,22 @@ const actions = [
   { value: "user_group_create", label: "新建分组" },
   { value: "user_group_rename", label: "重命名分组" },
   { value: "user_group_delete", label: "删除分组" },
+  { value: "user_quota_exceeded", label: "流量配额超额停用" },
+  { value: "user_quota_recovered", label: "流量配额周期恢复" },
   { value: "proxy_disable", label: "禁用代理" },
   { value: "proxy_enable", label: "启用代理" },
   { value: "port_pool_update", label: "修改端口池" },
-  { value: "auth_init", label: "初始化B端账号" },
+  { value: "auth_init", label: "初始化 seeinps（服务端）账号" },
   { value: "auth_rebind", label: "重新绑定授权码" },
   { value: "proxy_create", label: "创建代理" },
   { value: "proxy_update", label: "修改代理" },
   { value: "proxy_delete", label: "删除代理" },
-  { value: "client_upgrade", label: "推送升级客户端" },
-  { value: "upgrade_failed", label: "升级客户端失败" },
+  { value: "client_upgrade", label: "推送升级 seeinps（服务端）" },
+  { value: "upgrade_failed", label: "seeinps（服务端）升级失败" },
   { value: "version_upload", label: "上传升级包" },
   { value: "version_delete", label: "删除升级包" },
-  { value: "self_upgrade", label: "B端自主升级" },
-  { value: "pm_upgrade", label: "B端从PM拉取升级" },
+  { value: "self_upgrade", label: "seeinps（服务端）自主升级" },
+  { value: "pm_upgrade", label: "seeinps（服务端）从 seeinpm 拉取升级" },
   { value: "log_level_update", label: "修改日志级别" },
   { value: "user_expired", label: "账号过期踢线" }
 ]
@@ -141,7 +143,7 @@ const download = async () => {
     if (rows.length === 0) { return }
     const header = "时间,来源,操作者,动作,对象,详情"
     const lines = rows.map((r: any) => [
-      formatTime(r.createdAt), r.source === 'ps' ? 'B端' : 'PM', r.username, actionLabel(r.action), r.target,
+      formatTime(r.createdAt), r.source === 'ps' ? 'seeinps（服务端）' : 'seeinpm（中心端）', r.username, actionLabel(r.action), r.target,
       (r.detail || '').replace(/,/g, '，').replace(/\n/g, ' ')
     ].join(","))
     const blob = new Blob(["\ufeff" + [header, ...lines].join("\n")], { type: "text/csv;charset=utf-8" })

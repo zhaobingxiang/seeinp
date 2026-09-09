@@ -545,7 +545,7 @@ const startUpgradePoll = () => {
         loadClients()
       } else if (d.stage === 'none') {
         stopUpgradePoll()
-        upgradeErrMsg.value = '升级状态丢失（PM 可能已重启），请确认节点当前版本后重试'
+        upgradeErrMsg.value = '升级状态丢失（seeinpm 可能已重启），请确认节点当前版本后重试'
         ElMessage.warning(upgradeErrMsg.value)
       }
     } catch { /* 轮询错误忽略，下个周期重试 */ }

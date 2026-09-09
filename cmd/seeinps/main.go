@@ -44,6 +44,9 @@ type Client struct {
 	revoked atomic.Bool
 	// lastPing: 最近一次心跳成功时间（unix 秒），供 B端仪表盘展示
 	lastPing atomic.Int64
+	// quotaCache: A 端同步的周期流量配额状态（*protocol.QuotaStatusData），供 web-ui 展示用量/重置日期/超额提醒
+	quotaCache    atomic.Value
+	quotaSyncedAt atomic.Int64
 
 	// rootCtx 为 main 的生命周期 ctx；controlEpoch 用于重绑后重启控制循环并让旧循环退出
 	rootCtx       context.Context
@@ -76,6 +79,9 @@ var errPortPoolExhausted = errors.New("端口池获取失败，请联系管理�
 
 // errPortQuotaExhausted seeinpm 回 3002：用户端口数量配额已用满，新代理无法再分配端口
 var errPortQuotaExhausted = errors.New("端口数量已达上限，请联系管理员")
+
+// errTrafficQuotaExceeded seeinpm 回 3006：本周期总流量已达上限，除 web-ui 外代理停止转发，周期重置后自动恢复
+var errTrafficQuotaExceeded = errors.New("本周期流量已达上限，代理暂时不可用，周期重置后将自动恢复")
 
 type proxySnapshot struct {
 	LocalAddr, ProxyUsername, ProxyPasswordHash, ACLRaw string
@@ -235,6 +241,13 @@ func (l *controlLink) readLoop() {
 		if msg.Type == protocol.TypeUpgradePush {
 			if c := l.client; c != nil {
 				l.send(c.handleUpgradePush(msg))
+			}
+			continue
+		}
+		// 周期流量配额状态同步：心跳响应携带 / 状态跃迁时 QUOTA_STATUS 主动推送，缓存供 web-ui 展示
+		if msg.Type == protocol.TypeHeartbeatResp || msg.Type == protocol.TypeQuotaStatus {
+			if c := l.client; c != nil {
+				c.updateQuotaCache(msg)
 			}
 			continue
 		}
@@ -585,6 +598,9 @@ func (c *Client) allocProxy(link *controlLink, p *Proxy) (int, error) {
 		if code == int(protocol.CodePortPoolExhausted) {
 			return 0, errPortQuotaExhausted
 		}
+		if code == int(protocol.CodeTrafficQuotaExceeded) {
+			return 0, errTrafficQuotaExceeded
+		}
 		return 0, fmt.Errorf("ALLOC_PORT code=%d", code)
 	}
 	d := &protocol.AllocPortRespData{}
@@ -633,6 +649,29 @@ func (c *Client) heartbeatLoop(ctx context.Context, link *controlLink) error {
 			return fmt.Errorf("control link closed")
 		}
 	}
+}
+
+// updateQuotaCache 从控制消息解析 A 端下发的周期流量配额状态并缓存；
+// 心跳响应无 data 视为“未启用配额”，缓存清零（web 端据此隐藏配额卡片）。
+func (c *Client) updateQuotaCache(msg *protocol.Message) {
+	q := &protocol.QuotaStatusData{}
+	if msg.Data != nil {
+		b, _ := json.Marshal(msg.Data)
+		if err := json.Unmarshal(b, q); err != nil {
+			return
+		}
+	}
+	c.quotaCache.Store(q)
+	c.quotaSyncedAt.Store(time.Now().Unix())
+}
+
+// quotaSnapshot 返回最近一次 A 端同步的配额状态与同步时间（未同步过时返回未启用空态）
+func (c *Client) quotaSnapshot() (*protocol.QuotaStatusData, int64) {
+	q, _ := c.quotaCache.Load().(*protocol.QuotaStatusData)
+	if q == nil {
+		q = &protocol.QuotaStatusData{}
+	}
+	return q, c.quotaSyncedAt.Load()
 }
 
 func (c *Client) acceptDataStreams(session *yamux.Session) {

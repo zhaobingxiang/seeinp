@@ -61,7 +61,7 @@ const actions = [
   { value: 'proxy_update', label: '修改代理' },
   { value: 'proxy_delete', label: '删除代理' },
   { value: 'self_upgrade', label: '自主升级(上传包)' },
-  { value: 'pm_upgrade', label: '从PM拉取升级' },
+  { value: 'pm_upgrade', label: '从 seeinpm 拉取升级' },
   { value: 'log_level_update', label: '修改日志级别' }
 ]
 const actionLabel = (a: string) => actions.find((x: any) => x.value === a)?.label || a

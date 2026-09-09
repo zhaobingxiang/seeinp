@@ -31,6 +31,7 @@ import (
 	"github.com/seeinp/seeinp/internal/mux"
 	"github.com/seeinp/seeinp/internal/portpool"
 	"github.com/seeinp/seeinp/internal/protocol"
+	"github.com/seeinp/seeinp/internal/shaper"
 	"github.com/seeinp/seeinp/internal/store"
 	"github.com/seeinp/seeinp/internal/tlsutil"
 	"github.com/seeinp/seeinp/internal/udpframing"
@@ -64,6 +65,12 @@ type Server struct {
 	traffic          map[string]*proxyTraffic
 	trafficMu        sync.Mutex
 	lastProxyCleanup time.Time
+	// shapers：每用户一个共享令牌桶（所有代理双向合计），key=username。
+	// quotaEnforced：用户当前周期流量已超额并执行过断开存量，防重复触发/用于恢复检测
+	shapers       map[string]*shaper.Limiter
+	shapersMu     sync.Mutex
+	quotaEnforced map[string]bool
+	quotaMu       sync.Mutex
 	// fatal 上抛致命错误（如控制监听失败），Start 收到后优雅关停并以错误退出
 	fatal chan error
 }
@@ -113,6 +120,8 @@ type PublicListener struct {
 	UdpConn net.PacketConn
 	Client  *Client
 	tr      *proxyTraffic
+	// lim 用户级共享令牌桶（所有代理双向合计）；web-ui 管理代理恒为 nil（豁免限速）
+	lim *shaper.Limiter
 	// activeConns 跟踪该监听器上的活动转发连接（公网连接与 mux 流），禁用时强制断开
 	activeConns map[net.Conn]struct{}
 	connsMu     sync.Mutex
@@ -175,6 +184,8 @@ func NewServer(config *config.PMConfig) (*Server, error) {
 		publicConns:        make(map[int]*PublicListener),
 		publicConnsByProxy: make(map[string]*PublicListener),
 		traffic:            make(map[string]*proxyTraffic),
+		shapers:            make(map[string]*shaper.Limiter),
+		quotaEnforced:      make(map[string]bool),
 		fatal:              make(chan error, 2),
 	}, nil
 }
@@ -212,6 +223,7 @@ func (s *Server) Start(ctx context.Context) error {
 	go s.startExpiryTicker(ctx)
 	go s.trafficSampler(ctx)
 	go s.trafficFlusher(ctx)
+	go s.quotaWatcher(ctx)
 
 	httpAddr := s.config.Server.HTTPAddr
 	if httpAddr == "" {
@@ -493,6 +505,10 @@ func (s *Server) startPublicListener(port int, proxyID, proxyType string, client
 		tr:          s.trafficFor(client.username, proxyID),
 		activeConns: make(map[net.Conn]struct{}),
 	}
+	// 带宽限速取用户级共享令牌桶（ALLOC 前已 sync 过速率，一般非 nil）；web-ui 恒豁免
+	if proxyID != webUIProxyID {
+		pl.lim = s.userLimiter(client.username)
+	}
 
 	if proxyType == "udp" {
 		pc, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
@@ -659,7 +675,10 @@ func (s *Server) routeUDPPacket(pl *PublicListener, addr net.Addr, payload []byt
 	stream := sess.stream
 	pl.udpMu.Unlock()
 
-	// 外网→内网：写一帧到会话流，并刷新空闲计时（双方共享同一流）
+	// 外网→内网：写一帧到会话流，并刷新空闲计时（双方共享同一流）；限速走用户共享令牌桶
+	if pl.lim != nil && pl.lim.Active() {
+		pl.lim.Wait(context.Background(), int64(len(payload)))
+	}
 	stream.SetReadDeadline(time.Now().Add(udpSessionIdle))
 	udpframing.WriteFrame(stream, payload)
 	pl.tr.in.Add(int64(len(payload)))
@@ -681,6 +700,9 @@ func (s *Server) udpResponsePump(pl *PublicListener, key string, sess *udpPMSess
 			return
 		}
 		buf = payload
+		if pl.lim != nil && pl.lim.Active() {
+			pl.lim.Wait(context.Background(), int64(len(payload)))
+		}
 		if _, err := pl.UdpConn.WriteTo(payload, sess.clientAddr); err != nil {
 			return
 		}
@@ -724,15 +746,29 @@ func (s *Server) handlePublicConnection(pl *PublicListener, conn net.Conn) {
 	inConn := &countingConn{Conn: conn, onRead: func(n int) { pl.tr.in.Add(int64(n)) }}
 	outStream := &countingConn{Conn: stream, onRead: func(n int) { pl.tr.out.Add(int64(n)) }}
 
+	// 带宽限制：用户所有代理共享令牌桶（双向合计）；web-ui 与未配置限速走直通拷贝
+	lim := pl.lim
+	if lim != nil && !lim.Active() {
+		lim = nil
+	}
+
 	done := make(chan struct{}, 2)
 	go func() {
 		stream.SetReadDeadline(time.Now().Add(connReadTimeout))
-		io.Copy(stream, inConn)
+		if lim != nil {
+			shapedCopy(stream, inConn, lim)
+		} else {
+			io.Copy(stream, inConn)
+		}
 		done <- struct{}{}
 	}()
 	go func() {
 		conn.SetReadDeadline(time.Now().Add(connReadTimeout))
-		io.Copy(conn, outStream)
+		if lim != nil {
+			shapedCopy(conn, outStream, lim)
+		} else {
+			io.Copy(conn, outStream)
+		}
 		done <- struct{}{}
 	}()
 	<-done
@@ -750,6 +786,54 @@ func (s *Server) trafficFor(username, proxyID string) *proxyTraffic {
 		s.traffic[key] = tr
 	}
 	return tr
+}
+
+// webUIProxyID 为 B 端管理页代理 ID：豁免带宽限速，也是周期流量超额后唯一仍允许新建的代理
+const webUIProxyID = "web-ui"
+
+// syncUserLimiter 按最新 maxMbps 更新用户共享令牌桶（Mbps→字节/秒；0=不限）。
+// 桶对象跨监听器共享，进行中的转发即时生效。
+func (s *Server) syncUserLimiter(username string, maxMbps int64) {
+	bps := maxMbps * 1000000 / 8
+	s.shapersMu.Lock()
+	defer s.shapersMu.Unlock()
+	lim, ok := s.shapers[username]
+	if !ok {
+		s.shapers[username] = shaper.New(bps)
+		return
+	}
+	lim.SetRate(bps)
+}
+
+// userLimiter 返回用户共享限速器对象（用户从未分配过代理时为 nil）
+func (s *Server) userLimiter(username string) *shaper.Limiter {
+	s.shapersMu.Lock()
+	defer s.shapersMu.Unlock()
+	return s.shapers[username]
+}
+
+// shapedCopy 是 io.Copy 的限速等价实现：每块读完后按真实字节数向共享桶取令牌再写出；
+// src 侧计数由调用方包装（countingConn）完成，此处只负责节奏。
+func shapedCopy(dst io.Writer, src io.Reader, lim *shaper.Limiter) {
+	buf := make([]byte, shaper.ChunkSize)
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if werr := lim.Wait(context.Background(), int64(n)); werr != nil {
+				return
+			}
+			for off := 0; off < n; {
+				wn, werr := dst.Write(buf[off:n])
+				off += wn
+				if werr != nil {
+					return
+				}
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
 }
 
 // flushTraffic 将指定代理的未落库流量增量写入 DB（离线/定时/关停时调用）
@@ -774,6 +858,10 @@ func (s *Server) flushTraffic(username, proxyID string) {
 	}
 	tr.flushedIn.Store(in)
 	tr.flushedOut.Store(out)
+	// 周期流量配额：本次增量计入该用户当期用量（in+out 合计；web-ui 流量也计入用量，只是永不因超额被拒）
+	if err := s.store.AddQuotaUsage(username, dIn+dOut, time.Now()); err != nil {
+		logx.Warnf("[QUOTA] usage add error: user=%s err=%v", username, err)
+	}
 }
 
 // flushUserTraffic 落库某用户全部代理的流量
@@ -988,6 +1076,15 @@ func (s *Server) handleListUsers(w http.ResponseWriter) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	type quotaResp struct {
+		Enabled  bool   `json:"enabled"`
+		Period   string `json:"period,omitempty"`
+		Used     int64  `json:"used"`
+		Limit    int64  `json:"limit"`
+		StartAt  int64  `json:"startAt"`
+		ResetAt  int64  `json:"resetAt"`
+		Exceeded bool   `json:"exceeded"`
+	}
 	type userResp struct {
 		ID         int64             `json:"id"`
 		Username   string            `json:"username"`
@@ -1000,16 +1097,21 @@ func (s *Server) handleListUsers(w http.ResponseWriter) {
 		PortRanges []store.PortRange `json:"portRanges"`
 		UsedPorts  int               `json:"usedPorts"`
 		GroupID    int64             `json:"groupId"`
+		MaxMbps    int64             `json:"maxMbps"`
+		Quota      *quotaResp        `json:"quota,omitempty"`
 	}
 	list := make([]userResp, 0, len(users))
 	for _, u := range users {
 		_, active := s.isClientActive(u.Username)
 		used, _ := s.store.CountActiveAllocationsByUser(u.Username)
 		item := userResp{ID: u.ID, Username: u.Username, Remark: u.Remark, Status: u.Status, Online: active,
-			MaxPorts: u.MaxPorts, PortRanges: u.PortRanges, UsedPorts: used, GroupID: u.GroupID}
+			MaxPorts: u.MaxPorts, PortRanges: u.PortRanges, UsedPorts: used, GroupID: u.GroupID, MaxMbps: u.MaxMbps}
 		if u.ExpiresAt > 0 {
 			item.ExpireDate = time.Unix(u.ExpiresAt, 0).Format("2006-01-02")
 			item.Expired = userExpired(u)
+		}
+		if st, err := s.store.GetQuotaStatus(u.Username, time.Now()); err == nil && st.Enabled {
+			item.Quota = &quotaResp{Enabled: true, Period: st.Period, Used: st.Used, Limit: st.Limit, StartAt: u.QuotaStart, ResetAt: st.PeriodEnd, Exceeded: st.Exceeded}
 		}
 		list = append(list, item)
 	}
@@ -1019,12 +1121,16 @@ func (s *Server) handleListUsers(w http.ResponseWriter) {
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Username   string            `json:"username"`
-		Remark     string            `json:"remark"`
-		ExpireDate string            `json:"expireDate"`
-		MaxPorts   int               `json:"maxPorts"`
-		PortRanges []store.PortRange `json:"portRanges"`
-		GroupID    int64             `json:"groupId"`
+		Username    string            `json:"username"`
+		Remark      string            `json:"remark"`
+		ExpireDate  string            `json:"expireDate"`
+		MaxPorts    int               `json:"maxPorts"`
+		PortRanges  []store.PortRange `json:"portRanges"`
+		GroupID     int64             `json:"groupId"`
+		MaxMbps     int64             `json:"maxMbps"`
+		QuotaBytes  int64             `json:"quotaBytes"`
+		QuotaPeriod string            `json:"quotaPeriod"`
+		QuotaStart  string            `json:"quotaStart"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1036,38 +1142,42 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"code":2002,"message":"username min 3 chars"}`)
 		return
 	}
-	expiresAt, maxPorts, ranges, err := s.parseUserLimits(req.ExpireDate, req.MaxPorts, req.PortRanges)
+	limits, err := s.parseUserLimits(userLimitsReq{
+		ExpireDate: req.ExpireDate, MaxPorts: req.MaxPorts, PortRanges: req.PortRanges,
+		MaxMbps: req.MaxMbps, QuotaBytes: req.QuotaBytes, QuotaPeriod: req.QuotaPeriod, QuotaStart: req.QuotaStart,
+	})
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
 		return
 	}
 	// 分组：未指定时归根分组；指定了必须存在
-	groupID := req.GroupID
-	if groupID == 0 {
-		if groupID, err = s.store.RootGroupID(); err != nil {
+	limits.GroupID = req.GroupID
+	if limits.GroupID == 0 {
+		if limits.GroupID, err = s.store.RootGroupID(); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintf(w, `{"code":5000,"message":"resolve root group failed"}`)
 			return
 		}
-	} else if _, err := s.store.GetUserGroup(groupID); err != nil {
+	} else if _, err := s.store.GetUserGroup(limits.GroupID); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, `{"code":2002,"message":"分组不存在"}`)
 		return
 	}
 	code, salt, _ := auth.GenerateAuthCode()
 	authCodeHash := auth.HashAuthCode(code, salt)
-	if err := s.store.CreateUser(req.Username, authCodeHash, salt, expiresAt, maxPorts, ranges, groupID); err != nil {
+	if err := s.store.CreateUser(req.Username, authCodeHash, salt, limits); err != nil {
 		w.WriteHeader(http.StatusConflict)
 		fmt.Fprintf(w, `{"code":3001,"message":"username already exists"}`)
 		return
 	}
-	s.audit(r, "user_create", req.Username, fmt.Sprintf("remark=%s expire=%s maxPorts=%d portRanges=%v group=%d", req.Remark, req.ExpireDate, maxPorts, ranges, groupID))
+	s.audit(r, "user_create", req.Username, fmt.Sprintf("remark=%s expire=%s maxPorts=%d portRanges=%v group=%d maxMbps=%d quota=%d/%s",
+		req.Remark, req.ExpireDate, limits.MaxPorts, limits.PortRanges, limits.GroupID, limits.MaxMbps, limits.QuotaBytes, limits.QuotaPeriod))
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"username":"%s","authCode":"%s","remark":"%s"}}`, req.Username, code, req.Remark)
 }
 
-// handleUpdateUser PUT /api/v1/users/{username}：修改有效期/端口数量/用户端口池/所属分组（groupId=0 表示不改分组）。
-// 配置收紧导致现有分配违规（池外或超配额）时踢线重连，seeinps 30s 内按新约束重新分配端口。
+// handleUpdateUser PUT /api/v1/users/{username}：修改有效期/端口配额/用户端口池/带宽限制/周期流量配额/所属分组（groupId=0 表示不改分组）。
+// 配置收紧导致现有分配违规（池外或超配额）时踢线重连；配额下调/周期变更后若当期已超额，立即断除 web-ui 外存量。
 func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	username := r.PathValue("username")
@@ -1078,17 +1188,24 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ExpireDate string            `json:"expireDate"`
-		MaxPorts   int               `json:"maxPorts"`
-		PortRanges []store.PortRange `json:"portRanges"`
-		GroupID    int64             `json:"groupId"`
+		ExpireDate  string            `json:"expireDate"`
+		MaxPorts    int               `json:"maxPorts"`
+		PortRanges  []store.PortRange `json:"portRanges"`
+		GroupID     int64             `json:"groupId"`
+		MaxMbps     int64             `json:"maxMbps"`
+		QuotaBytes  int64             `json:"quotaBytes"`
+		QuotaPeriod string            `json:"quotaPeriod"`
+		QuotaStart  string            `json:"quotaStart"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, `{"code":2001,"message":"invalid request"}`)
 		return
 	}
-	expiresAt, maxPorts, ranges, err := s.parseUserLimits(req.ExpireDate, req.MaxPorts, req.PortRanges)
+	limits, err := s.parseUserLimits(userLimitsReq{
+		ExpireDate: req.ExpireDate, MaxPorts: req.MaxPorts, PortRanges: req.PortRanges,
+		MaxMbps: req.MaxMbps, QuotaBytes: req.QuotaBytes, QuotaPeriod: req.QuotaPeriod, QuotaStart: req.QuotaStart,
+	})
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, `{"code":2002,"message":%q}`, err.Error())
@@ -1108,21 +1225,32 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		}
 		groupChanged = true
 	}
-	if err := s.store.UpdateUserLimits(username, expiresAt, maxPorts, ranges); err != nil {
+	// 配额统计窗口（周期类型/起始日）变化 → 当期用量清零重计；仅改上下限则保留已用量
+	quotaWindowChanged := limits.QuotaPeriod != user.QuotaPeriod || (limits.QuotaPeriod != "" && limits.QuotaStart != user.QuotaStart)
+	if err := s.store.UpdateUserLimits(username, limits); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, `{"code":5000,"message":"update failed"}`)
 		return
 	}
+	if quotaWindowChanged {
+		s.store.ResetQuotaUsage(username)
+		s.markQuotaEnforced(username, false)
+	}
+	// 带宽即时生效（在线共享桶 SetRate；离线用户在下次 ALLOC 时同步）
+	s.syncUserLimiter(username, limits.MaxMbps)
+	// 配额收紧/窗口清零后即时判定超额（新上限已被超过 → 立即断存量并推送提醒）
+	s.refreshQuotaState(username)
 	allocs, _ := s.store.GetAllocationsByUser(username)
-	overQuota := maxPorts > 0 && len(allocs) > maxPorts
-	outsidePool := len(ranges) > 0 && !allocsInRanges(allocs, ranges)
+	overQuota := limits.MaxPorts > 0 && len(allocs) > limits.MaxPorts
+	outsidePool := len(limits.PortRanges) > 0 && !allocsInRanges(allocs, limits.PortRanges)
 	kicked := false
 	if overQuota || outsidePool {
 		s.kickClient(username, "user_config_changed")
 		kicked = true
 	}
-	logx.Infof("[USER] updated: user=%s expire=%s maxPorts=%d ranges=%v group=%d kicked=%v", username, req.ExpireDate, maxPorts, ranges, req.GroupID, kicked)
-	s.audit(r, "user_update", username, fmt.Sprintf("expire=%s maxPorts=%d portRanges=%v group=%d groupChanged=%v kicked=%v", req.ExpireDate, maxPorts, ranges, req.GroupID, groupChanged, kicked))
+	logx.Infof("[USER] updated: user=%s expire=%s maxPorts=%d ranges=%v group=%d maxMbps=%d quota=%d/%s windowReset=%v kicked=%v", username, req.ExpireDate, limits.MaxPorts, limits.PortRanges, req.GroupID, limits.MaxMbps, limits.QuotaBytes, limits.QuotaPeriod, quotaWindowChanged, kicked)
+	s.audit(r, "user_update", username, fmt.Sprintf("expire=%s maxPorts=%d portRanges=%v group=%d groupChanged=%v maxMbps=%d quotaBytes=%d quotaPeriod=%s quotaStart=%s windowReset=%v kicked=%v",
+		req.ExpireDate, limits.MaxPorts, limits.PortRanges, req.GroupID, groupChanged, limits.MaxMbps, limits.QuotaBytes, limits.QuotaPeriod, req.QuotaStart, quotaWindowChanged, kicked))
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"kicked":%v}}`, kicked)
 }
 
@@ -1295,51 +1423,94 @@ func (s *Server) handleUsersBatchMoveGroup(w http.ResponseWriter, r *http.Reques
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"moved":%d}}`, moved)
 }
 
-// parseUserLimits 校验并归一化用户配置：有效期（YYYY-MM-DD，取当天 23:59:59 本地时间，留空=不过期）、
-// 端口数量配额（0=不限）、用户端口池（自动合并重叠段；每段必须完整落在总端口池某一段内；
-// 配置了配额时用户池总跨度不得超过配额）
-func (s *Server) parseUserLimits(expireDate string, maxPorts int, portRanges []store.PortRange) (int64, int, []store.PortRange, error) {
-	var expiresAt int64
-	if expireDate != "" {
-		t, err := time.ParseInLocation("2006-01-02", expireDate, time.Local)
+// userLimitsReq 用户创建/编辑请求中的限制相关字段（带宽与配额均为可选：0/空=不限）。
+// quotaBytes 单位字节（前端由 GB 换算）；quotaStart 为 YYYY-MM-DD（空=配额启用时取本月 1 号）。
+type userLimitsReq struct {
+	ExpireDate  string            `json:"expireDate"`
+	MaxPorts    int               `json:"maxPorts"`
+	PortRanges  []store.PortRange `json:"portRanges"`
+	MaxMbps     int64             `json:"maxMbps"`
+	QuotaBytes  int64             `json:"quotaBytes"`
+	QuotaPeriod string            `json:"quotaPeriod"`
+	QuotaStart  string            `json:"quotaStart"`
+}
+
+// parseUserLimits 校验并归一化全部用户限制配置，返回存储层 UserLimits（不含 GroupID，由调用方补充）
+func (s *Server) parseUserLimits(req userLimitsReq) (store.UserLimits, error) {
+	var limits store.UserLimits
+	if req.ExpireDate != "" {
+		t, err := time.ParseInLocation("2006-01-02", req.ExpireDate, time.Local)
 		if err != nil {
-			return 0, 0, nil, fmt.Errorf("有效期格式应为 YYYY-MM-DD")
+			return limits, fmt.Errorf("有效期格式应为 YYYY-MM-DD")
 		}
-		expiresAt = t.Add(23*time.Hour + 59*time.Minute + 59*time.Second).Unix()
+		limits.ExpiresAt = t.Add(23*time.Hour + 59*time.Minute + 59*time.Second).Unix()
 	}
-	if maxPorts < 0 {
-		return 0, 0, nil, fmt.Errorf("端口数量不能为负数")
+	if req.MaxPorts < 0 {
+		return limits, fmt.Errorf("端口数量不能为负数")
 	}
-	if len(portRanges) == 0 {
-		return expiresAt, maxPorts, nil, nil
-	}
-	merged, err := normalizeRanges(portRanges)
-	if err != nil {
-		return 0, 0, nil, err
-	}
-	global := s.portPool.GetRanges()
-	for _, rg := range merged {
-		covered := false
-		for _, g := range global {
-			if rg.Start >= g.Start && rg.End <= g.End {
-				covered = true
-				break
+	limits.MaxPorts = req.MaxPorts
+	if len(req.PortRanges) > 0 {
+		merged, err := normalizeRanges(req.PortRanges)
+		if err != nil {
+			return limits, err
+		}
+		global := s.portPool.GetRanges()
+		for _, rg := range merged {
+			covered := false
+			for _, g := range global {
+				if rg.Start >= g.Start && rg.End <= g.End {
+					covered = true
+					break
+				}
+			}
+			if !covered {
+				return limits, fmt.Errorf("用户端口池 %d-%d 不在总端口池范围内", rg.Start, rg.End)
 			}
 		}
-		if !covered {
-			return 0, 0, nil, fmt.Errorf("用户端口池 %d-%d 不在总端口池范围内", rg.Start, rg.End)
+		if req.MaxPorts > 0 {
+			span := 0
+			for _, rg := range merged {
+				span += rg.End - rg.Start + 1
+			}
+			if span > req.MaxPorts {
+				return limits, fmt.Errorf("用户端口池共 %d 个端口，超过端口数量配额 %d", span, req.MaxPorts)
+			}
 		}
+		limits.PortRanges = merged
 	}
-	if maxPorts > 0 {
-		span := 0
-		for _, rg := range merged {
-			span += rg.End - rg.Start + 1
-		}
-		if span > maxPorts {
-			return 0, 0, nil, fmt.Errorf("用户端口池共 %d 个端口，超过端口数量配额 %d", span, maxPorts)
-		}
+	// 带宽限制（Mbps，0=不限；上限 100Gbps 防呆）
+	if req.MaxMbps < 0 || req.MaxMbps > 100000 {
+		return limits, fmt.Errorf("带宽限制需为 0~100000 Mbps（0=不限）")
 	}
-	return expiresAt, maxPorts, merged, nil
+	limits.MaxMbps = req.MaxMbps
+	// 周期流量配额
+	switch req.QuotaPeriod {
+	case "", "month", "quarter", "year":
+	default:
+		return limits, fmt.Errorf("流量周期仅支持 月/季/年")
+	}
+	if req.QuotaBytes < 0 {
+		return limits, fmt.Errorf("总流量上限不能为负数")
+	}
+	if req.QuotaBytes > 0 {
+		if req.QuotaPeriod == "" {
+			return limits, fmt.Errorf("设置总流量上限时必须选择统计周期")
+		}
+		if req.QuotaStart != "" {
+			t, err := time.ParseInLocation("2006-01-02", req.QuotaStart, time.Local)
+			if err != nil {
+				return limits, fmt.Errorf("流量起始日期格式应为 YYYY-MM-DD")
+			}
+			limits.QuotaStart = t.Unix()
+		} else {
+			// 默认：本月 1 号 0 点（周期建议口径）
+			now := time.Now()
+			limits.QuotaStart = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.Local).Unix()
+		}
+		limits.QuotaBytes = req.QuotaBytes
+		limits.QuotaPeriod = req.QuotaPeriod
+	}
+	return limits, nil
 }
 
 // allocsInRanges 判断全部分配是否都在给定范围集合内
@@ -1370,6 +1541,11 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+	// 清理内存态：共享令牌桶与超额标记（DB 侧 user_quota_usage 已随 DeleteUser 级联删除）
+	s.shapersMu.Lock()
+	delete(s.shapers, username)
+	s.shapersMu.Unlock()
+	s.markQuotaEnforced(username, false)
 	s.audit(r, "user_delete", username, "")
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
@@ -2263,7 +2439,12 @@ func (s *Server) handleHeartbeat(stream net.Conn, client *Client) {
 			s.clientsMu.Lock()
 			client.lastPing = time.Now()
 			s.clientsMu.Unlock()
-			client.writeControl(protocol.NewResponse(msg, protocol.CodeOK, nil))
+			// 配额状态随心跳响应下发（B 端缓存后在 web 页展示进度/重置日期/超额提醒）
+			var qdata interface{}
+			if st, err := s.store.GetQuotaStatus(client.username, time.Now()); err == nil && st.Enabled {
+				qdata = quotaDataOf(st)
+			}
+			client.writeControl(protocol.NewResponse(msg, protocol.CodeOK, qdata))
 		case protocol.TypeAllocPort:
 			s.handleAllocPort(msg, client)
 		case protocol.TypeReleasePort:
@@ -2375,6 +2556,14 @@ func (s *Server) handleAllocPort(msg *protocol.Message, client *Client) {
 		client.writeControl(protocol.NewResponse(msg, protocol.CodeSessionRevoked, map[string]string{"reason": "user_expired"}))
 		return
 	}
+	// 周期流量配额：超额时除 web-ui 外一律拒绝新建（B 端转入低速重试，下一周期自动恢复）
+	if d.ProxyID != webUIProxyID && s.store.QuotaExceeded(client.username, time.Now()) {
+		logx.Warnf("[ALLOC] rejected, traffic quota exceeded: proxy=%s user=%s", d.ProxyID, client.username)
+		client.writeControl(protocol.NewResponse(msg, protocol.CodeTrafficQuotaExceeded, map[string]string{"reason": "traffic_quota"}))
+		return
+	}
+	// 同步用户带宽限速（对象共享，SetRate 对存量转发即时生效）
+	s.syncUserLimiter(client.username, user.MaxMbps)
 	// 端口数量配额：仅对"新分配"生效，代理重连的端口复用不受限
 	if user.MaxPorts > 0 {
 		if _, err := s.store.GetPortByUserProxy(client.username, d.ProxyID); err != nil {
@@ -2478,6 +2667,109 @@ func (s *Server) stopUserForwarding(username string) {
 		s.flushTraffic(a.UserID, a.ProxyID)
 		if err := s.store.MarkProxyOffline(a.UserID, a.ProxyID); err != nil {
 			logx.Warnf("[USER] mark proxy offline error: %v", err)
+		}
+	}
+}
+
+// stopUserForwardingExceptWebUI 停用该用户除 web-ui 外的全部公网转发（周期流量超额时）：
+// 端口预留保留，管理页 web-ui 不受影响以便用户查看用量；seeinps 对断开的代理转入低速重试。
+func (s *Server) stopUserForwardingExceptWebUI(username string) {
+	allocs, err := s.store.GetAllocationsByUser(username)
+	if err != nil {
+		logx.Warnf("[QUOTA] stop forwarding error: user=%s err=%v", username, err)
+		return
+	}
+	for _, a := range allocs {
+		if a.ProxyID == webUIProxyID {
+			continue
+		}
+		s.stopPublicListener(a.Port)
+		s.flushTraffic(a.UserID, a.ProxyID)
+		if err := s.store.MarkProxyOffline(a.UserID, a.ProxyID); err != nil {
+			logx.Warnf("[QUOTA] mark proxy offline error: %v", err)
+		}
+	}
+}
+
+// quotaDataOf 存储层快照 → 控制协议载荷
+func quotaDataOf(st store.QuotaStatus) *protocol.QuotaStatusData {
+	return &protocol.QuotaStatusData{
+		Enabled: st.Enabled, Period: st.Period, Used: st.Used, Limit: st.Limit,
+		PeriodStart: st.PeriodStart, PeriodEnd: st.PeriodEnd, Exceeded: st.Exceeded,
+	}
+}
+
+// pushQuotaStatus 向在线 B 端即时推送一次配额状态（状态跃迁时用；常态由心跳响应携带）
+func (s *Server) pushQuotaStatus(username string, st store.QuotaStatus) {
+	s.clientsMu.RLock()
+	c, ok := s.clients[username]
+	s.clientsMu.RUnlock()
+	if !ok || c.controlStream == nil {
+		return
+	}
+	c.writeControl(protocol.NewMessage(protocol.TypeQuotaStatus, quotaDataOf(st)))
+}
+
+// isQuotaEnforced / markQuotaEnforced 维护“本周期已因超额断过存量”标记，防重复触发并支持恢复检测
+func (s *Server) isQuotaEnforced(username string) bool {
+	s.quotaMu.Lock()
+	defer s.quotaMu.Unlock()
+	return s.quotaEnforced[username]
+}
+
+func (s *Server) markQuotaEnforced(username string, enforced bool) {
+	s.quotaMu.Lock()
+	defer s.quotaMu.Unlock()
+	if enforced {
+		s.quotaEnforced[username] = true
+	} else {
+		delete(s.quotaEnforced, username)
+	}
+}
+
+// refreshQuotaState 处理单个用户的配额状态跃迁：
+// 首次超额 → 断开除 web-ui 外全部存量转发 + 审计 + 即时推送；
+// 周期滚动/上调上限后恢复 → 清标记 + 推送（B 端低速重试自动重建代理）。
+// 由 quotaWatcher 周期调用（在线用户），也在管理员编辑配额保存后立即调用。
+func (s *Server) refreshQuotaState(username string) {
+	st, err := s.store.GetQuotaStatus(username, time.Now())
+	if err != nil {
+		return
+	}
+	exceeded := st.Enabled && st.Exceeded
+	enforced := s.isQuotaEnforced(username)
+	if exceeded && !enforced {
+		s.markQuotaEnforced(username, true)
+		logx.Warnf("[QUOTA] exceeded, stopping non-web-ui forwarding: user=%s used=%d limit=%d period=%s", username, st.Used, st.Limit, st.Period)
+		s.stopUserForwardingExceptWebUI(username)
+		s.store.InsertAuditLog(username, "user_quota_exceeded", "", fmt.Sprintf("used=%d limit=%d period=%s", st.Used, st.Limit, st.Period))
+		s.pushQuotaStatus(username, st)
+	} else if !exceeded && enforced {
+		s.markQuotaEnforced(username, false)
+		logx.Infof("[QUOTA] recovered (period rolled or limit raised), forwarding may resume: user=%s used=%d limit=%d", username, st.Used, st.Limit)
+		s.store.InsertAuditLog(username, "user_quota_recovered", "", fmt.Sprintf("used=%d limit=%d", st.Used, st.Limit))
+		s.pushQuotaStatus(username, st)
+	}
+}
+
+// quotaWatcher 每 30s 对在线用户做配额状态跃迁检测（在线跑超即时断存量；周期滚动自动恢复）
+func (s *Server) quotaWatcher(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		s.clientsMu.RLock()
+		usernames := make([]string, 0, len(s.clients))
+		for u := range s.clients {
+			usernames = append(usernames, u)
+		}
+		s.clientsMu.RUnlock()
+		for _, u := range usernames {
+			s.refreshQuotaState(u)
 		}
 	}
 }

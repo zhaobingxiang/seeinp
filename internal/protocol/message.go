@@ -40,6 +40,9 @@ const (
 	TypeVersionListResp = "VERSION_LIST_RESP"
 	TypeVersionPullReq  = "VERSION_PULL_REQ"
 	TypeVersionPullResp = "VERSION_PULL_RESP"
+	// 周期流量配额（2026-09）：A 端把用户配额状态推给 B 端缓存，供 seeinps web 页面展示进度/重置日期/超额告警。
+	// 常态随心跳响应携带；超额/重置等状态跃迁时经 QUOTA_STATUS 主动推送一次。
+	TypeQuotaStatus = "QUOTA_STATUS"
 )
 
 // Stream types for data channel
@@ -63,11 +66,12 @@ const (
 	CodeProxyDisabled       = 1006
 	CodeBadRequest          = 2000
 	CodeUnsupportedType     = 2001
-	CodePortConflict        = 3001
-	CodePortPoolExhausted   = 3002
-	CodePortOutOfRange      = 3003
-	CodeProxyLimit          = 3004
-	CodeBandwidthExceeded   = 3005
+	CodePortConflict         = 3001
+	CodePortPoolExhausted    = 3002
+	CodePortOutOfRange       = 3003
+	CodeProxyLimit           = 3004
+	CodeBandwidthExceeded    = 3005 // 预留：带宽超限走令牌桶节流，不产生拒绝码
+	CodeTrafficQuotaExceeded = 3006 // 周期总流量达上限：ALLOC 拒绝新建（web-ui 除外）
 )
 
 // Message is the common envelope for all control messages
@@ -116,6 +120,18 @@ type AllocPortData struct {
 type AllocPortRespData struct {
 	ProxyID string `json:"proxyId"`
 	Port    int    `json:"port"`
+}
+
+// QuotaStatusData 是 A 端同步给 B 端的周期流量配额快照（心跳响应携带 / QUOTA_STATUS 推送）。
+// 字节为 in+out 合计；Limit=0 或 Enabled=false 表示不限。
+type QuotaStatusData struct {
+	Enabled     bool   `json:"enabled"`
+	Period      string `json:"period,omitempty"`
+	Used        int64  `json:"used"`
+	Limit       int64  `json:"limit"`
+	PeriodStart int64  `json:"periodStart"`
+	PeriodEnd   int64  `json:"periodEnd"`
+	Exceeded    bool   `json:"exceeded"`
 }
 
 // ReleasePortData is the payload for RELEASE_PORT message

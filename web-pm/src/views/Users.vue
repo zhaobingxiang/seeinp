@@ -77,6 +77,22 @@
               </span>
             </template>
           </el-table-column>
+          <el-table-column label="带宽" width="95">
+            <template #default="{row}">
+              <span v-if="row.maxMbps > 0">{{ row.maxMbps }} Mbps</span>
+              <span v-else style="color:var(--app-text-tertiary)">不限</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="流量周期" min-width="160">
+            <template #default="{row}">
+              <template v-if="row.quota && row.quota.enabled">
+                <span>{{ fmtGB(row.quota.used) }} / {{ fmtGB(row.quota.limit) }}</span>
+                <el-tag v-if="row.quota.exceeded" type="danger" size="small" style="margin-left:4px">超额停用</el-tag>
+                <div class="cell-sub">{{ periodShort(row.quota.period) }} {{ fmtDate(row.quota.resetAt) }} 重置</div>
+              </template>
+              <span v-else style="color:var(--app-text-tertiary)">不限</span>
+            </template>
+          </el-table-column>
           <el-table-column label="用户端口池" min-width="150">
             <template #default="{row}">
               <span v-if="row.portRanges && row.portRanges.length" style="font-family:var(--font-mono,monospace)">
@@ -116,6 +132,27 @@
         <el-form-item label="端口数量">
           <el-input-number v-model="form.maxPorts" :min="0" :max="65535" controls-position="right" style="width:100%" />
           <div class="form-tip">该用户最多可同时占用的转发端口数，0 表示不限制；超配额后新代理无法分配端口</div>
+        </el-form-item>
+        <el-form-item label="带宽限制">
+          <el-input-number v-model="form.maxMbps" :min="0" :max="100000" controls-position="right" style="width:100%" />
+          <div class="form-tip">Mbps，该用户全部代理共享的瞬时带宽上限（入+出合计），0 表示不限制；web-ui 管理代理不受限速</div>
+        </el-form-item>
+        <el-form-item label="总流量限制">
+          <div style="width:100%">
+            <el-input-number v-model="form.quotaGB" :min="0" :max="102400" :precision="1" controls-position="right" style="width:100%" @change="onQuotaGBChange" />
+            <div v-if="form.quotaGB > 0" class="quota-row">
+              <el-select v-model="form.quotaPeriod" style="width:110px">
+                <el-option label="按月" value="month" />
+                <el-option label="按季度" value="quarter" />
+                <el-option label="按年" value="year" />
+              </el-select>
+              <el-date-picker v-model="form.quotaStart" type="date" value-format="YYYY-MM-DD" placeholder="起始日期（默认本月1日，0点重置）" style="flex:1" />
+            </div>
+            <div class="form-tip">周期内总流量（入+出）上限，单位 GB，0 表示不限制；达上限自动停用除 web-ui 外的代理，周期滚动后恢复。起始日为第一个周期起点，此后按同日期 0 点滚动重置</div>
+            <div v-if="editing && editing.quota && editing.quota.enabled" class="form-tip">
+              本周期已用 {{ fmtGB(editing.quota.used) }} / {{ fmtGB(editing.quota.limit) }}，{{ periodShort(editing.quota.period) }} {{ fmtDate(editing.quota.resetAt) }} 重置<span v-if="editing.quota.exceeded" style="color:var(--el-color-danger)">（已超额停用）</span>
+            </div>
+          </div>
         </el-form-item>
         <el-form-item label="用户端口池" prop="portRanges">
           <div style="width:100%">
@@ -292,8 +329,28 @@ const sortedUsers = computed(() => {
 
 const pageUsers = computed(() => sortedUsers.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
 
+// ===== 带宽 / 周期流量展示辅助 =====
+const GB = 1024 * 1024 * 1024
+const fmtGB = (bytes: number) => {
+  if (!bytes || bytes <= 0) return '0 GB'
+  const gb = bytes / GB
+  return gb >= 100 ? `${Math.round(gb)} GB` : `${Math.round(gb * 10) / 10} GB`
+}
+const fmtDate = (unixSec: number) => {
+  const d = new Date(unixSec * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+const periodShort = (p: string) => ({ month: "按月", quarter: "按季", year: "按年" } as Record<string, string>)[p] || "周期"
+// 表单开启流量上限时给默认统计周期（按月）
+const onQuotaGBChange = (v: number) => {
+  if (v > 0 && !form.quotaPeriod) form.quotaPeriod = 'month'
+  if (v <= 0) { form.quotaPeriod = ''; form.quotaStart = '' }
+}
+
 const form = reactive({
   username: "", remark: "", expireDate: "", maxPorts: 0, groupId: 0,
+  maxMbps: 0, quotaGB: 0, quotaPeriod: "", quotaStart: "",
   portRanges: [] as { start: number; end: number }[]
 })
 
@@ -322,15 +379,20 @@ const loadGlobalRanges = async () => { try { const res: any = await portApi.getP
 
 const openCreate = () => {
   editing.value = null
-  Object.assign(form, { username: "", remark: "", expireDate: "", maxPorts: 0, groupId: rootGroupId.value, portRanges: [] })
+  Object.assign(form, { username: "", remark: "", expireDate: "", maxPorts: 0, groupId: rootGroupId.value, maxMbps: 0, quotaGB: 0, quotaPeriod: "", quotaStart: "", portRanges: [] })
   showEdit.value = true
 }
 const openEdit = (row: any) => {
   editing.value = row
+  const q = row.quota && row.quota.enabled ? row.quota : null
   Object.assign(form, {
     username: row.username, remark: row.remark || "",
     expireDate: row.expireDate || "", maxPorts: row.maxPorts || 0,
     groupId: row.groupId || rootGroupId.value,
+    maxMbps: row.maxMbps || 0,
+    quotaGB: q ? Math.round((q.limit / GB) * 10) / 10 : 0,
+    quotaPeriod: q ? q.period : "",
+    quotaStart: q && q.startAt ? fmtDate(q.startAt) : "",
     portRanges: (row.portRanges || []).map((r: any) => ({ start: r.start, end: r.end }))
   })
   showEdit.value = true
@@ -342,10 +404,17 @@ const handleSave = async () => {
   await formRef.value.validate(async (valid) => {
     if (!valid) return
     saving.value = true
+    const limitPayload = {
+      expireDate: form.expireDate || "", maxPorts: form.maxPorts, portRanges: form.portRanges,
+      maxMbps: form.maxMbps || 0,
+      quotaBytes: form.quotaGB > 0 ? Math.round(form.quotaGB * 1024 * 1024 * 1024) : 0,
+      quotaPeriod: form.quotaGB > 0 ? form.quotaPeriod : "",
+      quotaStart: form.quotaGB > 0 ? form.quotaStart : ""
+    }
     try {
       if (editing.value) {
         const res: any = await userApi.update(editing.value.username, {
-          expireDate: form.expireDate || "", maxPorts: form.maxPorts, portRanges: form.portRanges, groupId: form.groupId
+          ...limitPayload, groupId: form.groupId
         })
         if (res.code === 0) {
           ElMessage.success(res.data?.kicked ? "已保存，配置收紧已断开该用户连接，将按新配置自动恢复" : "保存成功")
@@ -355,7 +424,7 @@ const handleSave = async () => {
       } else {
         const res: any = await userApi.create({
           username: form.username, remark: form.remark,
-          expireDate: form.expireDate || "", maxPorts: form.maxPorts, portRanges: form.portRanges, groupId: form.groupId
+          ...limitPayload, groupId: form.groupId
         })
         if (res.code === 0) {
           createdAuthCode.value = res.data.authCode; authCodeIsNew.value = false; showEdit.value = false; showAuthCode.value = true; loadUsers(); loadGroups(); ElMessage.success("创建成功")
@@ -492,5 +561,18 @@ onMounted(() => { loadUsers(); loadGlobalRanges(); loadGroups() })
 
 .range-sep {
   color: var(--app-text-tertiary);
+}
+
+.quota-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  width: 100%;
+}
+
+.cell-sub {
+  font-size: 12px;
+  color: var(--app-text-tertiary);
+  line-height: 1.4;
 }
 </style>
