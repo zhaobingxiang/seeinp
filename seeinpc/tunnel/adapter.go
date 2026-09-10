@@ -37,13 +37,18 @@ func ConfigureAddress(ip, mask string) error {
 		"name="+AdapterName, "source=static", "address="+ip, "mask="+mask))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		if hasAddress(ip) {
+			lg.Debugf("configure address: %s already present, netsh reported %v (idempotent, ok)", ip, err)
 			return nil
 		}
+		// netsh 失败后降级 PowerShell：记录降级原因，便于排查版本差异导致的命令不兼容
+		lg.Debugf("configure address: netsh failed, falling back to powershell: %v (%s)",
+			err, strings.TrimSpace(decodeGBK(out)))
 		ps := fmt.Sprintf("New-NetIPAddress -InterfaceAlias '%s' -IPAddress %s -PrefixLength %d -ErrorAction Stop",
 			AdapterName, ip, maskToPrefix(mask))
 		cmd2 := noWindow(exec.Command("powershell", "-NoProfile", "-Command", ps))
 		if out2, err2 := cmd2.CombinedOutput(); err2 != nil {
 			if hasAddress(ip) {
+				lg.Debugf("configure address: %s already present after powershell failure (idempotent, ok)", ip)
 				return nil
 			}
 			return fmt.Errorf("配置网卡地址失败: netsh=%v(%s) powershell=%v(%s)",

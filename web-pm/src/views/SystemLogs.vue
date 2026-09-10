@@ -18,19 +18,19 @@
             <el-option :value="2000" label="2000 行" />
           </el-select>
           <el-button type="primary" @click="loadContent" :loading="loadingContent">刷新</el-button>
-          <template v-if="source === '__local__'">
+          <template v-if="source === '__local__' || selectedClientOnline">
             <span class="filter-label">日志级别：</span>
-            <el-select v-model="logLevel" style="width:110px" @change="onLevelChange">
+            <el-select v-model="logLevel" style="width:110px">
               <el-option v-for="lv in ['debug','info','warn','error']" :key="lv" :label="lv.toUpperCase()" :value="lv" />
             </el-select>
-            <el-button type="warning" plain :loading="changingLevel" @click="onLevelChange">保存</el-button>
+            <el-button :type="source === '__local__' ? 'warning' : 'primary'" plain :loading="changingLevel" @click="onLevelChange">保存级别</el-button>
           </template>
-          <el-tooltip :content="source === '__local__' ? 'seeinpm（中心端）运行日志级别' : '该 seeinps（服务端）的日志级别请在对应 seeinps 管理台设置'" placement="top">
+          <el-tooltip :content="levelHint" placement="top">
             <span class="level-hint">{{ levelHint }}</span>
           </el-tooltip>
         </div>
         <div class="tools">
-          <el-button type="success" :disabled="!currentFile" @click="download">下载日志</el-button>
+          <el-button type="success" :disabled="!currentFile || downloading" :loading="downloading" @click="download">下载日志</el-button>
         </div>
       </div>
       <el-alert v-if="source !== '__local__' && !loadingFiles && !hasFiles" type="warning" :closable="false" show-icon
@@ -69,9 +69,13 @@ const clients = ref<any[]>([])
 const hasFiles = computed(() => files.value.length > 0)
 const logLevel = ref("info")
 const changingLevel = ref(false)
+const downloading = ref(false)
+const selectedClientOnline = computed(() =>
+  source.value !== "__local__" && clients.value.some((c: any) => c.username === source.value))
 const levelHint = computed(() => {
-  if (source.value === "__local__") return "当前级别: " + logLevel.value.toUpperCase()
-  return "seeinps（服务端）级别请至对应 seeinps 管理台修改"
+  if (source.value === "__local__") return "中心端运行日志级别"
+  if (!selectedClientOnline.value) return "该 seeinps 不在线，无法调整级别"
+  return "级别将经控制通道下发到该 seeinps（并记入审计）"
 })
 const formatTime = (ts?: number) => { if (!ts) return "-"; return new Date(ts * 1000).toLocaleString() }
 const formatSize = (n?: number) => {
@@ -103,28 +107,37 @@ const loadFiles = async () => {
     }
   } catch (e) { console.error(e) } finally { loadingFiles.value = false }
 }
-const onSourceChange = () => { loadFiles(); if (source.value === "__local__") loadLogLevel() }
+const onSourceChange = () => { loadFiles(); loadLogLevel() }
 const loadLogLevel = async () => {
-  if (source.value !== "__local__") return
   try {
-    const res: any = await loggingApi.get()
+    if (source.value === "__local__") {
+      const res: any = await loggingApi.get()
+      if (res.code === 0 && res.data?.level) logLevel.value = res.data.level
+      return
+    }
+    if (!selectedClientOnline.value) return
+    const res: any = await psLogApi.getLevel(source.value)
     if (res.code === 0 && res.data?.level) logLevel.value = res.data.level
   } catch (e) { console.error(e) }
 }
 const onLevelChange = async () => {
-  if (source.value !== "__local__") return
   const lv = logLevel.value
   if (!["debug", "info", "warn", "error"].includes(lv)) return
   changingLevel.value = true
   try {
-    const res: any = await loggingApi.set(lv)
+    const res: any = source.value === "__local__"
+      ? await loggingApi.set(lv)
+      : await psLogApi.setLevel(source.value, lv)
     if (res.code === 0) {
-      ElMessage.success(`日志级别已修改为 ${lv.toUpperCase()}`)
+      ElMessage.success(source.value === "__local__"
+        ? `日志级别已修改为 ${lv.toUpperCase()}`
+        : `已下发到 seeinps（${source.value}）：${lv.toUpperCase()}`)
     } else {
-      ElMessage.error(res.msg || "修改失败")
+      ElMessage.error(res.message || "修改失败")
     }
-  } catch (e) { console.error(e); ElMessage.error("修改日志级别失败") }
-  finally { changingLevel.value = false }
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.message || "修改日志级别失败")
+  } finally { changingLevel.value = false }
 }
 const selectFile = (name: string) => { currentFile.value = name; loadContent() }
 const loadContent = async () => {
@@ -135,36 +148,46 @@ const loadContent = async () => {
     if (source.value === "__local__") {
       res = await logApi.content(currentFile.value, lines.value, keyword.value || undefined)
     } else {
-      res = await psLogApi.content(source.value, currentFile.value, lines.value)
+      // 关键词也交给服务端过滤（此前只在已拉取的窗口内过滤，搜不全）
+      res = await psLogApi.content(source.value, currentFile.value, lines.value, keyword.value || undefined)
     }
     if (res.code === 0) {
-      let c = res.data.content || "(空)"
-      if (keyword.value && source.value !== "__local__") {
-        c = c.split("\n").filter((ln: string) => ln.includes(keyword.value)).join("\n")
-      }
-      content.value = c
+      content.value = res.data.content || "(空)"
       setTimeout(() => { const el = document.querySelector(".log-content"); if (el) el.scrollTop = el.scrollHeight }, 50)
+    } else {
+      ElMessage.error(res.message || "读取日志失败")
     }
-  } catch (e) { console.error(e) } finally { loadingContent.value = false }
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.message || "读取日志失败")
+  } finally { loadingContent.value = false }
+}
+// 带鉴权的二进制下载：直接 window.open 不会带 Authorization 头，必须先取 blob
+const downloadBlob = async (url: string, filename: string) => {
+  const resp = await fetch(url, { headers: { Authorization: 'Bearer ' + (localStorage.getItem('pm_token') || '') } })
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  const blob = await resp.blob()
+  const a = document.createElement("a")
+  a.href = URL.createObjectURL(blob)
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(a.href)
 }
 const download = async () => {
   if (!currentFile.value) return
-  if (source.value === "__local__") {
-    try {
-      const resp = await fetch(`/api/v1/logs/content?file=${encodeURIComponent(currentFile.value)}&download=1`, {
-        headers: { Authorization: 'Bearer ' + (localStorage.getItem('pm_token') || '') }
-      })
-      if (!resp.ok) return
-      const blob = await resp.blob()
-      const a = document.createElement("a")
-      a.href = URL.createObjectURL(blob)
-      a.download = currentFile.value
-      a.click()
-      URL.revokeObjectURL(a.href)
-    } catch (e) { console.error(e) }
-  } else {
-    alert("seeinps（服务端）运行日志请登录对应 seeinps 管理台下载")
-  }
+  downloading.value = true
+  try {
+    if (source.value === "__local__") {
+      await downloadBlob(
+        `/api/v1/logs/content?file=${encodeURIComponent(currentFile.value)}&download=1`,
+        currentFile.value)
+    } else {
+      // seeinps 运行日志此前必须登录 PS 管理台才能下载；PM 已具备经控制通道取整文件的能力
+      await downloadBlob(psLogApi.downloadUrl(source.value, currentFile.value), currentFile.value)
+    }
+    ElMessage.success("已开始下载")
+  } catch (e: any) {
+    ElMessage.error(e?.message || "下载失败")
+  } finally { downloading.value = false }
 }
 const renderContent = () => {
   if (!content.value) return content.value || "选择左侧文件查看日志"
@@ -172,11 +195,12 @@ const renderContent = () => {
   const color = (lv: string) => ({
     debug: "#9aa6b2", info: "#d4d4d4", warn: "#e6a700", error: "#f56c6c", fatal: "#f56c6c"
   }[lv] || "#d4d4d4")
+  // 级别标记必须锚定在行首（时间戳之后），否则正文里出现 [ERROR] 字样的行会被整行误染
+  const levelRe = /^\d{4}-\d{2}-\d{2} \S+ \[(DEBUG|INFO|WARN|ERROR|FATAL)\]/
   return content.value.split(/\r?\n/).map((ln: string) => {
-    const m = ln.match(/\[(DEBUG|INFO|WARN|ERROR|FATAL)\]/)
-    const colorCode = m ? color(m[1].toLowerCase()) : null
-    if (!colorCode) return esc(ln)
-    return `<span style="color:${colorCode}">${esc(ln)}</span>`
+    const m = ln.match(levelRe)
+    if (!m) return esc(ln)
+    return `<span style="color:${color(m[1].toLowerCase())}">${esc(ln)}</span>`
   }).join("\n")
 }
 onMounted(() => { loadClients(); loadLogLevel(); loadFiles() })

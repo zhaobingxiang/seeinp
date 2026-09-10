@@ -66,6 +66,16 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_audit_logs_source_created ON audit_logs(source, created_at DESC)"); err != nil {
 		return fmt.Errorf("migrate audit_logs index: %w", err)
 	}
+	// v7: 审计投递可靠性——B 端上报带本地自增 id（ext_id），用于重连补传时的幂等去重。
+	// 部分唯一索引（ext_id > 0）避免与 PM 本地记录（ext_id=0）冲突。
+	if _, err := s.db.Exec("ALTER TABLE audit_logs ADD COLUMN ext_id INTEGER NOT NULL DEFAULT 0"); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate audit_logs.ext_id: %w", err)
+		}
+	}
+	if _, err := s.db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS ux_audit_logs_ext ON audit_logs(source, ext_id) WHERE ext_id > 0"); err != nil {
+		return fmt.Errorf("migrate audit_logs ext_id index: %w", err)
+	}
 	// v4: versions 表增加平台维度（goos/goarch），唯一约束扩为 (endpoint, version, goos, goarch)。
 	// SQLite 无法修改表内 UNIQUE，老库检测到旧 schema（无 goos 列）时整表重建，历史行回填 linux/amd64。
 	var hasVersions int
@@ -721,33 +731,17 @@ func (s *Store) InsertAuditLog(username, action, target, detail string) error {
 	return err
 }
 
-// InsertAuditLogFromPS 写入一条由 seeinps 上报的审计记录（source='ps'，保留原始时间）
-func (s *Store) InsertAuditLogFromPS(username, action, target, detail string, createdAt int64) error {
-	_, err := s.db.Exec("INSERT INTO audit_logs (username, action, target, detail, created_at, source) VALUES (?, ?, ?, ?, ?, 'ps')",
-		username, action, target, detail, createdAt)
+// InsertAuditLogFromPS 写入一条由 seeinps 上报的审计记录（source='ps'，保留原始时间）。
+// extID 为 B 端 local_audit_logs.id：重连补传会重复投递同一行，靠 (source, ext_id) 唯一索引
+// 幂等去重（INSERT OR IGNORE），因此该操作天然可重放。
+func (s *Store) InsertAuditLogFromPS(username, action, target, detail string, createdAt, extID int64) error {
+	_, err := s.db.Exec("INSERT OR IGNORE INTO audit_logs (username, action, target, detail, created_at, source, ext_id) VALUES (?, ?, ?, ?, ?, 'ps', ?)",
+		username, action, target, detail, createdAt, extID)
 	return err
 }
 
-// AuditFilter 审计日志查询条件
-type AuditFilter struct {
-	Username  string
-	Action    string
-	Keyword   string // 模糊匹配 username/action/target/detail
-	Source    string // pm / ps / 空=全部
-	StartTime int64  // Unix 秒，0=不限
-	EndTime   int64  // Unix 秒，0=不限
-	Page      int
-	PageSize  int
-}
-
-// ListAuditLogs 分页查询审计日志（按时间倒序），条件为空则不过滤
-func (s *Store) ListAuditLogs(f AuditFilter) ([]*AuditLog, int64, error) {
-	if f.Page < 1 {
-		f.Page = 1
-	}
-	if f.PageSize < 1 || f.PageSize > 200 {
-		f.PageSize = 20
-	}
+// auditWhere 依据过滤条件拼装 WHERE 子句与参数（供分页查询与导出共用）。
+func auditWhere(f AuditFilter) (string, []interface{}) {
 	where := " WHERE 1=1"
 	args := []interface{}{}
 	if f.Username != "" {
@@ -775,6 +769,30 @@ func (s *Store) ListAuditLogs(f AuditFilter) ([]*AuditLog, int64, error) {
 		where += " AND created_at <= ?"
 		args = append(args, f.EndTime)
 	}
+	return where, args
+}
+
+// AuditFilter 审计日志查询条件
+type AuditFilter struct {
+	Username  string
+	Action    string
+	Keyword   string // 模糊匹配 username/action/target/detail
+	Source    string // pm / ps / 空=全部
+	StartTime int64  // Unix 秒，0=不限
+	EndTime   int64  // Unix 秒，0=不限
+	Page      int
+	PageSize  int
+}
+
+// ListAuditLogs 分页查询审计日志（按时间倒序），条件为空则不过滤
+func (s *Store) ListAuditLogs(f AuditFilter) ([]*AuditLog, int64, error) {
+	if f.Page < 1 {
+		f.Page = 1
+	}
+	if f.PageSize < 1 || f.PageSize > 200 {
+		f.PageSize = 20
+	}
+	where, args := auditWhere(f)
 	var total int64
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM audit_logs"+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -795,6 +813,32 @@ func (s *Store) ListAuditLogs(f AuditFilter) ([]*AuditLog, int64, error) {
 		list = append(list, a)
 	}
 	return list, total, rows.Err()
+}
+
+// ExportAuditLogs 按筛选条件一次性取出最多 limit 条审计记录（时间倒序），专供 CSV 导出。
+// 与 ListAuditLogs 分开的原因：分页接口把 PageSize 上限压到 200（防误查全表），
+// 导出若复用该接口就会被静默截断成 20 条（历史的"CSV 永远只有 20 行"缺陷）。
+func (s *Store) ExportAuditLogs(f AuditFilter, limit int) ([]*AuditLog, error) {
+	if limit <= 0 || limit > 200000 {
+		limit = 200000
+	}
+	where, args := auditWhere(f)
+	query := "SELECT id, username, action, target, COALESCE(detail,''), created_at, COALESCE(source,'pm') FROM audit_logs" + where + " ORDER BY id DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []*AuditLog
+	for rows.Next() {
+		a := &AuditLog{}
+		if err := rows.Scan(&a.ID, &a.Username, &a.Action, &a.Target, &a.Detail, &a.CreatedAt, &a.Source); err != nil {
+			return nil, err
+		}
+		list = append(list, a)
+	}
+	return list, rows.Err()
 }
 
 // CleanupAuditLogs 删除 cutoff 之前的审计记录

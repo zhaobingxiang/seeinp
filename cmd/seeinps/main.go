@@ -49,8 +49,17 @@ type Client struct {
 	quotaSyncedAt atomic.Int64
 
 	// rootCtx 为 main 的生命周期 ctx；controlEpoch 用于重绑后重启控制循环并让旧循环退出
-	rootCtx       context.Context
-	controlEpoch  atomic.Int64
+	rootCtx      context.Context
+	controlEpoch atomic.Int64
+
+	// 审计补传：链路不在线时记录留在本地（synced=0），连接恢复后由 auditSyncLoop 补推；
+	// auditPoke 用于新记录落库后立即触发补传，避免等下一个周期。
+	auditPoke     chan struct{}
+	auditLoopOnce sync.Once
+
+	// loginFailAt 登录失败审计的按 IP 节流（防 spraying 刷爆审计表）
+	loginFailMu sync.Mutex
+	loginFailAt map[string]time.Time
 
 	proxiesMu sync.RWMutex
 	proxies   map[string]*Proxy
@@ -237,6 +246,19 @@ func (l *controlLink) readLoop() {
 			}
 			continue
 		}
+		// A 端在线查询/修改 B 端日志级别（LOGGING_GET_REQ / LOGGING_SET_REQ）
+		if msg.Type == protocol.TypeLoggingGetReq {
+			if c := l.client; c != nil {
+				l.send(c.handleLoggingGetReq(msg))
+			}
+			continue
+		}
+		if msg.Type == protocol.TypeLoggingSetReq {
+			if c := l.client; c != nil {
+				l.send(c.handleLoggingSetReq(msg))
+			}
+			continue
+		}
 		// A 端推送升级包（随后经 0x05 数据流传输二进制）
 		if msg.Type == protocol.TypeUpgradePush {
 			if c := l.client; c != nil {
@@ -279,11 +301,13 @@ func (l *controlLink) isClosed() bool {
 
 func NewClient(cfg *config.PSConfig, psStore *store.PSStore, jwt *auth.JWTManager) *Client {
 	return &Client{
-		config:  cfg,
-		store:   psStore,
-		jwt:     jwt,
-		guard:   guard.New(),
-		proxies: make(map[string]*Proxy),
+		config:     cfg,
+		store:      psStore,
+		jwt:        jwt,
+		guard:      guard.New(),
+		proxies:    make(map[string]*Proxy),
+		auditPoke:  make(chan struct{}, 1),
+		loginFailAt: make(map[string]time.Time),
 	}
 }
 
@@ -294,6 +318,9 @@ func (c *Client) setLink(l *controlLink, sessionID string) {
 	c.linkMu.Unlock()
 	// 连接建立即视为一次成功心跳，后续由 heartbeatLoop 每 10s 刷新
 	c.lastPing.Store(time.Now().Unix())
+	// 链路恢复：把断线期间累积的未同步审计补传给 seeinpm（按 id 幂等，可安全重放）
+	c.startAuditSyncLoop()
+	c.pokeAuditSync()
 }
 
 func (c *Client) clearLink(l *controlLink) {
@@ -902,10 +929,14 @@ func startWorker(confPath string) (context.Context, context.CancelFunc, func(), 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// 仅清理已成功同步到 seeinpm 的记录；未同步的是 PM 侧尚未持有的唯一副本
 				if n, err := psStore.CleanupAuditLogs(time.Now().Add(-90 * 24 * time.Hour).Unix()); err != nil {
 					logx.Warnf("[CLEANUP] audit logs cleanup error: %v", err)
 				} else if n > 0 {
-					logx.Infof("[CLEANUP] removed %d audit logs over 90 days", n)
+					logx.Infof("[CLEANUP] removed %d synced audit logs older than 90 days", n)
+				}
+				if pending, perr := psStore.PendingAuditLogs(1); perr == nil && len(pending) > 0 {
+					logx.Warnf("[AUDIT] there are unsynced audit records awaiting seeinpm; they are kept until delivered")
 				}
 			}
 		}

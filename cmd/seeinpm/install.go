@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/seeinp/seeinp/internal/auth"
+	"github.com/seeinp/seeinp/internal/logx"
 	"github.com/seeinp/seeinp/internal/store"
 )
 
@@ -61,11 +62,13 @@ func (s *Server) handlePSReleaseVersions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if _, err := s.verifyUserAuth(username, authCode); err != nil {
+		logx.Warnf("[RELEASE] versions query rejected user=%s ip=%s err=%v", username, clientIP(r), err)
 		writeInstallErr(w, http.StatusUnauthorized, err.Error())
 		return
 	}
 	list, err := s.store.ListVersions("seeinps")
 	if err != nil {
+		logx.Errorf("[RELEASE] versions query failed user=%s err=%v", username, err)
 		writeInstallErr(w, http.StatusInternalServerError, "查询版本失败")
 		return
 	}
@@ -100,6 +103,7 @@ func (s *Server) handlePSReleaseDownload(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if _, err := s.verifyUserAuth(username, authCode); err != nil {
+		logx.Warnf("[RELEASE] download rejected user=%s ip=%s err=%v", username, clientIP(r), err)
 		writeInstallErr(w, http.StatusUnauthorized, err.Error())
 		return
 	}
@@ -111,15 +115,21 @@ func (s *Server) handlePSReleaseDownload(w http.ResponseWriter, r *http.Request)
 		v, err = s.store.GetVersionByName("seeinps", version, goos, goarch)
 	}
 	if err != nil || v == nil {
+		logx.Warnf("[RELEASE] download: package not found user=%s version=%q platform=%s/%s",
+			username, version, goos, goarch)
 		writeInstallErr(w, http.StatusNotFound, "未找到对应平台的 seeinps 安装包")
 		return
 	}
 	f, err := os.Open(filepath.Join(releaseDir, v.Endpoint, v.Version, v.GoOS+"-"+v.GoArch, v.FileName))
 	if err != nil {
+		logx.Errorf("[RELEASE] download: package file missing version=%s file=%s err=%v", v.Version, v.FileName, err)
 		writeInstallErr(w, http.StatusNotFound, "安装包文件缺失")
 		return
 	}
 	defer f.Close()
+	// 免登录接口，此前下载安装包不留任何痕迹：谁在何时取走了哪个版本无法追溯
+	logx.Infof("[RELEASE] downloading seeinps package user=%s version=%s platform=%s/%s size=%d ip=%s",
+		username, v.Version, v.GoOS, v.GoArch, v.FileSize, clientIP(r))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filepath.Base(v.FileName)))
 	w.Header().Set("X-Seeinps-Version", v.Version)

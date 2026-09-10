@@ -23,6 +23,12 @@ path = "logs"
 max_size = 100  # MB
 max_backups = 7
 
+[audit]
+# true = 不可逆/高敏感操作（删除用户、重置授权码、删除升级包）先写审计再执行，
+# 审计落库失败则拒绝该操作，杜绝"动作成功但审计缺失"；代价是 DB 异常时这些操作也会失败。
+# false（默认）= best-effort：审计写入失败记 ERROR 日志，业务照常进行。
+fail_closed = false
+
 [port_pool]
 ranges = [
     { start = 20000, end = 30000 }

@@ -110,11 +110,12 @@ const renderContent = () => {
   const color = (lv: string) => ({
     debug: "#9aa6b2", info: "#d4d4d4", warn: "#e6a700", error: "#f56c6c", fatal: "#f56c6c"
   }[lv] || "#d4d4d4")
+  // 级别标记必须锚定在行首（时间戳之后），否则正文里出现 [ERROR] 字样的行会被整行误染
+  const levelRe = /^\d{4}-\d{2}-\d{2} \S+ \[(DEBUG|INFO|WARN|ERROR|FATAL)\]/
   return content.value.split(/\r?\n/).map((ln: string) => {
-    const m = ln.match(/\[(DEBUG|INFO|WARN|ERROR|FATAL)\]/)
-    const colorCode = m ? color(m[1].toLowerCase()) : null
-    if (!colorCode) return esc(ln)
-    return `<span style="color:${colorCode}">${esc(ln)}</span>`
+    const m = ln.match(levelRe)
+    if (!m) return esc(ln)
+    return `<span style="color:${color(m[1].toLowerCase())}">${esc(ln)}</span>`
   }).join("\n")
 }
 const loadLogLevel = async () => {
@@ -132,10 +133,11 @@ const onLevelChange = async () => {
     if (res.code === 0) {
       ElMessage.success(`日志级别已修改为 ${lv.toUpperCase()}`)
     } else {
-      ElMessage.error(res.msg || "修改失败")
+      ElMessage.error(res.message || "修改失败")
     }
-  } catch (e) { console.error(e); ElMessage.error("修改日志级别失败") }
-  finally { changingLevel.value = false }
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.message || "修改日志级别失败")
+  } finally { changingLevel.value = false }
 }
 onMounted(() => { loadLogLevel(); loadFiles() })
 </script>

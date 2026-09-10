@@ -16,6 +16,7 @@ type PSConfig struct {
 	TLS     PSTLSConfig    `toml:"tls"`
 	Local   PSLocalConfig  `toml:"local"`
 	Logging LoggingConfig  `toml:"logging"`
+	Audit   AuditConfig    `toml:"audit"`
 }
 
 type PSServerConfig struct {

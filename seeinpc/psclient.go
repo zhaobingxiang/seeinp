@@ -194,16 +194,24 @@ func (c *psClient) opsProxies(ctx context.Context, token string) ([]opsProxy, er
 // loginFallback 按固定服务器地址列表逐个尝试登录 seeinps 管理端。
 // seeinps 管理端口（65443）通常不对外映射，仅 web-ui 外部端口可达，服务器地址固定不可填；
 // 仅"连接失败"才回退下一台，登录业务结果（密码错/锁定/验证码）以首台可达者为准。
-func loginFallback(hosts []string, port int, user, pwd, captchaID, captchaText string) (*psClient, *loginResult, error) {
+// 日志约定：逐台尝试记 DEBUG；服务器回退记 WARN（"主服务器不通自动切备用"必须可见）。
+func (a *App) loginFallback(hosts []string, port int, user, pwd, captchaID, captchaText string) (*psClient, *loginResult, error) {
 	var lastErr error
-	for _, h := range hosts {
-		c := newPSClient(net.JoinHostPort(h, strconv.Itoa(port)))
+	for i, h := range hosts {
+		addr := net.JoinHostPort(h, strconv.Itoa(port))
+		a.debugf("[AUTH] login attempt %d/%d server=%s user=%s", i+1, len(hosts), addr, user)
+		c := newPSClient(addr)
 		lr, err := c.login(context.Background(), user, pwd, captchaID, captchaText)
 		if err != nil {
 			lastErr = err
+			if i+1 < len(hosts) {
+				a.logWarnf("[AUTH] login: server %s unreachable, falling back to next server: %v", addr, err)
+			}
 			continue
 		}
+		a.debugf("[AUTH] login attempt answered src=%s ok=%v code_msg=%q", addr, lr.OK, lr.Message)
 		return c, lr, nil
 	}
+	a.logWarnf("[AUTH] login: all servers failed hosts=%v port=%d err=%v", hosts, port, lastErr)
 	return nil, nil, lastErr
 }

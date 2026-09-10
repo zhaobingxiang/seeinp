@@ -70,7 +70,15 @@ export const proxyApi = {
 }
 
 export const auditApi = {
-  list: (params: { username?: string; action?: string; keyword?: string; source?: string; start_time?: number; end_time?: number; page?: number; page_size?: number }) => api.get('/audit-logs', { params })
+  list: (params: { username?: string; action?: string; keyword?: string; source?: string; start_time?: number; end_time?: number; page?: number; page_size?: number }) => api.get('/audit-logs', { params }),
+  // 导出走独立接口：分页接口的 page_size 上限为 200，复用会导致导出的 CSV 被静默截断
+  exportUrl: (params: Record<string, any>) => {
+    const q = new URLSearchParams()
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') q.set(k, String(v))
+    })
+    return '/api/v1/audit-logs/export?' + q.toString()
+  }
 }
 
 export const logApi = {
@@ -87,7 +95,14 @@ export const loggingApi = {
 // 混合架构：经控制通道按需拉取在线 seeinps 的运行日志（不落 PM 存储）
 export const psLogApi = {
   listFiles: (username: string) => api.get('/ps-logs', { params: { username } }),
-  content: (username: string, file: string, lines: number) => api.get('/ps-logs/content', { params: { username, file, lines } })
+  content: (username: string, file: string, lines: number, keyword?: string) =>
+    api.get('/ps-logs/content', { params: { username, file, lines, keyword } }),
+  // 修改在线 seeinps 的日志级别（经控制通道下发，审计记为 via=seeinpm）
+  setLevel: (username: string, level: string) => api.put('/ps-logging', { level }, { params: { username } }),
+  getLevel: (username: string) => api.get('/ps-logging', { params: { username } }),
+  // 整文件下载（服务端返回 attachment；这里只构造 URL，由浏览器直接发起以便流式落盘）
+  downloadUrl: (username: string, file: string) =>
+    '/api/v1/ps-logs/content?' + new URLSearchParams({ username, file, download: '1' }).toString()
 }
 
 export const healthApi = {
@@ -98,7 +113,12 @@ export const clientApi = {
   list: () => api.get('/clients'),
   // 升级请求只等到"通知节点成功"即返回，传输进度经 upgrade-status 轮询
   upgrade: (username: string, versionId: number) => api.post('/clients/' + encodeURIComponent(username) + '/upgrade', { versionId }, { timeout: 30000 }),
-  upgradeStatus: (username: string) => api.get('/clients/' + encodeURIComponent(username) + '/upgrade-status', { timeout: 10000 })
+  upgradeStatus: (username: string) => api.get('/clients/' + encodeURIComponent(username) + '/upgrade-status', { timeout: 10000 }),
+  // 批量升级：创建任务（返回执行计划）、状态轮询、停止（只停未开始的节点）
+  upgradeBatch: (data: any) => api.post('/clients/upgrade-batch', data, { timeout: 30000 }),
+  batches: () => api.get('/upgrade-batches', { timeout: 10000 }),
+  batchStatus: (id: string) => api.get('/upgrade-batch/' + encodeURIComponent(id), { timeout: 10000 }),
+  batchStop: (id: string) => api.post('/upgrade-batch/' + encodeURIComponent(id) + '/stop', {}, { timeout: 10000 })
 }
 
 // 版本管理：大包在慢链路上传可能持续数十分钟，不设客户端超时，进度经 onProgress 回调反馈

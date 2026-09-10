@@ -32,8 +32,65 @@ const (
 	readBatchSize = 8
 )
 
-// LogFunc 日志回调（由上层注入，遵循 logx 规范）
-type LogFunc func(format string, args ...any)
+// 日志模块名统一为 TUNNEL：级别由调用点决定（Debugf/Infof/Warnf/Errorf），
+// 不再用单一回调——否则 engine 内的拨号失败、设备读写错误会被迫落在 INFO 档，
+// 导致 level=error 也压不住真正的错误。
+//
+// Logger 日志接口（由上层注入，遵循 logx 规范）。*logx.Logger 天然满足；
+// seeinpc 注入的实现会同时写磁盘与 App 内存日志，保证两处内容一致。
+type Logger interface {
+	Debugf(format string, args ...any)
+	Infof(format string, args ...any)
+	Warnf(format string, args ...any)
+	Errorf(format string, args ...any)
+}
+
+// nopLogger 未注入日志器时的兜底实现（静默）。
+type nopLogger struct{}
+
+func (nopLogger) Debugf(string, ...any) {}
+func (nopLogger) Infof(string, ...any)  {}
+func (nopLogger) Warnf(string, ...any)  {}
+func (nopLogger) Errorf(string, ...any) {}
+
+// lg 当前生效的日志器。由 SetLogger 在启动早期（任何隧道协程启动之前）注入，
+// 此后不再变更，因此读取无需加锁。
+var lg Logger = nopLogger{}
+
+// SetLogger 注入日志器；应在启动阶段、任何隧道协程启动之前调用。
+func SetLogger(l Logger) {
+	if l != nil {
+		lg = l
+	}
+}
+
+// 限频告警：拨号失败、服务器回退等发生在 per-connection 路径上，
+// 目标不可达时可能每秒触发多次；同一 key 在 window 内只输出首条，避免刷屏。
+var (
+	throttleMu   sync.Mutex
+	throttleLast = map[string]time.Time{}
+)
+
+// warnThrottled 输出限频 WARN：同一 key 在 window 内只输出一次。
+func warnThrottled(key string, window time.Duration, format string, args ...any) {
+	now := time.Now()
+	throttleMu.Lock()
+	if last, ok := throttleLast[key]; ok && now.Sub(last) < window {
+		throttleMu.Unlock()
+		return
+	}
+	throttleLast[key] = now
+	// 简单清理，避免长期运行下 map 无限增长
+	if len(throttleLast) > 512 {
+		for k, t := range throttleLast {
+			if now.Sub(t) > window {
+				delete(throttleLast, k)
+			}
+		}
+	}
+	throttleMu.Unlock()
+	lg.Warnf(format, args...)
+}
 
 // Engine 隧道引擎：wintun 设备 ↔ gVisor netstack，TCP 流量经 dial 转发到上游代理。
 // 说明：
@@ -45,7 +102,6 @@ type Engine struct {
 	ep      *channel.Endpoint
 	dev     wtun.Device
 	dial    func(ctx context.Context, target string) (net.Conn, error)
-	logf    LogFunc
 	mtu     uint32
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
@@ -55,10 +111,7 @@ type Engine struct {
 
 // StartEngine 在给定 wintun 设备上启动协议栈引擎。
 // dev 的生命周期由 Engine 接管（Stop 时关闭）。
-func StartEngine(dev wtun.Device, mtu uint32, dial func(ctx context.Context, target string) (net.Conn, error), logf LogFunc) (*Engine, error) {
-	if logf == nil {
-		logf = func(string, ...any) {}
-	}
+func StartEngine(dev wtun.Device, mtu uint32, dial func(ctx context.Context, target string) (net.Conn, error)) (*Engine, error) {
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4},
@@ -80,7 +133,7 @@ func StartEngine(dev wtun.Device, mtu uint32, dial func(ctx context.Context, tar
 	zero := tcpip.AddressWithPrefix{Address: tcpip.AddrFrom4([4]byte{}), PrefixLen: 0}
 	s.SetRouteTable([]tcpip.Route{{Destination: zero.Subnet(), NIC: nicID}})
 
-	e := &Engine{s: s, ep: ep, dev: dev, dial: dial, logf: logf, mtu: mtu}
+	e := &Engine{s: s, ep: ep, dev: dev, dial: dial, mtu: mtu}
 	fwd := tcp.NewForwarder(s, 0, maxInFlight, e.handleTCP)
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
 
@@ -89,7 +142,7 @@ func StartEngine(dev wtun.Device, mtu uint32, dial func(ctx context.Context, tar
 	e.wg.Add(2)
 	go e.readLoop(ctx)
 	go e.writeLoop(ctx)
-	logf("[TUNNEL] engine started adapter=%s mtu=%d icmp=dropped (no fake echo reply)", AdapterName, mtu)
+	lg.Infof("engine started adapter=%s mtu=%d icmp=dropped (no fake echo reply)", AdapterName, mtu)
 	return e, nil
 }
 
@@ -106,7 +159,7 @@ func (e *Engine) Stop() {
 	e.wg.Wait()
 	e.s.Close()
 	e.ep.Close()
-	e.logf("[TUNNEL] engine stopped conns_left=%d", e.conns.Load())
+	lg.Infof("engine stopped conns_left=%d", e.conns.Load())
 }
 
 // handleTCP 处理入站 TCP SYN：目标 = 报文的"目的地址:端口"（即内网目标），
@@ -119,7 +172,7 @@ func (e *Engine) handleTCP(r *tcp.ForwarderRequest) {
 	ep, tcpipErr := r.CreateEndpoint(&wq)
 	if tcpipErr != nil {
 		r.Complete(true)
-		e.logf("[TUNNEL] create endpoint fail target=%s err=%v", target, tcpipErr)
+		lg.Warnf("create endpoint fail target=%s err=%v", target, tcpipErr)
 		return
 	}
 	r.Complete(false)
@@ -136,10 +189,12 @@ func (e *Engine) handleTCP(r *tcp.ForwarderRequest) {
 		upstream, err := e.dial(ctx, target)
 		cancel()
 		if err != nil {
-			e.logf("[TUNNEL] dial fail target=%s err=%v", target, err)
+			// 目标不可达时同一目标会高频重试，限频后只留首条，避免刷屏
+			warnThrottled("dial-fail:"+target, 60*time.Second, "dial fail target=%s err=%v", target, err)
 			return
 		}
 		defer upstream.Close()
+		lg.Debugf("dial ok target=%s conns=%d", target, e.conns.Load())
 		e.relay(conn, upstream)
 	}()
 }
@@ -168,7 +223,7 @@ func (e *Engine) readLoop(ctx context.Context) {
 		if n == 0 {
 			if err != nil {
 				if ctx.Err() == nil {
-					e.logf("[TUNNEL] device read error: %v", err)
+					lg.Errorf("device read error (tunnel down?): %v", err)
 				}
 				return
 			}
@@ -206,7 +261,7 @@ func (e *Engine) writeLoop(ctx context.Context) {
 		view.Release()
 		pkt.DecRef()
 		if err != nil && ctx.Err() == nil {
-			e.logf("[TUNNEL] device write error: %v", err)
+			lg.Errorf("device write error (tunnel down?): %v", err)
 			return
 		}
 	}

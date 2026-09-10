@@ -11,12 +11,13 @@ import (
 
 // PMConfig is the configuration for seeinpm
 type PMConfig struct {
-	Server    ServerConfig    `toml:"server"`
-	TLS       TLSConfig       `toml:"tls"`
-	Auth      PMAuthConfig    `toml:"auth"`
-	Database  DatabaseConfig  `toml:"database"`
-	Logging   LoggingConfig   `toml:"logging"`
-	PortPool  PortPoolConfig  `toml:"port_pool"`
+	Server   ServerConfig   `toml:"server"`
+	TLS      TLSConfig      `toml:"tls"`
+	Auth     PMAuthConfig   `toml:"auth"`
+	Database DatabaseConfig `toml:"database"`
+	Logging  LoggingConfig  `toml:"logging"`
+	PortPool PortPoolConfig `toml:"port_pool"`
+	Audit    AuditConfig    `toml:"audit"`
 }
 
 type ServerConfig struct {
@@ -45,6 +46,14 @@ type LoggingConfig struct {
 	Path       string `toml:"path"`
 	MaxSize    int    `toml:"max_size"`
 	MaxBackups int    `toml:"max_backups"`
+}
+
+// AuditConfig 审计行为配置。
+type AuditConfig struct {
+	// FailClosed 为 true 时，不可逆/高敏感操作（删除用户、重置授权码、删除升级包等）
+	// 改为"先写审计再执行"：审计落库失败则直接拒绝该操作，避免出现"动作成功但无审计"。
+	// 默认 false（best-effort：审计失败记 ERROR，业务继续）。
+	FailClosed bool `toml:"fail_closed"`
 }
 
 type PortPoolConfig struct {

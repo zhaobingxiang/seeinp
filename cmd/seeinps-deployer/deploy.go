@@ -501,6 +501,9 @@ func seeinpsConfigTemplate(pack *installPackage, serverAddr string, bendAddr str
 	b.WriteString("path = \"logs\"\n")
 	b.WriteString("max_size = 100\n")
 	b.WriteString("max_backups = 7\n")
+	b.WriteString("\n[audit]\n")
+	b.WriteString("# true = 不可逆操作（删除代理）先写审计再执行，写失败则拒绝；false = best-effort\n")
+	b.WriteString("fail_closed = false\n")
 	return b.String()
 }
 

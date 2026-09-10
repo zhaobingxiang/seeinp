@@ -113,7 +113,9 @@
     font-family:Consolas,"Courier New",monospace;font-size:12.5px;line-height:22px;color:#c9ced6;overflow:auto;
     user-select:text;white-space:pre-wrap;word-break:break-all;
   }
-  .log-toolbar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-shrink:0}
+  .log-toolbar{display:flex;gap:8px 10px;align-items:center;margin-bottom:12px;flex-shrink:0;flex-wrap:wrap}
+  .log-toolbar>select,.log-toolbar>input,.log-toolbar>button,.log-toolbar>.btn{flex:0 0 auto;white-space:nowrap;width:auto}
+  .log-toolbar>.summary{flex:0 1 auto;min-width:0;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   select,input[type=text],input[type=password],input[type=number]{
     height:32px;border:1px solid var(--border);border-radius:var(--radius-sm);padding:0 10px;font-size:13px;
     outline:none;background:#fff;color:var(--text);width:100%;
@@ -253,6 +255,17 @@
       <!-- 运行日志 -->
       <div class="page" id="page-logs">
         <div class="log-toolbar">
+          <select id="selLogSource" onchange="pollLogs(true)" title="内存=本次运行最近 2000 行；日志文件=磁盘尾部（含历史运行）">
+            <option value="memory" selected>本次运行（内存）</option>
+            <option value="file">日志文件（含历史）</option>
+          </select>
+          <select id="selLogMinLevel" onchange="pollLogs(true)" title="无级别标记的行（如 panic 堆栈）始终显示">
+            <option value="debug">全部级别</option>
+            <option value="info" selected>INFO 及以上</option>
+            <option value="warn">WARN 及以上</option>
+            <option value="error">仅 ERROR</option>
+          </select>
+          <input type="text" id="logFilter" placeholder="筛选关键词 / 模块" style="width:190px" oninput="pollLogs(true)">
           <select id="selLevel"><option>debug</option><option selected>info</option><option>warn</option><option>error</option></select>
           <button class="btn btn-outline btn-sm" onclick="applyLevel()">应用级别</button>
           <select id="selLogInterval" onchange="setLogInterval(this.value)">
@@ -262,6 +275,7 @@
             <option value="10000">10 秒刷新</option>
           </select>
           <button class="btn btn-outline btn-sm" id="btnLogPause" onclick="toggleLogPause()">暂停刷新</button>
+          <button class="btn btn-outline btn-sm" onclick="copyLogs()">复制当前视图</button>
           <button class="btn btn-outline btn-sm" onclick="App.OpenLogsDir()">打开日志目录</button>
           <div class="spacer" style="flex:1"></div>
           <div class="summary" id="logPath" title="当前实例实际写入的日志文件">-</div>
@@ -410,7 +424,7 @@
       </div>
       <div class="hint">必填，至少一个网段（决定哪些流量走 VPN，不支持 0.0.0.0/0）</div></div>
     <div class="field"><label>内网探测目标（可选）</label>
-      <input type="text" id="mProbe" placeholder="如 192.168.1.1:443，留空自动取首个网段地址" onblur="checkProbeFmt('mProbe','mProbeTip')">
+      <input type="text" id="mProbe" placeholder="如 192.168.1.1:443；留空仅探测代理可连接性，填写即启用内网探测" onblur="checkProbeFmt('mProbe','mProbeTip')">
       <div class="hint" id="mProbeTip" style="color:var(--red);display:none"></div></div>
     <div class="form-err" id="manualError"></div>
     <div class="dialog-foot">
@@ -973,9 +987,13 @@ async function doEdit(){
 }
 async function doRemove(){
   if(!confirm("确认移除该运维入口？")) return;
-  const r = await App.RemoveEntry(editingId);
-  closeMask("maskEdit");
-  toast(r.message);
+  const errEl = document.getElementById("editError");
+  try{
+    const r = await App.RemoveEntry(editingId);
+    if(!r.ok){ errEl.textContent = r.message; return; }   // 失败留在弹窗内提示，不误报成功
+    closeMask("maskEdit");
+    toast(r.message);
+  }catch(e){ errEl.textContent = String(e); }
 }
 
 /* 设置 */
@@ -991,20 +1009,70 @@ async function saveSettings(){
   toast(r.message, !r.ok);
 }
 async function applyLevel(){
-  const r = await App.SetLogLevel(document.getElementById("selLevel").value);
-  toast(r.message, !r.ok);
+  try{
+    const r = await App.SetLogLevel(document.getElementById("selLevel").value);
+    toast(r.message, !r.ok);
+    if(r.ok){
+      // 级别变化会改变后端产出，立即重取一次（否则最多要等一个刷新周期）
+      document.getElementById("selLogMinLevel").value = document.getElementById("selLevel").value;
+      pollLogs(true);
+    }
+  }catch(e){ toast(String(e), true); }
 }
 
-/* 日志轮询 */
-async function pollLogs(){
-  if(curPage!=="logs" || logPaused) return;
+/* 日志轮询与按级别着色 */
+const LOG_LEVEL_COLOR = { DEBUG:"#8b949e", INFO:"#c9ced6", WARN:"#e3b341", ERROR:"#ff7b72" };
+const LOG_LEVEL_RANK  = { debug:0, info:1, warn:2, error:3 };
+const LOG_LINE_RE     = /^\d{4}-\d{2}-\d{2} \S+ \[(DEBUG|INFO|WARN|ERROR)\]/;
+
+function escHtml(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+/* renderLogLines 按当前筛选条件渲染：
+   级别过滤只作用于"带级别标记"的行；无标记的行（panic 堆栈、第三方输出）始终保留。 */
+function renderLogLines(lines){
+  const minRank = LOG_LEVEL_RANK[document.getElementById("selLogMinLevel").value] ?? 0;
+  const kw = document.getElementById("logFilter").value.trim();
+  const out = [];
+  for (const raw of lines){
+    const line = (raw || "").replace(/\r$/,"");
+    if (!line) continue;
+    const m = line.match(LOG_LINE_RE);
+    const lv = m ? m[1] : "";
+    if (lv && LOG_LEVEL_RANK[lv.toLowerCase()] < minRank) continue;
+    if (kw && line.indexOf(kw) === -1) continue;
+    out.push('<span style="color:' + (LOG_LEVEL_COLOR[lv] || "#c9ced6") + '">' + escHtml(line) + '</span>');
+  }
+  return out.join("\n") || "（暂无日志 / 当前筛选无匹配）";
+}
+
+async function pollLogs(force){
+  if (curPage !== "logs") return;
+  if (logPaused && !force) return;
   try{
-    const lines = await App.GetLogs(400);
+    const src = document.getElementById("selLogSource").value;
+    const lines = src === "file" ? await App.ReadLogFile(3000) : await App.GetLogs(2000);
     const panel = document.getElementById("logPanel");
-    panel.textContent = (lines||[]).join("\n") || "（暂无日志）";
-    panel.scrollTop = panel.scrollHeight;
+    const atBottom = panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 40;
+    panel.innerHTML = renderLogLines(lines || []);
+    if (atBottom) panel.scrollTop = panel.scrollHeight;
   }catch(e){}
 }
+
+/* copyLogs 复制当前筛选后的视图（纯文本），便于用户直接把有问题的片段发给支持 */
+async function copyLogs(){
+  const panel = document.getElementById("logPanel");
+  const text = panel.innerText || "";
+  if (!text.trim()){ toast("当前视图没有可复制的日志", true); return; }
+  try{
+    await navigator.clipboard.writeText(text);
+    toast("已复制当前视图日志");
+  }catch(e){
+    const r = document.createRange(); r.selectNodeContents(panel);
+    const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    toast(document.execCommand("copy") ? "已复制当前视图日志" : "复制失败，请手动选择", false);
+  }
+}
+
 function startLogTimer(){
   if(logTimer) clearInterval(logTimer);
   logTimer = setInterval(pollLogs, logIntervalMs);

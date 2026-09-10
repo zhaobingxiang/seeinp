@@ -43,6 +43,9 @@ func (d *Dialer) Addr() string {
 }
 
 // DialContext 建立到 target（"ip:port"）的 CONNECT 隧道，返回可读写的数据连接。
+// 日志约定：逐台尝试与握手状态码记 DEBUG（per-connection 路径，高频）；
+// 服务器回退记限频 WARN（"主服务器不通自动切备用"是可观测的重要事件）。
+// 注意：Basic 认证串绝不落日志。
 func (d *Dialer) DialContext(ctx context.Context, target string) (net.Conn, error) {
 	timeout := d.Timeout
 	if timeout <= 0 {
@@ -50,23 +53,31 @@ func (d *Dialer) DialContext(ctx context.Context, target string) (net.Conn, erro
 	}
 	nd := net.Dialer{Timeout: timeout}
 	var lastErr error
-	for _, srv := range d.Servers {
+	for i, srv := range d.Servers {
 		if ctx.Err() != nil {
 			break
 		}
-		conn, err := nd.DialContext(ctx, "tcp", net.JoinHostPort(srv, strconv.Itoa(d.OpsID)))
+		addr := net.JoinHostPort(srv, strconv.Itoa(d.OpsID))
+		lg.Debugf("dial: try %s target=%s attempt=%d/%d", addr, target, i+1, len(d.Servers))
+		conn, err := nd.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			lastErr = err
+			if i+1 < len(d.Servers) {
+				warnThrottled("fallback:"+addr, 60*time.Second,
+					"dial: server %s unreachable, falling back to next server: %v", addr, err)
+			}
 			continue // TCP 不通才回退下一台
 		}
-		return d.handshake(conn, target, timeout, ctx)
+		return d.handshake(conn, target, addr, timeout, ctx)
 	}
+	lg.Debugf("dial: all servers exhausted target=%s servers=%v err=%v", target, d.Servers, lastErr)
 	return nil, fmt.Errorf("%w: %v", ErrProxyUnreachable, lastErr)
 }
 
 // Probe 探测代理可用性并返回"到代理的 TCP 握手耗时"。
 // rtt 仅计量 TCP 三次握手（首台可达服务器），不含 seeinps 拨上游目标的时间，
 // 因此能真实反映客户端到代理的链路延迟；err 为 CONNECT 认证结果（nil/407/403/不可达等）。
+// 结果由调用方（探测循环）按级别记录，此处只记 DEBUG，避免重复刷屏。
 func (d *Dialer) Probe(ctx context.Context, target string) (time.Duration, error) {
 	timeout := d.Timeout
 	if timeout <= 0 {
@@ -74,28 +85,37 @@ func (d *Dialer) Probe(ctx context.Context, target string) (time.Duration, error
 	}
 	nd := net.Dialer{Timeout: timeout}
 	var lastErr error
-	for _, srv := range d.Servers {
+	for i, srv := range d.Servers {
 		if ctx.Err() != nil {
 			break
 		}
+		addr := net.JoinHostPort(srv, strconv.Itoa(d.OpsID))
 		start := time.Now()
-		conn, err := nd.DialContext(ctx, "tcp", net.JoinHostPort(srv, strconv.Itoa(d.OpsID)))
+		conn, err := nd.DialContext(ctx, "tcp", addr)
 		rtt := time.Since(start)
 		if err != nil {
 			lastErr = err
+			if i+1 < len(d.Servers) {
+				warnThrottled("fallback:"+addr, 60*time.Second,
+					"probe: server %s unreachable, falling back to next server: %v", addr, err)
+			}
 			continue
 		}
 		// TCP 已连通，rtt 即握手耗时；继续做 CONNECT 认证得到状态
-		if _, herr := d.handshake(conn, target, timeout, ctx); herr != nil {
+		if _, herr := d.handshake(conn, target, addr, timeout, ctx); herr != nil {
+			lg.Debugf("probe: %s target=%s rtt=%s result=%v", addr, target, rtt, herr)
 			return rtt, herr
 		}
+		lg.Debugf("probe: %s target=%s rtt=%s ok", addr, target, rtt)
 		return rtt, nil
 	}
+	lg.Debugf("probe: all servers exhausted target=%s servers=%v err=%v", target, d.Servers, lastErr)
 	return 0, fmt.Errorf("%w: %v", ErrProxyUnreachable, lastErr)
 }
 
 // handshake 在已连通的 TCP 连接上完成 CONNECT + Basic 认证握手。
-func (d *Dialer) handshake(conn net.Conn, target string, timeout time.Duration, ctx context.Context) (net.Conn, error) {
+// addr 仅用于日志。
+func (d *Dialer) handshake(conn net.Conn, target, addr string, timeout time.Duration, ctx context.Context) (net.Conn, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	} else {
@@ -109,6 +129,7 @@ func (d *Dialer) handshake(conn net.Conn, target string, timeout time.Duration, 
 		"Proxy-Connection: keep-alive\r\n\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {
 		conn.Close()
+		lg.Debugf("handshake: write CONNECT fail addr=%s target=%s err=%v", addr, target, err)
 		return nil, fmt.Errorf("发送 CONNECT 请求失败: %w", err)
 	}
 
@@ -116,6 +137,7 @@ func (d *Dialer) handshake(conn net.Conn, target string, timeout time.Duration, 
 	line, err := br.ReadString('\n')
 	if err != nil {
 		conn.Close()
+		lg.Debugf("handshake: read proxy response fail addr=%s target=%s err=%v", addr, target, err)
 		return nil, fmt.Errorf("读取代理响应失败: %w", err)
 	}
 	code := parseStatusCode(line)
@@ -132,15 +154,19 @@ func (d *Dialer) handshake(conn net.Conn, target string, timeout time.Duration, 
 		return conn, nil
 	case 407:
 		conn.Close()
+		lg.Debugf("handshake: auth failed (407) addr=%s user=%s", addr, d.Username)
 		return nil, ErrProxyAuthFailed
 	case 403:
 		conn.Close()
+		lg.Debugf("handshake: target denied (403) addr=%s target=%s", addr, target)
 		return nil, ErrACLDenied
 	default:
 		conn.Close()
 		if code >= 500 {
+			lg.Debugf("handshake: target unreachable (%d) addr=%s target=%s", code, addr, target)
 			return nil, fmt.Errorf("%w: %s", ErrTargetUnreachable, firstLine(line))
 		}
+		lg.Warnf("handshake: unexpected proxy status addr=%s code=%d line=%q", addr, code, firstLine(line))
 		return nil, fmt.Errorf("代理返回异常状态: %s", firstLine(line))
 	}
 }

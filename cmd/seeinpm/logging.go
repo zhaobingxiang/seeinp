@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 
 	"github.com/seeinp/seeinp/internal/logx"
 )
@@ -45,17 +47,25 @@ func (s *Server) handleLoggingSet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, 2000, "请求体格式错误")
 		return
 	}
+	if _, ok := logx.ParseLevel(req.Level); !ok {
+		writeErr(w, http.StatusBadRequest, 2000, fmt.Sprintf("invalid log level %q (want debug/info/warn/error)", req.Level))
+		return
+	}
+	// 级别变更需在收紧与放宽两个方向都留痕：
+	//   - "requested" 按旧级别记录，保证收紧（info -> error）时可见；
+	//   - "changed"   按新级别记录，保证放宽（error -> info）时可见。
+	prev := logx.GetLevel()
+	logx.Infof("[SYS] log level change requested: %s -> %s", prev, strings.ToLower(req.Level))
 	if err := logx.SetLevel(req.Level); err != nil {
 		writeErr(w, http.StatusBadRequest, 2000, err.Error())
 		return
 	}
-	// 持久化；失败不影响运行时生效，但需告警
 	if err := persistLogLevel(s.configPath, logx.GetLevel()); err != nil {
 		logx.Warnf("[SYS] persist log level failed: path=%s err=%v", s.configPath, err)
 	}
 	// 同步内存配置，便于后续 GET 与展示
 	s.config.Logging.Level = logx.GetLevel()
+	logx.Infof("[SYS] log level changed: %s -> %s", prev, logx.GetLevel())
 	s.audit(r, "log_level_update", "", "level="+logx.GetLevel())
-	logx.Infof("[SYS] log level changed: level=%s", logx.GetLevel())
 	writeOK(w, map[string]interface{}{"level": logx.GetLevel()})
 }

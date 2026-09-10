@@ -20,7 +20,7 @@
           <el-button @click="reset">重置</el-button>
         </div>
         <div class="tools">
-          <el-button type="success" :disabled="list.length === 0" @click="download">下载</el-button>
+          <el-button type="success" :disabled="downloading" :loading="downloading" @click="download">导出 CSV</el-button>
           <el-button @click="load" :loading="loading">刷新</el-button>
         </div>
       </div>
@@ -48,12 +48,14 @@ import { ref, onMounted } from "vue"
 import { Search } from "@element-plus/icons-vue"
 import { auditApi } from "@/api"
 import Layout from "@/components/Layout.vue"
+import { ElMessage } from "element-plus"
 
 const list = ref<any[]>([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = 20
 const loading = ref(true)
+const downloading = ref(false)
 const filterAction = ref("")
 const filterUsername = ref("")
 const filterKeyword = ref("")
@@ -62,6 +64,7 @@ const timeRange = ref<any[]>([])
 const actions = [
   { value: "login", label: "登录" },
   { value: "login_failed", label: "登录失败" },
+  { value: "login_locked", label: "账号锁定拒绝登录" },
   { value: "admin_init", label: "初始化管理账号" },
   { value: "user_create", label: "创建用户" },
   { value: "user_update", label: "修改用户" },
@@ -77,6 +80,7 @@ const actions = [
   { value: "user_quota_recovered", label: "流量配额周期恢复" },
   { value: "proxy_disable", label: "禁用代理" },
   { value: "proxy_enable", label: "启用代理" },
+  { value: "proxy_cleanup_offline", label: "清理离线代理" },
   { value: "port_pool_update", label: "修改端口池" },
   { value: "auth_init", label: "初始化 seeinps（服务端）账号" },
   { value: "auth_rebind", label: "重新绑定授权码" },
@@ -84,19 +88,24 @@ const actions = [
   { value: "proxy_update", label: "修改代理" },
   { value: "proxy_delete", label: "删除代理" },
   { value: "client_upgrade", label: "推送升级 seeinps（服务端）" },
+  { value: "client_upgrade_batch", label: "批量升级 seeinps（服务端）" },
+  { value: "client_upgrade_batch_stop", label: "停止批量升级任务" },
   { value: "upgrade_failed", label: "seeinps（服务端）升级失败" },
   { value: "version_upload", label: "上传升级包" },
   { value: "version_delete", label: "删除升级包" },
   { value: "self_upgrade", label: "seeinps（服务端）自主升级" },
   { value: "pm_upgrade", label: "seeinps（服务端）从 seeinpm 拉取升级" },
   { value: "log_level_update", label: "修改日志级别" },
+  { value: "log_download", label: "下载运行日志" },
+  { value: "ps_log_download", label: "下载 seeinps 运行日志" },
+  { value: "audit_log_export", label: "导出审计日志" },
   { value: "user_expired", label: "账号过期踢线" }
 ]
 const actionLabel = (a: string) => actions.find((x: any) => x.value === a)?.label || a
 const formatTime = (ts?: number) => { if (!ts) return "-"; return new Date(ts * 1000).toLocaleString() }
 const actionTag = (a: string) => {
-  if (a.endsWith("_failed")) return "danger"
-  if (a.endsWith("_disable") || a === "user_delete" || a === "proxy_delete") return "warning"
+  if (a.endsWith("_failed") || a === "login_locked" || a.endsWith("_exceeded")) return "danger"
+  if (a.endsWith("_disable") || a === "user_delete" || a === "proxy_delete" || a.endsWith("_export") || a.endsWith("_download")) return "warning"
   if (a === "login" || a === "user_create" || a === "proxy_create") return "success"
   return "info"
 }
@@ -130,29 +139,30 @@ const download = async () => {
     username: filterUsername.value || undefined,
     action: filterAction.value || undefined,
     keyword: filterKeyword.value || undefined,
-    source: filterSource.value || undefined,
-    page_size: 10000
+    source: filterSource.value || undefined
   }
   if (timeRange.value && timeRange.value.length === 2) {
     params.start_time = Number(timeRange.value[0])
     params.end_time = Number(timeRange.value[1])
   }
+  downloading.value = true
   try {
-    const res: any = await auditApi.list(params)
-    const rows: any[] = res.data?.list || []
-    if (rows.length === 0) { return }
-    const header = "时间,来源,操作者,动作,对象,详情"
-    const lines = rows.map((r: any) => [
-      formatTime(r.createdAt), r.source === 'ps' ? 'seeinps（服务端）' : 'seeinpm（中心端）', r.username, actionLabel(r.action), r.target,
-      (r.detail || '').replace(/,/g, '，').replace(/\n/g, ' ')
-    ].join(","))
-    const blob = new Blob(["\ufeff" + [header, ...lines].join("\n")], { type: "text/csv;charset=utf-8" })
+    // 走服务端导出接口：分页接口的 page_size 上限是 200，
+    // 之前传 page_size=10000 会被静默重置为 20，导出的 CSV 只有 20 行。
+    const resp = await fetch(auditApi.exportUrl(params), {
+      headers: { Authorization: 'Bearer ' + (localStorage.getItem('pm_token') || '') }
+    })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const blob = await resp.blob()
     const a = document.createElement("a")
     a.href = URL.createObjectURL(blob)
     a.download = `audit-logs-${new Date().toISOString().slice(0, 10)}.csv`
     a.click()
     URL.revokeObjectURL(a.href)
-  } catch (e) { console.error(e) }
+    ElMessage.success(`已导出 ${total.value} 条中的匹配记录（导出行为本身也会记入审计）`)
+  } catch (e: any) {
+    ElMessage.error(e?.message || "导出失败")
+  } finally { downloading.value = false }
 }
 onMounted(load)
 </script>

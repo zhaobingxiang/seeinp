@@ -158,7 +158,7 @@ func allowTrayClicksFromLowIL() {
 			r1, _, _ := procChangeFilterEx.Call(uintptr(hwnd), m, msgFLTAllow, 0)
 			// 双保险：进程级同步放行（Ex 个别场景不生效）
 			r2, _, _ := procChangeFilter.Call(m, msgFLTAllow)
-			logx.Infof("[TRAY] filter allow hwnd=%d msg=0x%x ex_ret=%d proc_ret=%d", hwnd, m, r1, r2)
+			logx.Debugf("[TRAY] filter allow hwnd=%d msg=0x%x ex_ret=%d proc_ret=%d", hwnd, m, r1, r2)
 		}
 		return 0
 	})

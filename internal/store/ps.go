@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -74,6 +75,20 @@ func (s *PSStore) migrate() error {
 		if _, err := s.db.Exec(q); err != nil {
 			return fmt.Errorf("exec migration: %w", err)
 		}
+	}
+	// v2: 审计补传标记。synced=0 表示尚未成功同步到 seeinpm（含链路不在线时的累积），
+	// 重连后由 auditSyncLoop 按 id 补传；PM 侧以 (source, ext_id) 唯一索引幂等去重。
+	auditCols, err := s.tableColumns("local_audit_logs")
+	if err != nil {
+		return err
+	}
+	if !auditCols["synced"] {
+		if _, err := s.db.Exec("ALTER TABLE local_audit_logs ADD COLUMN synced INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("add column local_audit_logs.synced: %w", err)
+		}
+	}
+	if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_ps_audit_pending ON local_audit_logs(synced, id)"); err != nil {
+		return fmt.Errorf("migrate local_audit_logs pending index: %w", err)
 	}
 	// 旧库补列（proxy_username/proxy_password/acl 为后期新增）
 	cols, err := s.tableColumns("local_proxies")
@@ -258,9 +273,50 @@ type PSAuditLog struct {
 	CreatedAt int64
 }
 
-func (s *PSStore) InsertAuditLog(username, action, target, detail string) error {
-	_, err := s.db.Exec("INSERT INTO local_audit_logs (username, action, target, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+// InsertAuditLog 落库一条本地审计，返回自增 id（该 id 随 AUDIT_SYNC 上报，
+// 供 seeinpm 端做幂等去重；补传重放同一条不会产生重复记录）。
+func (s *PSStore) InsertAuditLog(username, action, target, detail string) (int64, error) {
+	res, err := s.db.Exec("INSERT INTO local_audit_logs (username, action, target, detail, created_at, synced) VALUES (?, ?, ?, ?, ?, 0)",
 		username, action, target, detail, time.Now().Unix())
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// PendingAuditLogs 取尚未同步到 seeinpm 的审计记录（按 id 升序，保证到达顺序稳定）。
+func (s *PSStore) PendingAuditLogs(limit int) ([]*PSAuditLog, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := s.db.Query("SELECT id, username, action, target, COALESCE(detail,''), created_at FROM local_audit_logs WHERE synced = 0 ORDER BY id ASC LIMIT ?", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []*PSAuditLog
+	for rows.Next() {
+		a := &PSAuditLog{}
+		if err := rows.Scan(&a.ID, &a.Username, &a.Action, &a.Target, &a.Detail, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, a)
+	}
+	return list, rows.Err()
+}
+
+// MarkAuditSynced 把指定 id 标记为已同步。
+func (s *PSStore) MarkAuditSynced(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	ph := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		ph[i] = "?"
+		args[i] = id
+	}
+	_, err := s.db.Exec("UPDATE local_audit_logs SET synced = 1 WHERE id IN ("+strings.Join(ph, ",")+")", args...)
 	return err
 }
 
@@ -282,6 +338,56 @@ func (s *PSStore) ListAuditLogs(f PSAuditFilter) ([]*PSAuditLog, int64, error) {
 	if f.PageSize < 1 || f.PageSize > 200 {
 		f.PageSize = 20
 	}
+	where, args := psAuditWhere(f)
+	var total int64
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM local_audit_logs"+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	query := "SELECT id, username, action, target, COALESCE(detail,''), created_at FROM local_audit_logs" + where + " ORDER BY id DESC LIMIT ? OFFSET ?"
+	args = append(args, f.PageSize, (f.Page-1)*f.PageSize)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var list []*PSAuditLog
+	for rows.Next() {
+		a := &PSAuditLog{}
+		if err := rows.Scan(&a.ID, &a.Username, &a.Action, &a.Target, &a.Detail, &a.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		list = append(list, a)
+	}
+	return list, total, rows.Err()
+}
+
+// ExportAuditLogs 按筛选条件一次性取出最多 limit 条审计记录（时间倒序），专供 CSV 导出。
+// 与 ListAuditLogs 分开：分页接口把 PageSize 上限压到 200，复用会导致导出被静默截断成 20 条。
+func (s *PSStore) ExportAuditLogs(f PSAuditFilter, limit int) ([]*PSAuditLog, error) {
+	if limit <= 0 || limit > 200000 {
+		limit = 200000
+	}
+	where, args := psAuditWhere(f)
+	query := "SELECT id, username, action, target, COALESCE(detail,''), created_at FROM local_audit_logs" + where + " ORDER BY id DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []*PSAuditLog
+	for rows.Next() {
+		a := &PSAuditLog{}
+		if err := rows.Scan(&a.ID, &a.Username, &a.Action, &a.Target, &a.Detail, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, a)
+	}
+	return list, rows.Err()
+}
+
+// psAuditWhere 依据过滤条件拼装 WHERE 子句与参数（分页查询与导出共用）。
+func psAuditWhere(f PSAuditFilter) (string, []interface{}) {
 	where := " WHERE 1=1"
 	args := []interface{}{}
 	if f.Username != "" {
@@ -305,30 +411,15 @@ func (s *PSStore) ListAuditLogs(f PSAuditFilter) ([]*PSAuditLog, int64, error) {
 		where += " AND created_at <= ?"
 		args = append(args, f.EndTime)
 	}
-	var total int64
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM local_audit_logs"+where, args...).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-	query := "SELECT id, username, action, target, COALESCE(detail,''), created_at FROM local_audit_logs" + where + " ORDER BY id DESC LIMIT ? OFFSET ?"
-	args = append(args, f.PageSize, (f.Page-1)*f.PageSize)
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-	var list []*PSAuditLog
-	for rows.Next() {
-		a := &PSAuditLog{}
-		if err := rows.Scan(&a.ID, &a.Username, &a.Action, &a.Target, &a.Detail, &a.CreatedAt); err != nil {
-			return nil, 0, err
-		}
-		list = append(list, a)
-	}
-	return list, total, rows.Err()
+	return where, args
 }
 
+// CleanupAuditLogs 删除 cutoff 之前且**已成功同步**的审计记录。
+//
+// 只删已同步的行：未同步的行是 seeinpm 侧尚未持有的唯一副本，
+// 删掉就等于永久丢失（正是此前"链路抖动 → 统一审计视图不完整"的成因之一）。
 func (s *PSStore) CleanupAuditLogs(cutoff int64) (int64, error) {
-	res, err := s.db.Exec("DELETE FROM local_audit_logs WHERE created_at < ?", cutoff)
+	res, err := s.db.Exec("DELETE FROM local_audit_logs WHERE created_at < ? AND synced = 1", cutoff)
 	if err != nil {
 		return 0, err
 	}

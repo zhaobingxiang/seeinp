@@ -24,7 +24,9 @@ func AddRoutes(subnets []string, gateway string, ifIdx int) ([]string, error) {
 		netAddr := ipNet.IP.To4().String()
 		mask := net.IP(ipNet.Mask).String()
 		// 先删旧路由（不存在时忽略报错）
-		_ = noWindow(exec.Command("route", "delete", netAddr)).Run()
+		if err := noWindow(exec.Command("route", "delete", netAddr)).Run(); err != nil {
+			lg.Debugf("route: delete stale %s before add (expected when absent): %v", netAddr, err)
+		}
 		cmd := noWindow(exec.Command("route", "add", netAddr, "mask", mask, gateway, "if", fmt.Sprint(ifIdx)))
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return added, fmt.Errorf("添加路由 %s 失败: %v (%s)", cidr, err, strings.TrimSpace(decodeGBK(out)))
@@ -35,8 +37,11 @@ func AddRoutes(subnets []string, gateway string, ifIdx int) ([]string, error) {
 }
 
 // DeleteRoutes 删除指定网段的静态路由（逐项执行，忽略单项失败）。
+// 残留路由会让下次连接经由失效的虚拟网卡，是"连上但流量不通"的常见原因，故失败记 WARN。
 func DeleteRoutes(nets []string) {
 	for _, n := range nets {
-		_ = noWindow(exec.Command("route", "delete", n)).Run()
+		if err := noWindow(exec.Command("route", "delete", n)).Run(); err != nil {
+			lg.Debugf("route: delete %s failed (ignored): %v", n, err)
+		}
 	}
 }

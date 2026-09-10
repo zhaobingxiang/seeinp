@@ -95,31 +95,99 @@ func TestInstallWritesTimestamped(t *testing.T) {
 	}
 }
 
-// 级别过滤：info 拦截 [DEBUG]，warn 拦截 [INFO] 但放行无标记行
+// 级别过滤：info 拦截 [DEBUG]，warn 拦截 [INFO] 但放行无标记行；
+// 新格式 "[LEVEL] [MOD] msg" 只按第一个方括号判定级别，模块名不干扰。
 func TestLevelFilter(t *testing.T) {
-	if lineShouldKeep("[DEBUG] detail\n", "info") {
-		t.Fatal("info should drop [DEBUG]")
+	cases := []struct {
+		level string
+		line  string
+		want  bool
+	}{
+		{"info", "[DEBUG] detail\n", false},
+		{"info", "[INFO] ok\n", true},
+		{"info", "[CTRL] Connecting...\n", true},
+		{"info", "[TUNNEL] unmarked module line\n", true},
+		{"warn", "[INFO] ok\n", false},
+		{"warn", "[WARN] slow\n", true},
+		{"warn", "[ERROR] boom\n", true},
+		{"warn", "[CTRL] Connecting...\n", true},
+		{"debug", "[DEBUG] detail\n", true},
+		{"error", "[WARN] slow\n", false},
+		{"debug", "[INFO] [TUNNEL] engine started\n", true},
+		{"error", "[INFO] [TUNNEL] engine started\n", false},
+		{"error", "[ERROR] [DIAL] dial fail\n", true},
 	}
-	if !lineShouldKeep("[INFO] ok\n", "info") {
-		t.Fatal("info should keep [INFO]")
+	defer func() { _ = SetLevel("info") }()
+	for _, c := range cases {
+		if err := SetLevel(c.level); err != nil {
+			t.Fatal(err)
+		}
+		if got := lineShouldKeep(c.line); got != c.want {
+			t.Errorf("level=%s line=%q: got %v want %v", c.level, c.line, got, c.want)
+		}
 	}
-	if !lineShouldKeep("[CTRL] Connecting...\n", "info") {
-		t.Fatal("unmarked lines should be kept at info")
+}
+
+// Level 解析与格式化：模块名规范化、格式拼装、Enabled 语义
+func TestLevelParseAndFormat(t *testing.T) {
+	if lv, ok := ParseLevel("WARN"); !ok || lv != LevelWarn {
+		t.Fatalf("ParseLevel(WARN) = %v,%v", lv, ok)
 	}
-	if lineShouldKeep("[INFO] ok\n", "warn") {
-		t.Fatal("warn should drop [INFO]")
+	if lv, ok := ParseLevel("warning"); !ok || lv != LevelWarn {
+		t.Fatalf("ParseLevel(warning) = %v,%v", lv, ok)
 	}
-	if !lineShouldKeep("[WARN] slow\n", "warn") {
-		t.Fatal("warn should keep [WARN]")
+	if _, ok := ParseLevel("verbose"); ok {
+		t.Fatal("ParseLevel(verbose) should fail")
 	}
-	if !lineShouldKeep("[ERROR] boom\n", "warn") {
-		t.Fatal("warn should keep [ERROR]")
+	if got := Format(LevelInfo, "", "[CTRL] ok"); got != "[INFO] [CTRL] ok" {
+		t.Fatalf("Format with empty module = %q", got)
 	}
-	if !lineShouldKeep("[CTRL] Connecting...\n", "warn") {
-		t.Fatal("unmarked lines should be kept at warn")
+	if got := Format(LevelWarn, "tunnel", "dial fail"); got != "[WARN] [TUNNEL] dial fail" {
+		t.Fatalf("Format = %q", got)
 	}
-	if !lineShouldKeep("[DEBUG] detail\n", "debug") {
-		t.Fatal("debug should keep [DEBUG]")
+	if got := New(" [tray] ").Module(); got != "TRAY" {
+		t.Fatalf("normalizeModule = %q", got)
+	}
+	defer func() { _ = SetLevel("info") }()
+	_ = SetLevel("warn")
+	if Enabled(LevelInfo) || !Enabled(LevelWarn) || !Enabled(LevelError) {
+		t.Fatal("Enabled semantics wrong at warn")
+	}
+	_ = SetLevel("debug")
+	if !Enabled(LevelDebug) {
+		t.Fatal("debug must be enabled at debug")
+	}
+}
+
+// Logger 输出必须带上模块名，且与包级函数一样受级别过滤
+func TestLoggerModuleAndFilter(t *testing.T) {
+	dir := t.TempDir()
+	restore := Install(dir, "app", "info", 0, 0)
+	lg := New("TUNNEL")
+	lg.Infof("engine started mtu=%d", 65535)
+	lg.Warnf("dial fail target=%s", "10.0.1.5:443")
+	lg.Debugf("per-conn detail (should be dropped at info)")
+	SetLevel("warn")
+	lg.Infof("dropped at warn")
+	SetLevel("info")
+	restore()
+
+	b, err := os.ReadFile(filepath.Join(dir, "app.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if !strings.Contains(s, "[INFO] [TUNNEL] engine started mtu=65535") {
+		t.Fatalf("module info line missing: %q", s)
+	}
+	if !strings.Contains(s, "[WARN] [TUNNEL] dial fail target=10.0.1.5:443") {
+		t.Fatalf("module warn line missing: %q", s)
+	}
+	if strings.Contains(s, "per-conn detail") {
+		t.Fatalf("debug must be dropped at info: %q", s)
+	}
+	if strings.Contains(s, "dropped at warn") {
+		t.Fatalf("info must be dropped at warn: %q", s)
 	}
 }
 

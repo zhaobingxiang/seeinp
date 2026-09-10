@@ -29,6 +29,12 @@ const (
 	TypeLogListResp      = "LOG_LIST_RESP"
 	TypeLogContentReq    = "LOG_CONTENT_REQ"
 	TypeLogContentResp   = "LOG_CONTENT_RESP"
+	// A 端在线查询/修改 B 端运行日志级别（LOGGING_GET_REQ/RESP、LOGGING_SET_REQ/RESP）：
+	// 此前只能登录 B 端管理台查看与修改级别，与"A 端集中管理"的定位不一致。
+	TypeLoggingGetReq  = "LOGGING_GET_REQ"
+	TypeLoggingGetResp = "LOGGING_GET_RESP"
+	TypeLoggingSetReq  = "LOGGING_SET_REQ"
+	TypeLoggingSetResp = "LOGGING_SET_RESP"
 	// 版本管理（2026-08-29）：A 端推送升级包（UPGRADE_PUSH 通知 + 0x05 数据流直传二进制），
 	// B 端校验通过后换二进制重启，成功与否由重连后的 HELLO 版本判定，异常经 UPGRADE_REPORT 上报
 	TypeUpgradePush     = "UPGRADE_PUSH"
@@ -148,8 +154,11 @@ type ProxyRevokeData struct {
 	Reason  string `json:"reason"` // proxy_disabled
 }
 
-// AuditSyncItem 是 B 端（seeinps）上报的一条本地审计记录
+// AuditSyncItem 是 B 端（seeinps）上报的一条本地审计记录。
+// LocalID 为 B 端 local_audit_logs.id：链路中断时记录会留在本地，重连后补传，
+// A 端以 (source, ext_id) 唯一索引做幂等去重，因此补传可安全重放。
 type AuditSyncItem struct {
+	LocalID   int64  `json:"localId,omitempty"`
 	Username  string `json:"username"`
 	Action    string `json:"action"`
 	Target    string `json:"target"`
@@ -178,15 +187,40 @@ type LogListRespData struct {
 }
 
 // LogContentReqData 是 LOG_CONTENT_REQ 的载荷（A 端 -> B 端，请求文件尾部内容）
+// Download=true 时返回整文件（供 A 端以附件形式提供下载）；Keyword 非空时由 B 端过滤，
+// 避免"只搜到已拉取窗口"的不一致体验。
 type LogContentReqData struct {
-	File  string `json:"file"`
-	Lines int    `json:"lines"`
+	File     string `json:"file"`
+	Lines    int    `json:"lines"`
+	Keyword  string `json:"keyword,omitempty"`
+	Download bool   `json:"download,omitempty"`
 }
 
 // LogContentRespData 是 LOG_CONTENT_RESP 的载荷（B 端 -> A 端，返回文件内容）
 type LogContentRespData struct {
 	File    string `json:"file"`
 	Content string `json:"content"`
+}
+
+// LoggingSetReqData 是 LOGGING_SET_REQ 的载荷（A 端 -> B 端，在线修改日志级别）
+type LoggingSetReqData struct {
+	Level string `json:"level"`
+}
+
+// LoggingSetRespData 是 LOGGING_SET_RESP 的载荷（B 端 -> A 端，返回生效后的级别）
+type LoggingSetRespData struct {
+	Level string `json:"level"`
+}
+
+// LoggingGetReqData 是 LOGGING_GET_REQ 的载荷（A 端 -> B 端，查询当前日志级别）
+type LoggingGetReqData struct{}
+
+// LoggingGetRespData 是 LOGGING_GET_RESP 的载荷（B 端 -> A 端）
+type LoggingGetRespData struct {
+	Level      string `json:"level"`
+	Path       string `json:"path"`
+	MaxSize    int    `json:"maxSize"`
+	MaxBackups int    `json:"maxBackups"`
 }
 
 // VersionListItem 是 VERSION_LIST_RESP 中的一条版本摘要（不含文件）

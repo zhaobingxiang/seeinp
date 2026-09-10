@@ -1,16 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -103,6 +106,7 @@ func (c *Client) startLocalServer() error {
 	mux.HandleFunc("GET /api/v1/stats", c.requireAuth(c.handleStats))
 	mux.HandleFunc("GET /api/v1/quota", c.requireAuth(c.handleQuota))
 	mux.HandleFunc("GET /api/v1/audit-logs", c.requireAuth(c.handleAuditLogs))
+	mux.HandleFunc("GET /api/v1/audit-logs/export", c.requireAuth(c.handleAuditLogsExport))
 	mux.HandleFunc("GET /api/v1/logs", c.requireAuth(c.handleListLogFiles))
 	mux.HandleFunc("GET /api/v1/logs/content", c.requireAuth(c.handleLogFileContent))
 
@@ -123,9 +127,10 @@ func (c *Client) startLocalServer() error {
 	addr := c.config.Local.BendAddr
 
 	server := &http.Server{
-		Addr:    addr,
+		Addr: addr,
 		// gzip：前端产物与 API 响应压缩（窄带链路下体积 -60% 以上）
-		Handler: gzhttp.Handler(mux),
+		// 外层再套访问日志中间件：所有 4xx/5xx 落盘，panic 兜底
+		Handler: c.accessLog(gzhttp.Handler(mux)),
 		// 超时按慢链路适配：B 端要承载 200MB 升级包上传（Read）与文件/日志下载（Write）
 		ReadTimeout:  30 * time.Minute,
 		WriteTimeout: 10 * time.Minute,
@@ -149,6 +154,121 @@ type ctxKey string
 
 const operatorKey ctxKey = "operator"
 
+// ---------------- HTTP 访问/错误日志中间件 ----------------
+//
+// 级别约定（与 seeinpm 一致）：5xx -> ERROR，4xx -> WARN，其余 -> DEBUG。
+// 此前所有 writeErr 只回前端、不落盘，用户报"创建代理报错"时服务端零线索。
+
+// accessInfoKey 承载本次请求的访问日志附加信息（指针，便于内层处理器回填）。
+const accessInfoKey ctxKey = "access-info"
+
+// accessInfo 由外层中间件创建、内层 requireAuth 回填操作者。
+type accessInfo struct{ operator string }
+
+// statusRecorder 捕获响应状态码与写出字节数。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += n
+	return n, err
+}
+
+// Flush / Hijack / Unwrap 透传，避免破坏 gzip 中间件、升级包上传与大文件下载。
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := r.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("hijack not supported")
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// ReadFrom 透传底层 writer 的 ReadFrom（sendfile），否则大文件下载会退化为纯用户态拷贝。
+// 注意必须委托给 r.ResponseWriter 而不是自己，避免 io.Copy 回调自身造成无限递归。
+func (r *statusRecorder) ReadFrom(src io.Reader) (int64, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	if rf, ok := r.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(src)
+		r.bytes += int(n)
+		return n, err
+	}
+	n, err := io.Copy(r.ResponseWriter, src)
+	r.bytes += int(n)
+	return n, err
+}
+
+// skipAccessLog 静态资源与健康检查不进访问日志，避免刷屏。
+func skipAccessLog(path string) bool {
+	return path == "/health" || !strings.HasPrefix(path, "/api/")
+}
+
+// accessLog 统一 HTTP 访问/错误日志中间件：按状态码分级记录并兜住 handler panic。
+func (c *Client) accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if skipAccessLog(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		info := &accessInfo{}
+		rec := &statusRecorder{ResponseWriter: w}
+		start := time.Now()
+		r = r.WithContext(context.WithValue(r.Context(), accessInfoKey, info))
+
+		defer func() {
+			if rv := recover(); rv != nil {
+				if rec.status == 0 {
+					rec.status = http.StatusInternalServerError
+					rec.ResponseWriter.WriteHeader(rec.status)
+					_, _ = rec.ResponseWriter.Write([]byte(`{"code":5000,"message":"internal error"}`))
+				}
+				logx.Errorf("[HTTP] panic recovered method=%s path=%s ip=%s err=%v\n%s",
+					r.Method, r.URL.Path, clientIP(r), rv, debug.Stack())
+			}
+			dur := time.Since(start)
+			op := info.operator
+			if op == "" {
+				op = "-"
+			}
+			switch {
+			case rec.status >= 500:
+				logx.Errorf("[HTTP] %s %s status=%d dur=%s bytes=%d ip=%s operator=%s",
+					r.Method, r.URL.Path, rec.status, dur, rec.bytes, clientIP(r), op)
+			case rec.status >= 400:
+				logx.Warnf("[HTTP] %s %s status=%d dur=%s bytes=%d ip=%s operator=%s",
+					r.Method, r.URL.Path, rec.status, dur, rec.bytes, clientIP(r), op)
+			default:
+				logx.Debugf("[HTTP] %s %s status=%d dur=%s bytes=%d ip=%s operator=%s",
+					r.Method, r.URL.Path, rec.status, dur, rec.bytes, clientIP(r), op)
+			}
+		}()
+
+		next.ServeHTTP(rec, r)
+	})
+}
+
 // requireAuth 校验 JWT 并把操作者用户名放入 context，供审计埋点取用
 func (c *Client) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -162,6 +282,10 @@ func (c *Client) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, 1003, "登录已过期，请重新登录")
 			return
 		}
+		// 回填操作者给外层访问日志（context 里是指针，外层可读到）
+		if info, ok := r.Context().Value(accessInfoKey).(*accessInfo); ok {
+			info.operator = claims.Username
+		}
 		next(w, r.WithContext(context.WithValue(r.Context(), operatorKey, claims.Username)))
 	}
 }
@@ -174,20 +298,38 @@ func operatorFrom(r *http.Request) string {
 	return "unknown"
 }
 
-// audit 写一条本地操作审计记录（自动附加来源 IP）并上报 seeinpm（混合架构）；
-// 失败只打日志不影响主流程
+// audit 写一条本地操作审计记录（自动附加来源 IP）并触发上报 seeinpm（混合架构）。
+// best-effort：写失败记 ERROR（不再静默），业务继续；需要 fail-closed 的关键动作用 auditBefore。
 func (c *Client) audit(r *http.Request, action, target, detail string) {
-	ip := clientIP(r)
-	if detail != "" {
-		detail += "; "
-	}
-	detail += "ip=" + ip
-	c.auditRecord(operatorFrom(r), action, target, detail, time.Now().Unix())
+	c.auditRecord(operatorFrom(r), action, target, withIP(detail, clientIP(r)))
 }
 
 // auditPlain 无 JWT 场景（登录/初始化）的审计记录，操作者取自请求参数（detail 需自带 ip=）
 func (c *Client) auditPlain(username, action, detail string, r *http.Request) {
-	c.auditRecord(username, action, "", detail, time.Now().Unix())
+	c.auditRecord(username, action, "", detail)
+}
+
+// auditBefore 先落库审计、再执行关键操作（fail-closed）。
+// 仅在配置 [audit] fail_closed = true 时生效：审计写不进去就拒绝执行，
+// 避免出现"用户已删除但审计表里查不到"这种不可追溯的状态。返回 false 表示已写出响应、调用方应直接返回。
+func (c *Client) auditBefore(w http.ResponseWriter, r *http.Request, action, target, detail string) bool {
+	if !c.config.Audit.FailClosed {
+		c.audit(r, action, target, detail)
+		return true
+	}
+	if err := c.auditRecord(operatorFrom(r), action, target, withIP(detail, clientIP(r))); err != nil {
+		writeErr(w, http.StatusInternalServerError, 5000, "审计日志写入失败，已拒绝该操作（fail_closed 已开启）")
+		return false
+	}
+	return true
+}
+
+// withIP 把来源 IP 追加到 detail 末尾（保持既有 "k=v; k=v" 风格）。
+func withIP(detail, ip string) string {
+	if detail != "" {
+		detail += "; "
+	}
+	return detail + "ip=" + ip
 }
 
 // clientIP 从请求取客户端 IP（去掉端口）
@@ -199,28 +341,119 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// auditRecord 落库本地审计并异步上报 seeinpm（AUDIT_SYNC）
-func (c *Client) auditRecord(username, action, target, detail string, createdAt int64) {
-	if err := c.store.InsertAuditLog(username, action, target, detail); err != nil {
-		logx.Warnf("[AUDIT] insert error: %v", err)
+// auditLoginFailed 记录登录失败，并按 IP 节流：
+// guard 的锁定是按 username 的，攻击者换 username 喷洒可无限写审计表；同一 IP 60s 内只记一条。
+// 返回是否真的落库（供调用方在需要时提示）。
+func (c *Client) auditLoginFailed(username, ip string) {
+	now := time.Now()
+	c.loginFailMu.Lock()
+	if last, ok := c.loginFailAt[ip]; ok && now.Sub(last) < time.Minute {
+		c.loginFailMu.Unlock()
+		return
 	}
-	// 混合架构：本地已落库，控制连接可用时异步上报，失败不影响主流程（PM 端可按 username 区分来源）
-	go func() {
-		if link := c.getLink(); link != nil {
-			msg := protocol.NewMessage(protocol.TypeAuditSync, &protocol.AuditSyncData{
-				Items: []protocol.AuditSyncItem{{
-					Username:  username,
-					Action:    action,
-					Target:    target,
-					Detail:    detail,
-					CreatedAt: createdAt,
-				}},
-			})
-			if err := link.send(msg); err != nil {
-				logx.Warnf("[AUDIT] sync to seeinpm error: %v", err)
+	c.loginFailAt[ip] = now
+	if len(c.loginFailAt) > 1024 { // 简单清理，防长期运行下无界增长
+		for k, t := range c.loginFailAt {
+			if now.Sub(t) > time.Minute {
+				delete(c.loginFailAt, k)
 			}
 		}
-	}()
+	}
+	c.loginFailMu.Unlock()
+	c.auditRecord(username, "login_failed", "", "ip="+ip)
+}
+
+// auditRecord 落库本地审计（synced=0），随后 pokes 补传协程把未同步记录推给 seeinpm。
+// 返回写库错误，供 fail-closed 场景判定。
+func (c *Client) auditRecord(username, action, target, detail string) error {
+	id, err := c.store.InsertAuditLog(username, action, target, detail)
+	if err != nil {
+		// 审计写入失败必须显式可见（此前只 Warnf，且业务照常成功返回）
+		logx.Errorf("[AUDIT] insert failed action=%s user=%s err=%v", action, username, err)
+		return err
+	}
+	logx.Debugf("[AUDIT] recorded id=%d action=%s user=%s target=%q", id, action, username, target)
+	c.pokeAuditSync()
+	return nil
+}
+
+// pokeAuditSync 非阻塞唤醒补传协程。
+func (c *Client) pokeAuditSync() {
+	select {
+	case c.auditPoke <- struct{}{}:
+	default:
+	}
+}
+
+// startAuditSyncLoop 启动（幂等）审计补传协程：收到 poke 或每 60s 兜底推送一次未同步记录。
+func (c *Client) startAuditSyncLoop() {
+	c.auditLoopOnce.Do(func() {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logx.Errorf("[PANIC] audit sync loop panicked: %v\n%s", r, debug.Stack())
+				}
+			}()
+			for {
+				select {
+				case <-c.auditPoke:
+				case <-time.After(time.Minute):
+				case <-rootDone(c):
+					return
+				}
+				c.flushAudit()
+			}
+		}()
+	})
+}
+
+// rootDone 返回进程退出信号；rootCtx 未注入时返回一个永不触发的 channel。
+func rootDone(c *Client) <-chan struct{} {
+	if c.rootCtx == nil {
+		return make(chan struct{})
+	}
+	return c.rootCtx.Done()
+}
+
+// flushAudit 把本地未同步的审计批量推给 seeinpm；成功后标记 synced=1。
+// PM 侧以 (source, ext_id) 唯一索引幂等去重，因此重放不会产生重复记录。
+func (c *Client) flushAudit() {
+	link := c.getLink()
+	if link == nil {
+		return // 离线：记录留在本地，连接恢复后由 setLink 再次触发
+	}
+	for {
+		rows, err := c.store.PendingAuditLogs(200)
+		if err != nil {
+			logx.Errorf("[AUDIT] read pending audit failed: %v", err)
+			return
+		}
+		if len(rows) == 0 {
+			return
+		}
+		items := make([]protocol.AuditSyncItem, 0, len(rows))
+		ids := make([]int64, 0, len(rows))
+		for _, r := range rows {
+			items = append(items, protocol.AuditSyncItem{
+				LocalID: r.ID, Username: r.Username, Action: r.Action,
+				Target: r.Target, Detail: r.Detail, CreatedAt: r.CreatedAt,
+			})
+			ids = append(ids, r.ID)
+		}
+		msg := protocol.NewMessage(protocol.TypeAuditSync, &protocol.AuditSyncData{Items: items})
+		if err := link.send(msg); err != nil {
+			logx.Warnf("[AUDIT] sync %d records to seeinpm failed, will retry after reconnect: %v", len(ids), err)
+			return
+		}
+		if err := c.store.MarkAuditSynced(ids); err != nil {
+			logx.Errorf("[AUDIT] mark synced failed (records may be re-sent, PM dedups by ext_id): %v", err)
+			return
+		}
+		logx.Infof("[AUDIT] synced %d audit records to seeinpm", len(ids))
+		if len(rows) < 200 {
+			return
+		}
+	}
 }
 
 func (c *Client) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -335,7 +568,7 @@ func (c *Client) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 
 	// 先判锁定：锁定期间即使密码/验证码正确也拒绝
 	if locked, remaining, failed := c.guard.Locked(req.Username); locked {
-		c.auditPlain(req.Username, "login_locked", "ip="+r.RemoteAddr, r)
+		c.auditPlain(req.Username, "login_locked", "ip="+clientIP(r), r)
 		writeErrData(w, http.StatusForbidden, 1103, "账号已锁定", map[string]interface{}{
 			"lock_remaining": remaining,
 			"failed_count":   failed,
@@ -356,7 +589,7 @@ func (c *Client) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Username != u.Username || !auth.CheckPassword(req.Password, u.PasswordHash) {
 		failed, lockSec := c.guard.OnFailure(req.Username)
-		c.auditPlain(req.Username, "login_failed", "ip="+r.RemoteAddr, r)
+		c.auditLoginFailed(req.Username, clientIP(r)) // 按 IP 节流，防喷洒刷表
 		if lockSec > 0 {
 			writeErrData(w, http.StatusForbidden, 1103, "密码错误次数过多，账号已锁定", map[string]interface{}{
 				"lock_remaining": lockSec,
@@ -377,7 +610,8 @@ func (c *Client) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, 5000, "生成令牌失败")
 		return
 	}
-	c.auditPlain(u.Username, "login", "ip="+r.RemoteAddr, r)
+	c.auditPlain(u.Username, "login", "ip="+clientIP(r), r)
+	logx.Infof("[AUTH] login ok user=%s ip=%s", u.Username, clientIP(r))
 	writeOK(w, map[string]interface{}{"token": token})
 }
 
@@ -691,6 +925,18 @@ func (c *Client) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, 2004, "代理不存在")
 		return
 	}
+	c.proxiesMu.Unlock()
+
+	detail := ""
+	if p.ForwardPort > 0 {
+		detail = fmt.Sprintf("type=%s forward_port=%d", p.Type, p.ForwardPort)
+	}
+	// 删除不可逆：fail_closed 开启时先落审计，写不进去就拒绝执行
+	if !c.auditBefore(w, r, "proxy_delete", id, detail) {
+		return
+	}
+
+	c.proxiesMu.Lock()
 	delete(c.proxies, id)
 	c.proxiesMu.Unlock()
 
@@ -698,15 +944,11 @@ func (c *Client) handleProxyDelete(w http.ResponseWriter, r *http.Request) {
 		c.releaseProxy(link, p)
 	}
 	if err := c.store.DeleteProxy(id); err != nil {
+		logx.Errorf("[PROXY] delete failed: proxy=%s err=%v", id, err)
 		writeErr(w, http.StatusInternalServerError, 5000, "删除代理失败")
 		return
 	}
 	logx.Infof("[PROXY] deleted: proxy=%s", id)
-	detail := ""
-	if p.ForwardPort > 0 {
-		detail = fmt.Sprintf("type=%s forward_port=%d", p.Type, p.ForwardPort)
-	}
-	c.audit(r, "proxy_delete", id, detail)
 	writeOK(w, nil)
 }
 
@@ -791,6 +1033,61 @@ func (c *Client) handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 		items = append(items, auditResp{ID: a.ID, Username: a.Username, Action: a.Action, Target: a.Target, Detail: a.Detail, CreatedAt: a.CreatedAt})
 	}
 	writeOK(w, map[string]interface{}{"list": items, "total": total, "page": page, "pageSize": pageSize})
+}
+
+// handleAuditLogsExport GET /api/v1/audit-logs/export：按筛选条件导出完整 CSV。
+// 独立于分页接口的原因：ListAuditLogs 会把 PageSize 压到 200，
+// 前端导出曾传 page_size=10000 被静默重置为 20 —— 导出的 CSV 永远只有 20 行。
+// 导出行为本身也记入审计（敏感数据外带需留痕）。
+func (c *Client) handleAuditLogsExport(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	start, _ := strconv.ParseInt(q.Get("start_time"), 10, 64)
+	end, _ := strconv.ParseInt(q.Get("end_time"), 10, 64)
+	f := store.PSAuditFilter{
+		Username:  q.Get("username"),
+		Action:    q.Get("action"),
+		Keyword:   q.Get("keyword"),
+		StartTime: start,
+		EndTime:   end,
+	}
+	list, err := c.store.ExportAuditLogs(f, 200000)
+	if err != nil {
+		logx.Errorf("[AUDIT] export failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, 5000, "导出失败")
+		return
+	}
+	c.audit(r, "audit_log_export", fmt.Sprintf("%d rows", len(list)),
+		fmt.Sprintf("action=%s keyword=%s start=%d end=%d", f.Action, f.Keyword, f.StartTime, f.EndTime))
+
+	name := "audit-logs-" + time.Now().Format("20060102-150405") + ".csv"
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+	_, _ = w.Write([]byte("\ufeff")) // BOM：Excel 直接打开不乱码
+	bw := bufio.NewWriter(w)
+	_, _ = bw.WriteString("时间,操作者,动作,对象,详情\n")
+	for _, a := range list {
+		row := []string{
+			time.Unix(a.CreatedAt, 0).Format("2006-01-02 15:04:05"),
+			a.Username, a.Action, a.Target, a.Detail,
+		}
+		for i, col := range row {
+			if i > 0 {
+				_ = bw.WriteByte(',')
+			}
+			_, _ = bw.WriteString(csvQuote(col))
+		}
+		_ = bw.WriteByte('\n')
+	}
+	_ = bw.Flush()
+	logx.Infof("[AUDIT] exported %d rows to CSV by %s", len(list), operatorFrom(r))
+}
+
+// csvQuote 按 RFC 4180 转义 CSV 字段（含逗号/引号/换行时加引号并把 " 翻倍）。
+func csvQuote(s string) string {
+	if !strings.ContainsAny(s, ",\"\n\r") {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 const psLogsDir = "logs"
@@ -902,13 +1199,27 @@ func (c *Client) psReadLogContent(name string, lines int, keyword string, downlo
 }
 
 // handleLogFileContent 尾部读取运行日志（?file=seeinps.log&lines=500&keyword=&download=1）
+// download=1 时以附件形式返回整文件（此前即便传 download 也只返回 JSON 字符串，
+// 前端"下载"实际拿不到文件，与 seeinpm 的行为不一致）。
 func (c *Client) handleLogFileContent(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	name := q.Get("file")
 	lines, _ := strconv.Atoi(q.Get("lines"))
-	content, err := c.psReadLogContent(name, lines, q.Get("keyword"), q.Get("download") == "1")
+	download := q.Get("download") == "1"
+	content, err := c.psReadLogContent(name, lines, q.Get("keyword"), download)
 	if err != nil {
+		logx.Warnf("[LOG] read log failed file=%q download=%v user=%s err=%v",
+			name, download, operatorFrom(r), err)
 		writeErr(w, http.StatusNotFound, 2004, "文件不存在或参数非法")
+		return
+	}
+	if download {
+		// 运行日志外带需留痕（同 PM 侧 log_download）
+		c.audit(r, "log_download", name, fmt.Sprintf("size=%d", len(content)))
+		logx.Infof("[LOG] downloaded runtime log file=%s size=%d by=%s", name, len(content), operatorFrom(r))
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+		_, _ = w.Write([]byte(content))
 		return
 	}
 	writeOK(w, map[string]string{"file": name, "content": content})
@@ -931,7 +1242,7 @@ func (c *Client) handleLogContentReq(msg *protocol.Message) *protocol.Message {
 	b, _ := json.Marshal(msg.Data)
 	req := &protocol.LogContentReqData{}
 	json.Unmarshal(b, req)
-	content, err := c.psReadLogContent(req.File, req.Lines, "", false)
+	content, err := c.psReadLogContent(req.File, req.Lines, req.Keyword, req.Download)
 	code := int(protocol.CodeOK)
 	if err != nil {
 		code = int(protocol.CodeBadRequest)

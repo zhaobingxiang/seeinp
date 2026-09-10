@@ -6,8 +6,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/url"
+	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,19 +43,28 @@ type App struct {
 	quitFlag  atomic.Bool
 	probeOnce chan struct{}
 	onQuit    func() // 由 main 注入：退出托盘等收尾
+
+	probeWarnMu sync.Mutex
+	probeWarnAt map[string]time.Time // 探测失败告警限频（entryID -> 上次记录时刻）
 }
 
-// fullQuit 完整退出：置退出标记 → 清理隧道 → 保存配置 → 退出托盘与窗口
+// probeWarnWindow 同一入口的探测失败告警最短间隔。
+const probeWarnWindow = 60 * time.Second
+
+// fullQuit 完整退出：置退出标记 → 清理隧道 → 保存配置 → 刷盘 → 退出托盘与窗口
 func (a *App) fullQuit() {
 	if !a.quitFlag.CompareAndSwap(false, true) {
 		return
 	}
+	a.logf("[APP] quitting")
 	a.stopVPN("程序退出")
 	a.mu.Lock()
 	if err := saveConfig(a.cfg); err != nil {
 		a.logErrorf("[APP] save config failed: %v", err)
 	}
 	a.mu.Unlock()
+	// 管道写端关闭后泵协程仍可能持有未落盘的行，退出前显式刷盘
+	logx.Sync()
 	if a.onQuit != nil {
 		a.onQuit()
 	}
@@ -83,37 +96,92 @@ type probeInfo struct {
 }
 
 func NewApp() *App {
-	return &App{
-		probes:    make(map[string]*probeInfo),
-		ring:      newLogRing(600),
-		probeOnce: make(chan struct{}, 1),
+	a := &App{
+		probes:      make(map[string]*probeInfo),
+		ring:        newLogRing(2000),
+		probeOnce:   make(chan struct{}, 1),
+		probeWarnAt: make(map[string]time.Time),
 	}
+	// 把 tunnel 包的日志接回统一出口（在此之前 tunnel 用静默兜底）。
+	// 必须在任何隧道协程启动前完成，之后不再变更。
+	tunnel.SetLogger(a.moduleLogger("TUNNEL"))
+	return a
 }
 
-// logf 统一日志出口：logx 落盘 + 内存环形缓冲（前端日志页读取）
-func (a *App) logf(format string, args ...any) {
+// ---------------- 日志 ----------------
+//
+// 统一出口 logAt：先按级别判定一次，再同时写磁盘与内存环形缓冲。
+// 关键点：判定只做一次（logx.Enabled），因此 level=warn 时磁盘与 App 日志页
+// 都不会出现 INFO —— 早前 ring 无条件 append 会导致"文件里没有、界面上却有"。
+//
+// 级别约定（各模块统一）：
+//   - DEBUG：每一步操作的过程细节（连接分步、每次拨号尝试、探测单次成功）；高频、仅排障时开
+//   - INFO ：状态跃迁与用户可见的结果（连接/断开、登录成功、配置保存、探测周期结束）
+//   - WARN ：可恢复的异常或需要用户关注的情况（拨号失败、认证 407/ACL 403、探测失败、解密失败）
+//   - ERROR：进程级故障或不可恢复错误（网卡创建失败、配置写入失败、更新失败、panic）
+
+// logAt 统一日志出口：级别判定一次，磁盘与内存环形缓冲内容保持一致。
+// mod 为空表示消息自带模块标记（历史调用点的写法，输出为 "[LEVEL] [APP] ..."）。
+func (a *App) logAt(lv logx.Level, mod, format string, args ...any) {
+	if !logx.Enabled(lv) {
+		return // ring 与磁盘共用同一次判定，避免二者不一致
+	}
 	msg := fmt.Sprintf(format, args...)
-	logx.Infof("%s", msg)
-	a.ring.append(time.Now().Format("2006-01-02 15:04:05.000") + " [INFO] " + msg)
+	logx.Write(lv, mod, msg)
+	a.ring.append(time.Now().Format("2006-01-02 15:04:05.000") + " " + logx.Format(lv, mod, msg))
 }
 
-func (a *App) logWarnf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	logx.Warnf("%s", msg)
-	a.ring.append(time.Now().Format("2006-01-02 15:04:05.000") + " [WARN] " + msg)
-}
+// logf 输出 info 级日志（消息自带模块标记，如 "[TUNNEL] connected ..."）
+func (a *App) logf(format string, args ...any) { a.logAt(logx.LevelInfo, "", format, args...) }
 
+// logWarnf 输出 warn 级日志
+func (a *App) logWarnf(format string, args ...any) { a.logAt(logx.LevelWarn, "", format, args...) }
+
+// logErrorf 输出 error 级日志
 func (a *App) logErrorf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	logx.Errorf("%s", msg)
-	a.ring.append(time.Now().Format("2006-01-02 15:04:05.000") + " [ERROR] " + msg)
+	a.logAt(logx.LevelError, "", format, args...)
+}
+
+// debugf 输出 debug 级日志（消息自带模块标记）
+func (a *App) debugf(format string, args ...any) { a.logAt(logx.LevelDebug, "", format, args...) }
+
+// moduleLogger 返回带模块名的日志器，供不再自带模块标记的子系统（tunnel 等）使用。
+// 它同样走 logAt，因此级别过滤与内存缓冲行为与 App 其余日志完全一致。
+func (a *App) moduleLogger(mod string) tunnel.Logger {
+	return tunnelLogger{a: a, mod: mod}
+}
+
+// tunnelLogger 把 tunnel 包的日志接回 App 的统一出口。
+type tunnelLogger struct {
+	a   *App
+	mod string
+}
+
+func (l tunnelLogger) Debugf(format string, args ...any) {
+	l.a.logAt(logx.LevelDebug, l.mod, format, args...)
+}
+func (l tunnelLogger) Infof(format string, args ...any) {
+	l.a.logAt(logx.LevelInfo, l.mod, format, args...)
+}
+func (l tunnelLogger) Warnf(format string, args ...any) {
+	l.a.logAt(logx.LevelWarn, l.mod, format, args...)
+}
+func (l tunnelLogger) Errorf(format string, args ...any) {
+	l.a.logAt(logx.LevelError, l.mod, format, args...)
+}
+
+// panicf 记录 panic 与堆栈（error 级），并立即刷盘。
+// logx 经管道异步落盘，进程即将退出时后台协程可能来不及写完，故此处显式 Sync。
+func (a *App) panicf(format string, args ...any) {
+	a.logAt(logx.LevelError, "", format, args...)
+	logx.Sync()
 }
 
 // ---------------- 生命周期 ----------------
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	cfg, err := loadConfig()
+	cfg, warnings, err := loadConfig()
 	if err != nil {
 		a.logErrorf("[APP] load config failed: %v", err)
 		cfg = &Config{Settings: defaultSettings()}
@@ -121,10 +189,17 @@ func (a *App) startup(ctx context.Context) {
 	a.mu.Lock()
 	a.cfg = cfg
 	a.mu.Unlock()
-	if cfg.Settings.LogLevel != "" {
-		_ = logx.SetLevel(cfg.Settings.LogLevel)
+	for _, w := range warnings {
+		a.logWarnf("[APP] %s", w)
 	}
-	a.logf("[APP] version=%s banner=%s pid_entries=%d admin=%v", version.Version, version.Banner, len(cfg.Entries), isAdmin())
+	if cfg.Settings.LogLevel != "" {
+		if serr := logx.SetLevel(cfg.Settings.LogLevel); serr != nil {
+			a.logWarnf("[APP] invalid log level %q in config, keeping %s: %v",
+				cfg.Settings.LogLevel, logx.GetLevel(), serr)
+		}
+	}
+	a.logf("[APP] version=%s banner=%s pid_entries=%d admin=%v driver_ok=%v log_level=%s",
+		version.Version, version.Banner, len(cfg.Entries), isAdmin(), driverReady(), logx.GetLevel())
 	go a.probeLoop()
 	go func() {
 		time.Sleep(3 * time.Second) // 延迟检查，不阻塞启动
@@ -154,6 +229,7 @@ func (a *App) shutdown(_ context.Context) {
 	if err := saveConfig(a.cfg); err != nil {
 		a.logErrorf("[APP] save config failed: %v", err)
 	}
+	logx.Sync()
 }
 
 // beforeClose 窗口关闭拦截：最小化到托盘（除非真正退出）
@@ -248,7 +324,9 @@ func (a *App) FetchSeeinps(port int, user, pwd, captchaID, captchaText string) F
 	if port <= 0 || port > 65535 {
 		return FetchSeeinpsResult{OpResult: OpResult{Message: "请填写有效的 web-ui 外部端口（1-65535）"}}
 	}
-	c, lr, err := loginFallback(a.serverPool(), port, user, pwd, captchaID, captchaText)
+	a.debugf("[AUTH] login start hosts=%v port=%d user=%s captcha=%v",
+		a.serverPool(), port, user, captchaID != "")
+	c, lr, err := a.loginFallback(a.serverPool(), port, user, pwd, captchaID, captchaText)
 	if err != nil {
 		a.logErrorf("[AUTH] login failed port=%d err=%v", port, err)
 		return FetchSeeinpsResult{OpResult: OpResult{Message: err.Error()}}
@@ -426,7 +504,7 @@ func (a *App) ManualAdd(name, server string, opsID int, proxyUser, proxyPass str
 	a.cfg.Entries = append(a.cfg.Entries, &Entry{
 		ID: newID(), Name: name, Server: server, OpsID: opsID,
 		ProxyUser: proxyUser, ProxyPass: proxyPass, ACL: acl,
-		ProbeTarget: probeTarget, Manual: true,
+		ProbeTarget: probeTarget, ProbeIntranet: probeTarget != "", Manual: true,
 	})
 	err := saveConfig(a.cfg)
 	a.mu.Unlock()
@@ -504,10 +582,14 @@ func (a *App) UpdateEntry(id, name, server, probeTarget string, probeIntranet bo
 	e.ProbeTarget = probeTarget
 	e.ACL = cleaned
 	err := saveConfig(a.cfg)
+	entryName := e.Name
 	a.mu.Unlock()
 	if err != nil {
+		a.logErrorf("[APP] update entry failed entry=%s err=%v", id, err)
 		return OpResult{Message: "保存失败: " + err.Error()}
 	}
+	a.logf("[APP] entry updated name=%s server=%q probe_target=%q probe_intranet=%v acl=%v",
+		entryName, server, probeTarget, probeIntranet, cleaned)
 	a.emitState()
 	return OpResult{OK: true, Message: "已保存"}
 }
@@ -587,21 +669,115 @@ func (a *App) RefreshProbes() OpResult {
 	return OpResult{OK: true, Message: "探测中…"}
 }
 
-// GetLogs 读取最近 lines 行日志（内存环形缓冲）
+// GetLogs 读取最近 lines 行日志（内存环形缓冲，上限 2000 行且重启清零）
 func (a *App) GetLogs(lines int) []string {
 	return a.ring.tail(lines)
 }
 
+// LogSource 日志来源（前端下拉用）
+type LogSource struct {
+	ID    string `json:"id"`    // memory / file
+	Label string `json:"label"` // 展示名
+}
+
+// LogSources 返回可选的日志来源。
+func (a *App) LogSources() []LogSource {
+	return []LogSource{
+		{ID: "memory", Label: "本次运行（内存，最近 2000 行）"},
+		{ID: "file", Label: "日志文件（seeinpc.log 尾部，含历史运行）"},
+	}
+}
+
+// ReadLogFile 读取磁盘日志文件 seeinpc.log 的尾部。
+// 内存环形缓冲只保留本次运行且重启清零，日志页需要能回看磁盘上的历史运行记录。
+func (a *App) ReadLogFile(lines int) []string {
+	if lines <= 0 || lines > 5000 {
+		lines = 1000
+	}
+	path := filepath.Join(logsDir(), "seeinpc.log")
+	content, err := tailFileLines(path, lines, 4*1024*1024)
+	if err != nil {
+		a.logWarnf("[APP] read log file failed path=%s err=%v", path, err)
+		return []string{}
+	}
+	if content == "" {
+		return []string{}
+	}
+	return strings.Split(content, "\n")
+}
+
+// safeURLForLog 去掉 URL 的 query 后返回，避免把签名/令牌写进日志。
+func safeURLForLog(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(unparsable url)"
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	u.User = nil
+	return u.String()
+}
+
+// tailFileLines 读取文件尾部至多 maxLines 行；大文件只读末尾 tailBytes 以避免整读。
+func tailFileLines(path string, maxLines int, tailBytes int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	size := info.Size()
+	offset := int64(0)
+	if size > tailBytes {
+		offset = size - tailBytes
+	}
+	buf := make([]byte, size-offset)
+	if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
+		return "", err
+	}
+	content := string(buf)
+	// 若非从文件头读起，丢弃首行（可能是半行）
+	if offset > 0 {
+		if idx := strings.Index(content, "\n"); idx >= 0 {
+			content = content[idx+1:]
+		}
+	}
+	rows := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(rows) > maxLines {
+		rows = rows[len(rows)-maxLines:]
+	}
+	return strings.Join(rows, "\n"), nil
+}
+
 // SetLogLevel 修改日志级别（即时生效并持久化）
 func (a *App) SetLogLevel(level string) OpResult {
-	if err := logx.SetLevel(level); err != nil {
+	lv, ok := logx.ParseLevel(level)
+	if !ok {
+		return OpResult{Message: fmt.Sprintf("invalid log level %q (want debug/info/warn/error)", level)}
+	}
+	// 级别变更需在收紧与放宽两个方向都留痕：
+	//   - requested 按旧级别记录，保证收紧（info -> error）时可见；
+	//   - changed   按新级别记录，保证放宽（error -> info）时可见。
+	prev := logx.GetLevel()
+	a.logf("[APP] log level change requested %s -> %s", prev, strings.ToLower(lv.String()))
+	if err := logx.SetLevel(lv.String()); err != nil {
 		return OpResult{Message: err.Error()}
 	}
 	a.mu.Lock()
 	a.cfg.Settings.LogLevel = logx.GetLevel()
-	_ = saveConfig(a.cfg)
+	err := saveConfig(a.cfg)
 	a.mu.Unlock()
-	a.logf("[APP] log level changed level=%s", logx.GetLevel())
+	a.logf("[APP] log level changed %s -> %s", prev, logx.GetLevel())
+	if err != nil {
+		a.logWarnf("[APP] persist log level failed (runtime level already applied): %v", err)
+	}
+	a.emitState() // 让各页面（日志页/设置页）的级别显示立即同步
+	if err != nil {
+		return OpResult{OK: true, Message: "已生效（配置保存失败：" + err.Error() + "，重启后可能回退）"}
+	}
 	return OpResult{OK: true, Message: "已生效"}
 }
 
@@ -637,10 +813,16 @@ func (a *App) SaveSettings(s Settings) OpResult {
 	err := saveConfig(a.cfg)
 	a.mu.Unlock()
 	if err != nil {
+		a.logErrorf("[APP] save settings failed: %v", err)
 		return OpResult{Message: "保存失败: " + err.Error()}
 	}
-	_ = logx.SetLevel(s.LogLevel)
-	a.logf("[APP] settings saved interval=%d", s.ProbeIntervalSec)
+	// 级别持久化值可能与运行时不一致（非法值），此处显式纠正并记录
+	if lvErr := logx.SetLevel(s.LogLevel); lvErr != nil {
+		a.logWarnf("[APP] settings carry invalid log level %q, keeping %s: %v",
+			s.LogLevel, logx.GetLevel(), lvErr)
+	}
+	a.logf("[APP] settings saved interval=%ds minimize_to_tray=%v log_level=%s servers=%d",
+		s.ProbeIntervalSec, s.MinimizeToTray, logx.GetLevel(), len(s.Servers))
 	a.emitState()
 	return OpResult{OK: true, Message: "设置已保存"}
 }
@@ -673,10 +855,12 @@ func (a *App) QuitApp() {
 // ---------------- VPN 会话 ----------------
 
 // startVPN 启动隧道（失败按步骤回滚：引擎→路由→网卡地址）
+// 日志：每步开始记 DEBUG（排障时能看到卡在哪一步），失败记 ERROR 并回滚，成功记 INFO。
 func (a *App) startVPN(e *Entry) error {
 	a.stopVPN("切换 VPN")
 
-	a.logf("[TUNNEL] connecting entry=%s opsId=%d server=%s", e.Name, e.OpsID, e.Server)
+	servers := a.entryServers(e)
+	a.logf("[TUNNEL] connecting entry=%s opsId=%d servers=%v", e.Name, e.OpsID, servers)
 	emitConnecting := func() {
 		a.mu.Lock()
 		a.probes[e.ID] = &probeInfo{Probe: "unknown", Msg: "连接中…", Last: time.Now()}
@@ -686,6 +870,8 @@ func (a *App) startVPN(e *Entry) error {
 	emitConnecting()
 
 	// 1. 创建虚拟网卡
+	a.debugf("[TUNNEL] step 1/5 create adapter name=%s mtu=%d admin=%v driver_ok=%v",
+		tunnel.AdapterName, tunnel.DefaultMTU, isAdmin(), driverReady())
 	dev, err := tunnel.CreateDevice(tunnel.DefaultMTU)
 	if err != nil {
 		a.logErrorf("[TUNNEL] create adapter failed: %v", err)
@@ -701,6 +887,7 @@ func (a *App) startVPN(e *Entry) error {
 	// 2. 配置网卡地址
 	subnet := pickTunSubnet(e.ACL)
 	adapterIP := fmt.Sprintf("10.0.%d.1", subnet)
+	a.debugf("[TUNNEL] step 2/5 configure address ip=%s/24 (subnet=%d)", adapterIP, subnet)
 	if err := tunnel.ConfigureAddress(adapterIP, "255.255.255.0"); err != nil {
 		dev.Close()
 		return rollback("配置网卡地址", err)
@@ -708,12 +895,14 @@ func (a *App) startVPN(e *Entry) error {
 	a.logf("[TUNNEL] adapter=%s ip=%s/24", tunnel.AdapterName, adapterIP)
 
 	// 3. 写路由
+	a.debugf("[TUNNEL] step 3/5 resolve interface index for %s", tunnel.AdapterName)
 	ifIdx, err := tunnel.AdapterIndex()
 	if err != nil {
 		tunnel.RemoveAddress(adapterIP)
 		dev.Close()
 		return rollback("查询接口索引", err)
 	}
+	a.debugf("[TUNNEL] step 3/5 add routes acl=%v gateway=%s if=%d", e.ACL, adapterIP, ifIdx)
 	added, err := tunnel.AddRoutes(e.ACL, adapterIP, ifIdx)
 	if err != nil {
 		tunnel.DeleteRoutes(added)
@@ -724,12 +913,14 @@ func (a *App) startVPN(e *Entry) error {
 	a.logf("[ROUTE] added=%v via=%s if=%d", added, adapterIP, ifIdx)
 
 	// 4. 启动协议栈引擎
+	a.debugf("[TUNNEL] step 4/5 start engine servers=%v opsId=%d user=%s",
+		servers, e.OpsID, e.ProxyUser)
 	dialer := &tunnel.Dialer{
-		Servers: a.entryServers(e), OpsID: e.OpsID,
+		Servers: servers, OpsID: e.OpsID,
 		Username: e.ProxyUser, Password: e.ProxyPass,
 		Timeout: 15 * time.Second,
 	}
-	engine, err := tunnel.StartEngine(dev, tunnel.DefaultMTU, dialer.DialContext, a.logf)
+	engine, err := tunnel.StartEngine(dev, tunnel.DefaultMTU, dialer.DialContext)
 	if err != nil {
 		tunnel.DeleteRoutes(added)
 		tunnel.RemoveAddress(adapterIP)
@@ -749,16 +940,19 @@ func (a *App) startVPN(e *Entry) error {
 	go func() {
 		time.Sleep(800 * time.Millisecond) // 等待路由生效
 		if !e.ProbeIntranet {
+			a.debugf("[PROBE] post-connect skipped entry=%s (intranet probe disabled)", e.Name)
 			a.markProbe(e.ID, "ok", "VPN 已连接（代理正常）")
 			a.emitState()
 			return
 		}
 		target := a.probeTargetOf(e)
 		if target == "" {
+			a.debugf("[PROBE] post-connect skipped entry=%s (no probe target configured)", e.Name)
 			a.markProbe(e.ID, "ok", "VPN 已连接（未配置内网探测目标）")
 			a.emitState()
 			return
 		}
+		a.debugf("[PROBE] post-connect dial entry=%s target=%s", e.Name, target)
 		start := time.Now()
 		conn, derr := net.DialTimeout("tcp", target, 8*time.Second)
 		if derr != nil {
@@ -766,6 +960,7 @@ func (a *App) startVPN(e *Entry) error {
 			a.markProbe(e.ID, "dialfail", "VPN 已连接，但内网目标 "+target+" 不可达")
 		} else {
 			conn.Close()
+			a.debugf("[PROBE] post-connect ok entry=%s target=%s rtt=%s", e.Name, target, time.Since(start))
 			a.markProbe(e.ID, "ok", "内网目标可达", time.Since(start))
 		}
 		a.emitState()
@@ -780,6 +975,7 @@ func (a *App) stopVPN(reason string) {
 	a.session = nil
 	a.mu.Unlock()
 	if s == nil {
+		a.debugf("[TUNNEL] stop skipped (no active session) reason=%s", reason)
 		return
 	}
 	tunnel.DeleteRoutes(s.addedRoutes)
@@ -787,7 +983,8 @@ func (a *App) stopVPN(reason string) {
 		s.engine.Stop() // 内部关闭 dev
 	}
 	tunnel.RemoveAddress(s.adapterIP)
-	a.logf("[TUNNEL] disconnected entry=%s reason=%s routes_removed=%d", s.entryName, reason, len(s.addedRoutes))
+	a.logf("[TUNNEL] disconnected entry=%s reason=%s routes_removed=%d uptime=%s",
+		s.entryName, reason, len(s.addedRoutes), time.Since(s.startedAt).Truncate(time.Second))
 	a.emitState()
 }
 
@@ -812,6 +1009,11 @@ func (a *App) triggerProbe() {
 
 // probeLoop 周期探测所有已填密码的入口（运行中的走隧道路径，其余走代理预检）
 func (a *App) probeLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			a.panicf("[PANIC] probe loop panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
 	for {
 		a.runProbeCycle()
 		a.mu.Lock()
@@ -830,6 +1032,9 @@ func (a *App) probeLoop() {
 	}
 }
 
+// runProbeCycle 执行一轮探测。
+// 日志：单次成功记 DEBUG（周期运行，高频），失败/认证错误记限频 WARN
+// —— 探测结果是诊断"时通时不通"的唯一连续线索，必须落盘而不是只更新卡片。
 func (a *App) runProbeCycle() {
 	defer func() {
 		a.mu.Lock()
@@ -850,60 +1055,100 @@ func (a *App) runProbeCycle() {
 		running := a.session != nil && a.session.entryID == e.ID
 		tasks = append(tasks, task{entry: *e, running: running})
 	}
+	interval := a.cfg.Settings.ProbeIntervalSec
 	a.mu.Unlock()
+	a.debugf("[PROBE] cycle start entries=%d interval=%ds", len(tasks), interval)
 
 	for _, t := range tasks {
 		if a.quitFlag.Load() {
 			return
 		}
 		e := t.entry
-		target := a.probeTargetOf(&e)
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		start := time.Now()
+
+		if !e.ProbeIntranet {
+			// 未勾选"探测内网目标"：仅探测代理服务器池的 TCP 可连接性，
+			// 不再向任何目标地址（含 ACL 网段首地址回退）发起 CONNECT。
+			rtt, addr, err := a.probeProxyTCP(&e)
+			if err != nil {
+				a.probeWarnf(e.ID, "[PROBE] fail entry=%s mode=proxy-tcp addr=%s err=%v", e.Name, addr, err)
+				a.markProbe(e.ID, "unreachable", "无法连接代理服务器 "+addr)
+			} else {
+				a.debugf("[PROBE] ok entry=%s mode=proxy-tcp addr=%s rtt=%s", e.Name, addr, rtt)
+				a.markProbe(e.ID, "ok", "代理可连接", rtt)
+			}
+			continue
+		}
+
+		target := a.probeTargetOf(&e)
 		dialer := &tunnel.Dialer{
 			Servers: a.entryServers(&e), OpsID: e.OpsID,
 			Username: e.ProxyUser, Password: e.ProxyPass, Timeout: 10 * time.Second,
 		}
 
-		if e.ProbeIntranet && t.running {
+		if t.running {
 			// 勾选内网探测且运行中：经虚拟网卡直连内网目标
 			conn, err := net.DialTimeout("tcp", target, 8*time.Second)
-			cancel()
 			if err != nil {
+				a.probeWarnf(e.ID, "[PROBE] fail entry=%s mode=intranet target=%s err=%v", e.Name, target, err)
 				a.markProbe(e.ID, "dialfail", "内网目标 "+target+" 不可达")
 			} else {
 				conn.Close()
+				a.debugf("[PROBE] ok entry=%s mode=intranet target=%s rtt=%s", e.Name, target, time.Since(start))
 				a.markProbe(e.ID, "ok", "内网目标可达", time.Since(start))
 			}
 			continue
 		}
 
-		// 默认：探测 HTTP 代理是否可用（CONNECT 认证预检），rtt 仅为到代理握手耗时
+		if target == "" {
+			a.markProbe(e.ID, "dialfail", "已勾选内网探测，但未填写探测目标且 ACL 为空，无法确定目标")
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		// 勾选内网探测但未运行：经代理对目标做 CONNECT 预检，rtt 仅为到代理握手耗时
 		rtt, err := dialer.Probe(ctx, target)
 		cancel()
 		switch {
 		case err == nil:
+			a.debugf("[PROBE] ok entry=%s mode=proxy target=%s rtt=%s", e.Name, target, rtt)
 			a.markProbe(e.ID, "ok", "代理可用", rtt)
 		case errors.Is(err, tunnel.ErrTargetUnreachable):
-			// 认证/ACL 通过但目标不可达：代理本身是可用的
-			if e.ProbeIntranet {
-				a.markProbe(e.ID, "dialfail", "认证通过，但内网目标 "+target+" 不可达")
-			} else {
-				a.markProbe(e.ID, "ok", "代理可用（认证通过）", rtt)
-			}
+			// 认证/ACL 通过但目标不可达：代理本身可用，但用户勾选了内网探测，按失败提示
+			a.probeWarnf(e.ID, "[PROBE] fail entry=%s mode=proxy target=%s (auth ok, target unreachable)", e.Name, target)
+			a.markProbe(e.ID, "dialfail", "认证通过，但内网目标 "+target+" 不可达")
 		case errors.Is(err, tunnel.ErrProxyAuthFailed):
+			a.probeWarnf(e.ID, "[PROBE] fail entry=%s mode=proxy cause=auth(407) user=%s", e.Name, e.ProxyUser)
 			a.markProbe(e.ID, "407", "认证失败：请核对代理用户名与密码")
 		case errors.Is(err, tunnel.ErrACLDenied):
+			a.probeWarnf(e.ID, "[PROBE] fail entry=%s mode=proxy cause=acl(403) target=%s", e.Name, target)
 			a.markProbe(e.ID, "403", "探测目标被 ACL 拒绝（可修改探测目标）")
 		case errors.Is(err, tunnel.ErrProxyUnreachable):
+			a.probeWarnf(e.ID, "[PROBE] fail entry=%s mode=proxy cause=unreachable server=%s", e.Name, dialer.Addr())
 			a.markProbe(e.ID, "unreachable", "无法连接代理服务器 "+dialer.Addr())
 		default:
+			a.probeWarnf(e.ID, "[PROBE] fail entry=%s mode=proxy target=%s err=%v", e.Name, target, err)
 			a.markProbe(e.ID, "dialfail", err.Error())
 		}
 	}
 }
 
-// probeTargetOf 探测目标：显式配置优先，否则取首个网段的首个可用地址:443
+// probeWarnf 探测失败告警限频：同一入口 60s 内只记一次。
+// 默认探测周期 30s，不限频会让持续失败的入口把日志刷满。
+func (a *App) probeWarnf(key, format string, args ...any) {
+	now := time.Now()
+	a.probeWarnMu.Lock()
+	last, ok := a.probeWarnAt[key]
+	if ok && now.Sub(last) < probeWarnWindow {
+		a.probeWarnMu.Unlock()
+		return
+	}
+	a.probeWarnAt[key] = now
+	a.probeWarnMu.Unlock()
+	a.logWarnf(format, args...)
+}
+
+// probeTargetOf 内网探测目标（仅勾选"探测内网目标"时才会用到）：
+// 显式配置优先，否则回退首个网段的首个可用地址:443；未勾选内网探测时不探测任何地址
 func (a *App) probeTargetOf(e *Entry) string {
 	if e.ProbeTarget != "" {
 		return e.ProbeTarget
@@ -926,6 +1171,26 @@ func (a *App) probeTargetOf(e *Entry) string {
 		return net.JoinHostPort(ip.String(), "443")
 	}
 	return ""
+}
+
+// probeProxyTCP 仅探测代理服务器本身的 TCP 可连接性（不发起 CONNECT、不指向任何内网目标）：
+// 按入口服务器池顺序逐台尝试，首台成功即返回其地址与握手耗时。
+func (a *App) probeProxyTCP(e *Entry) (time.Duration, string, error) {
+	var lastAddr string
+	var lastErr error = errors.New("未配置代理服务器")
+	for _, srv := range a.entryServers(e) {
+		addr := srv + ":" + fmt.Sprint(e.OpsID)
+		start := time.Now()
+		d := net.Dialer{Timeout: 8 * time.Second}
+		conn, err := d.Dial("tcp", addr)
+		if err != nil {
+			lastAddr, lastErr = addr, err
+			continue
+		}
+		_ = conn.Close()
+		return time.Since(start), addr, nil
+	}
+	return 0, lastAddr, lastErr
 }
 
 // ---------------- 工具 ----------------
@@ -978,7 +1243,8 @@ func (a *App) entryServers(e *Entry) []string {
 	return a.serverPool()
 }
 
-// validateProbeTarget 校验内网探测目标：留空合法（自动取首个网段地址:443）；
+// validateProbeTarget 校验内网探测目标：留空合法（直填入口=不启用内网探测，仅探测代理可连接性；
+// 编辑入口是否探测以勾选项为准，勾选且留空时回退首个网段地址:443）。
 // 填写时必须是 IPv4:端口。用户最常犯的错误是只填 IP 漏填端口，这里给出明确提示。
 func validateProbeTarget(s string) (string, string) {
 	s = strings.TrimSpace(s)
@@ -1144,7 +1410,7 @@ func (a *App) StartDownload() OpResult {
 	a.mu.Lock()
 	a.updateCancel = cancel
 	a.mu.Unlock()
-	a.logf("[UPDATE] download start version=%s url=%s", info.Version, info.URL)
+	a.logf("[UPDATE] download start version=%s size=%d src=%s", info.Version, info.Size, safeURLForLog(info.URL))
 	go func() {
 		defer a.downloading.Store(false)
 		defer cancel()

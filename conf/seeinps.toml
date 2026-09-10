@@ -17,3 +17,8 @@ level = "info"
 path = "logs"
 max_size = 100
 max_backups = 7
+
+[audit]
+# true = 不可逆/高敏感操作（删除代理）先写审计再执行，审计落库失败则拒绝该操作。
+# false（默认）= best-effort：审计写入失败记 ERROR 日志，业务照常进行。
+fail_closed = false

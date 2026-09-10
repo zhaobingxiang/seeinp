@@ -402,14 +402,23 @@ func (s *Server) handleVersionDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, 2004, "版本不存在")
 		return
 	}
+	// 删除升级包不可逆（文件随之删除）：fail_closed 时先落审计
+	if !s.auditBefore(w, r, "version_delete", v.Version,
+		fmt.Sprintf("endpoint=%s platform=%s/%s file=%s", v.Endpoint, v.GoOS, v.GoArch, v.FileName)) {
+		return
+	}
 	ok, err := s.store.DeleteVersion(id)
 	if err != nil || !ok {
+		logx.Errorf("[VERSION] delete record failed version=%s id=%d err=%v", v.Version, id, err)
 		writeErr(w, http.StatusInternalServerError, 5000, "删除版本记录失败")
 		return
 	}
-	os.RemoveAll(filepath.Join(releaseDir, v.Endpoint, v.Version, v.GoOS+"-"+v.GoArch))
-	logx.Infof("[VERSION] deleted: endpoint=%s version=%s platform=%s/%s", v.Endpoint, v.Version, v.GoOS, v.GoArch)
-	s.audit(r, "version_delete", v.Version, fmt.Sprintf("endpoint=%s platform=%s/%s file=%s", v.Endpoint, v.GoOS, v.GoArch, v.FileName))
+	if rerr := os.RemoveAll(filepath.Join(releaseDir, v.Endpoint, v.Version, v.GoOS+"-"+v.GoArch)); rerr != nil {
+		// 记录已删但文件残留：仅告警，不回滚（避免出现"记录在但文件已删"的更差状态）
+		logx.Warnf("[VERSION] delete files failed (record already removed) version=%s err=%v", v.Version, rerr)
+	}
+	logx.Infof("[VERSION] deleted: endpoint=%s version=%s platform=%s/%s by=%s",
+		v.Endpoint, v.Version, v.GoOS, v.GoArch, operatorFrom(r))
 	writeOK(w, nil)
 }
 
@@ -435,16 +444,27 @@ func (s *Server) handleClientUpgrade(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, 5002, "该 seeinps 不在线，无法升级")
 		return
 	}
+	if status, code, msg := s.startUpgradeFor(client, v); status != 0 {
+		writeErr(w, status, code, msg)
+		return
+	}
+	s.audit(r, "client_upgrade", username, fmt.Sprintf("version=%s sha256=%s", v.Version, v.Sha256[:16]))
+	writeOK(w, map[string]interface{}{"started": true, "version": v.Version, "totalBytes": v.FileSize})
+}
+
+// startUpgradeFor 单点与批量共用的升级核心：平台强校验 → 防重入 → beginUpgrade →
+// UPGRADE_PUSH 预检（同步等应答）→ 后台协程 0x05 流传包。
+// 返回 httpStatus==0 表示已成功启动；否则返回可直接透传给前端的状态码与文案。
+func (s *Server) startUpgradeFor(client *Client, v *store.Version) (httpStatus, bizCode int, msg string) {
+	username := client.username
 	// 平台强校验：升级包平台必须与节点平台完全一致，杜绝跨平台误推导致节点 exec 失败
 	if v.GoOS != client.goos || v.GoArch != client.goarch {
-		writeErr(w, http.StatusBadRequest, 2000,
-			fmt.Sprintf("升级包平台不匹配：节点是 %s/%s，包是 %s/%s", client.goos, client.goarch, v.GoOS, v.GoArch))
-		return
+		return http.StatusBadRequest, 2000,
+			fmt.Sprintf("升级包平台不匹配：节点是 %s/%s，包是 %s/%s", client.goos, client.goarch, v.GoOS, v.GoArch)
 	}
 	// 相同或更低版本也允许推送（即手动回滚到旧包），最终版本号变化由前端轮询观察
 	if isUpgrading(username) {
-		writeErr(w, http.StatusConflict, 3001, "该节点正在升级中")
-		return
+		return http.StatusConflict, 3001, "该节点正在升级中"
 	}
 	beginUpgrade(username, v.Version, v.FileSize)
 
@@ -455,8 +475,7 @@ func (s *Server) handleClientUpgrade(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.clientRequest(client, push, 15*time.Second)
 	if err != nil {
 		upgradeStage(username, "failed", "升级通知超时: "+err.Error())
-		writeErr(w, http.StatusGatewayTimeout, 5003, "升级通知超时: "+err.Error())
-		return
+		return http.StatusGatewayTimeout, 5003, "升级通知超时: " + err.Error()
 	}
 	if resp.Code == nil || *resp.Code != protocol.CodeOK {
 		msgText := "seeinps 拒绝升级"
@@ -468,8 +487,7 @@ func (s *Server) handleClientUpgrade(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		upgradeStage(username, "failed", msgText)
-		writeErr(w, http.StatusBadGateway, 5002, msgText)
-		return
+		return http.StatusBadGateway, 5002, msgText
 	}
 
 	// 2. 0x05 数据流直传二进制放后台协程：慢链路可能持续数分钟，
@@ -487,8 +505,7 @@ func (s *Server) handleClientUpgrade(w http.ResponseWriter, r *http.Request) {
 		upgradeStage(username, "sent", "")
 		logx.Infof("[UPGRADE] package sent, waiting for node restart: user=%s version=%s", username, v.Version)
 	}()
-	s.audit(r, "client_upgrade", username, fmt.Sprintf("version=%s sha256=%s", v.Version, v.Sha256[:16]))
-	writeOK(w, map[string]interface{}{"started": true, "version": v.Version, "totalBytes": v.FileSize})
+	return 0, 0, ""
 }
 
 // handleUpgradeStatus GET /api/v1/clients/{username}/upgrade-status：前端轮询升级进度

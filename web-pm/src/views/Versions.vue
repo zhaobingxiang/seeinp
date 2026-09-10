@@ -53,14 +53,20 @@
     <div class="page-card" style="padding:20px">
       <div class="card-header" style="margin-bottom:16px">
         <span>在线节点</span>
-        <el-button @click="refreshNow" :loading="refreshing">刷新</el-button>
+        <div>
+          <el-button v-if="batchRunning" type="warning" plain @click="reopenBatch">批量升级任务进行中</el-button>
+          <el-button type="primary" :disabled="clients.length === 0 || versions.length === 0" @click="openBatch">批量升级</el-button>
+          <el-button @click="refreshNow" :loading="refreshing">刷新</el-button>
+        </div>
       </div>
 
       <div v-if="clients.length === 0" class="empty-state">
         <el-empty description="暂无在线的 seeinps 节点" />
       </div>
 
-      <el-table v-else :data="pageClients" style="width: 100%">
+      <el-table v-else :data="pageClients" style="width: 100%" row-key="username" ref="clientsTableRef"
+        @selection-change="(rows: any[]) => (selectedClients = rows)">
+        <el-table-column type="selection" width="42" reserve-selection :selectable="() => !batchRunning" />
         <el-table-column prop="username" label="用户名" min-width="120" />
         <el-table-column label="连接状态" width="100">
           <template #default="{ row }">
@@ -178,6 +184,93 @@
           <el-button type="primary" :loading="upgrading" @click="handleUpgrade">确认升级</el-button>
         </template>
         <el-button v-else type="primary" @click="closeUpgradeProgress">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 批量升级弹窗 -->
+    <el-dialog v-model="showBatch" title="批量升级" width="820px" :close-on-click-modal="false"
+      :before-close="(done: any) => (batchPhase === 'progress' ? (showBatch = false, done()) : done())">
+      <template v-if="batchPhase === 'config'">
+        <el-alert type="warning" :closable="false" style="margin-bottom:14px"
+          title="批量升级将按并发数逐个重启所选节点，期间这些节点的全部代理会短暂断开；建议安排在业务低峰期执行。" />
+        <div class="form-tip" style="margin-bottom:10px">已选择 <b>{{ selectedClients.length }}</b> 个节点（未勾选任何节点时默认为全部在线节点），按平台匹配升级包：</div>
+        <el-table :data="batchPlatformGroups" size="small" style="margin-bottom:14px">
+          <el-table-column label="平台" width="150">
+            <template #default="{ row }">
+              <el-tag size="small" type="info">{{ row.goos }} / {{ row.goarch }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="count" label="节点数" width="80" />
+          <el-table-column label="目标版本包">
+            <template #default="{ row }">
+              <el-select v-if="row.packages.length" v-model="batchPkgs[row.key]" style="width:100%">
+                <el-option v-for="p in row.packages" :key="p.id" :value="p.id" :label="p.version + (row.sampleVersion && compareVersion(p.version, row.sampleVersion) > 0 ? '（升级）' : '（回滚）')" />
+              </el-select>
+              <span v-else style="color:var(--el-color-danger);font-size:12px">无该平台版本包，这些节点将被跳过</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-form label-width="110px">
+          <el-form-item label="金丝雀先行">
+            <el-switch v-model="batchCanary" />
+            <div class="form-tip">先升级 1 台并等待验证通过，再放开其余节点；金丝雀失败将中止整个批次</div>
+          </el-form-item>
+          <el-form-item label="并发数">
+            <el-input-number v-model="batchConcurrency" :min="1" :max="8" />
+            <div class="form-tip">同时传输的节点数。升级包经 seeinpm 上行带宽分发，并发越高每台越慢，一般 2~3 即可</div>
+          </el-form-item>
+        </el-form>
+      </template>
+      <template v-else>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+          <span>任务 <span style="font-family:var(--font-mono,monospace)">{{ batchTask?.id }}</span></span>
+          <el-tag size="small" :type="batchPhaseDoneUI ? 'success' : 'warning'">{{ batchPhaseDoneUI ? '已结束' : '进行中' }}</el-tag>
+          <el-tag size="small" type="info">等待 {{ batchCount('pending') }}</el-tag>
+          <el-tag size="small" type="warning">进行中 {{ batchCount('running') }}</el-tag>
+          <el-tag size="small" type="success">成功 {{ batchCount('verified') }}</el-tag>
+          <el-tag size="small" type="danger">失败 {{ batchCount('failed') }}</el-tag>
+          <el-tag size="small">跳过 {{ batchCount('skipped') }}</el-tag>
+        </div>
+        <el-alert v-if="batchCanaryNote" :closable="false" :type="batchCanaryNote.type" :title="batchCanaryNote.text" style="margin-bottom:10px" />
+        <el-table :data="batchTask?.nodes || []" size="small" max-height="380">
+          <el-table-column prop="username" label="节点" min-width="110" show-overflow-tooltip />
+          <el-table-column label="角色" width="72">
+            <template #default="{ row }">
+              <el-tag v-if="row.role === 'canary'" size="small" type="warning">金丝雀</el-tag>
+              <span v-else>-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="版本" width="190">
+            <template #default="{ row }">
+              <span style="font-family:var(--font-mono,monospace);font-size:12px">{{ row.currentVersion || '?' }} → {{ row.version || '-' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="88">
+            <template #default="{ row }">
+              <el-tag size="small" :type="(batchStageTag[row.stage] || 'info') as any">{{ batchStageText[row.stage] || row.stage }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="传输进度" width="130">
+            <template #default="{ row }">
+              <el-progress v-if="row.totalBytes > 0" :percentage="Math.min(100, Math.round(row.sentBytes / row.totalBytes * 100))" :stroke-width="6"
+                :status="row.stage === 'failed' ? 'exception' : (row.stage === 'verified' ? 'success' : undefined)" />
+              <span v-else>-</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="reason" label="说明" min-width="150" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.reason || '-' }}</template>
+          </el-table-column>
+        </el-table>
+      </template>
+      <template #footer>
+        <template v-if="batchPhase === 'config'">
+          <el-button @click="showBatch = false">取消</el-button>
+          <el-button type="danger" :loading="batchStarting" @click="startBatch">开始批量升级</el-button>
+        </template>
+        <template v-else>
+          <el-button v-if="!batchPhaseDoneUI" type="warning" @click="stopBatch">停止（仅未开始的节点）</el-button>
+          <el-button type="primary" @click="showBatch = false">{{ batchPhaseDoneUI ? '关闭' : '后台运行' }}</el-button>
+        </template>
       </template>
     </el-dialog>
   </Layout>
@@ -575,18 +668,159 @@ const watchNodeVersion = () => {
   }, 3000)
 }
 
+// ===== 批量升级 =====
+const selectedClients = ref<any[]>([])
+const clientsTableRef = ref()
+const showBatch = ref(false)
+const batchPhase = ref<'config' | 'progress'>('config')
+const batchPkgs = reactive<Record<string, number>>({})
+const batchCanary = ref(true)
+const batchConcurrency = ref(2)
+const batchStarting = ref(false)
+const batchTask = ref<any>(null)
+let batchPollTimer: number | undefined
+
+const batchStageText: Record<string, string> = {
+  pending: '等待中', running: '进行中', verified: '成功', failed: '失败', skipped: '跳过'
+}
+const batchStageTag: Record<string, string> = {
+  pending: 'info', running: 'warning', verified: 'success', failed: 'danger', skipped: 'info'
+}
+
+const batchCount = (stage: string) => (batchTask.value?.counts || {})[stage] || 0
+const batchPhaseDoneUI = computed(() => {
+  const t = batchTask.value
+  if (!t) return false
+  if (t.phase === 'done') return true
+  // phase 兜底：PM 重启丢任务时按节点终态判断，避免前端永远"进行中"
+  const nodes: any[] = t.nodes || []
+  return nodes.length > 0 && nodes.every((n: any) => ['verified', 'failed', 'skipped'].includes(n.stage))
+})
+const batchRunning = computed(() => !!batchTask.value && !batchPhaseDoneUI.value)
+
+const batchCanaryNote = computed(() => {
+  const t = batchTask.value
+  if (!t || !t.useCanary) return null
+  const canary = (t.nodes || []).find((n: any) => n.role === 'canary')
+  if (!canary) return null
+  if (canary.stage === 'running' || canary.stage === 'pending') return { type: 'info', text: '金丝雀节点升级中，通过后再放开其余节点' }
+  if (canary.stage === 'verified') return { type: 'success', text: '金丝雀已通过，其余节点按计划推进' }
+  return { type: 'error', text: '金丝雀失败：' + (canary.reason || '未知原因') + '，批量已中止' }
+})
+
+// 目标节点集合（未勾选=全部在线）按平台分组 + 各平台可用包
+const batchPlatformGroups = computed(() => {
+  const targets = selectedClients.value.length ? selectedClients.value : clients.value
+  const map = new Map<string, any>()
+  for (const c of targets) {
+    const key = (c.goos || '?') + '/' + (c.goarch || '?')
+    if (!map.has(key)) map.set(key, { key, goos: c.goos, goarch: c.goarch, count: 0, sampleVersion: c.version, packages: [] as any[] })
+    map.get(key).count++
+  }
+  for (const g of map.values()) {
+    g.packages = versions.value.filter((v: any) => v.goos === g.goos && v.goarch === g.goarch)
+  }
+  return [...map.values()]
+})
+
+const openBatch = () => {
+  batchPhase.value = 'config'
+  for (const k of Object.keys(batchPkgs)) delete batchPkgs[k]
+  for (const g of batchPlatformGroups.value) {
+    if (g.packages.length) batchPkgs[g.key] = g.packages[0].id // 版本列表按新→旧排，默认最新
+  }
+  showBatch.value = true
+}
+
+const reopenBatch = () => {
+  if (batchTask.value) { batchPhase.value = 'progress'; showBatch.value = true }
+}
+
+const startBatch = async () => {
+  const targets = selectedClients.value.length ? selectedClients.value : clients.value
+  const packages = batchPlatformGroups.value
+    .filter((g: any) => g.packages.length && batchPkgs[g.key])
+    .map((g: any) => ({ versionId: batchPkgs[g.key], goos: g.goos, goarch: g.goarch }))
+  if (!packages.length) { ElMessage.warning('没有任何平台选到了版本包'); return }
+  try {
+    await ElMessageBox.confirm(
+      `将对 ${targets.length} 个节点执行批量升级（并发 ${batchConcurrency.value}${batchCanary.value ? '，金丝雀先行' : ''}）。升级期间这些节点的全部代理将中断并自动恢复，请确认已在业务低峰期。\n\n是否开始？`,
+      '批量升级风险提示',
+      { type: 'warning', confirmButtonText: '我已了解，开始升级', cancelButtonText: '取消', confirmButtonClass: 'el-button--danger' }
+    )
+  } catch { return }
+  batchStarting.value = true
+  try {
+    const res: any = await clientApi.upgradeBatch({
+      packages,
+      usernames: selectedClients.value.length ? targets.map((c: any) => c.username) : undefined,
+      concurrency: batchConcurrency.value,
+      useCanary: batchCanary.value
+    })
+    if (res.code === 0) {
+      batchTask.value = res.data
+      batchPhase.value = 'progress'
+      startBatchPoll()
+    } else {
+      ElMessage.error(res.message || '批量任务创建失败')
+    }
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.message || '批量任务创建失败')
+  } finally {
+    batchStarting.value = false
+  }
+}
+
+const stopBatch = async () => {
+  try {
+    await ElMessageBox.confirm('停止后仅跳过尚未开始的节点，传输/重启中的节点不会被打断。', '确认停止', { type: 'warning' })
+    const res: any = await clientApi.batchStop(batchTask.value.id)
+    if (res.code === 0) batchTask.value = res.data
+    else ElMessage.error(res.message || '停止失败')
+  } catch { /* 取消或失败提示 */ }
+}
+
+const stopBatchPoll = () => { if (batchPollTimer) { clearInterval(batchPollTimer); batchPollTimer = undefined } }
+
+const startBatchPoll = () => {
+  stopBatchPoll()
+  batchPollTimer = window.setInterval(async () => {
+    const t = batchTask.value
+    if (!t) { stopBatchPoll(); return }
+    try {
+      const res: any = await clientApi.batchStatus(t.id)
+      if (res.code !== 0) return
+      batchTask.value = res.data
+      if (batchPhaseDoneUI.value) {
+        stopBatchPoll()
+        const c = res.data.counts || {}
+        ElMessage({ type: (c.failed ? 'warning' : 'success'), message: `批量升级结束：成功 ${c.verified || 0} / 失败 ${c.failed || 0} / 跳过 ${c.skipped || 0}`, duration: 8000 })
+        loadClients()
+      }
+    } catch { /* 忽略瞬时轮询错误 */ }
+  }, 2500)
+}
+
 let pollTimer: number | undefined
 
 onMounted(() => {
   loadVersions()
   loadClients()
   pollTimer = window.setInterval(loadClients, 10000)
+  // 刷新页面后恢复进行中的批量任务视图（任务本体在 PM 内存中持续执行）
+  clientApi.batches().then((res: any) => {
+    if (res.code !== 0) return
+    const active = (res.data.items || []).find((t: any) =>
+      t.phase !== 'done' && (t.nodes || []).some((n: any) => ['pending', 'running'].includes(n.stage)))
+    if (active) { batchTask.value = active; startBatchPoll() }
+  }).catch(() => {})
 })
 
 onUnmounted(() => {
   if (pollTimer) window.clearInterval(pollTimer)
   stopUpgradePoll()
   stopUpgradeWatch()
+  stopBatchPoll()
 })
 </script>
 

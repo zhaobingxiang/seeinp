@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 
 	"github.com/energye/systray"
 	"github.com/seeinp/seeinp/internal/logx"
@@ -29,21 +30,36 @@ var trayIcon []byte
 func main() {
 	elevateAndRestart() // 虚拟网卡需管理员权限（清单声明之外的运行时兜底）
 
+	// 日志尽早接管：双开检测、驱动准备等启动期问题才有记录可查
+	// （此前 logx.Install 在实例锁校验之后，锁失败直接 exit 会留下零日志）
+	restoreLogs := logx.Install(logsDir(), "seeinpc", "info", 10, 7)
+	defer restoreLogs()
+
+	// 兜底：panic 时记录堆栈并立即刷盘。
+	// logx 经管道异步落盘，进程直接崩溃会丢掉尾部日志（含 panic 堆栈）——
+	// 全项目此前只有 version.go/selfupgrade.go/deployer 有 recover，seeinpc 一处都没有。
+	defer func() {
+		if r := recover(); r != nil {
+			logx.Panicf("[PANIC] seeinpc panicked: %v\n%s", r, debug.Stack())
+			panic(r)
+		}
+	}()
+
 	if _, err := acquireInstanceLock(filepath.Join(exeDir(), "seeinpc.lock")); err != nil {
 		// 已有实例在运行：弹窗告知（GUI 子系统下 stderr 不可见，静默退出曾让
 		// 用户误以为新实例的托盘失效，实为旧实例残留图标）
+		logx.Panicf("[APP] another instance is already running, exiting: %v", err)
 		title, _ := windows.UTF16PtrFromString("seeinpc")
 		text, _ := windows.UTF16PtrFromString("seeinpc 已在运行（请查看任务栏通知区域图标）。\n如托盘图标无响应，将鼠标悬停其上即可清除失效图标。")
 		_, _ = windows.MessageBox(0, text, title, windows.MB_OK|windows.MB_ICONINFORMATION)
 		os.Exit(0)
 	}
 
-	restoreLogs := logx.Install(logsDir(), "seeinpc", "info", 10, 7)
-	defer restoreLogs()
-
 	wintunEmbed = wintunDLL
 	if err := ensureWintun(); err != nil {
 		logx.Errorf("[DRIVER] wintun 准备失败: %v", err)
+	} else {
+		logx.Infof("[DRIVER] wintun ready admin=%v", isAdmin())
 	}
 
 	app := NewApp()
@@ -61,6 +77,11 @@ func main() {
 	// 也不可能再把托盘循环挤走。Run 返回即托盘消息循环终止（正常退出时 quitFlag
 	// 已置位），此处日志用于侦测"图标可见但点击无响应"的循环停摆问题。
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logx.Panicf("[PANIC] tray goroutine panicked: %v\n%s", r, debug.Stack())
+			}
+		}()
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		systray.Run(func() { setupTray(app) }, func() {})

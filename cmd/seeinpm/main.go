@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,8 +42,12 @@ import (
 )
 
 const (
-	connReadTimeout = 60 * time.Second
-	connIdleTimeout = 300 * time.Second
+	// connWriteTimeout 转发连接单次写的上限（每次写前刷新，滑动语义）：
+	// 对端窗口僵死时最迟在此时间后写失败、连接回收。
+	connWriteTimeout = 300 * time.Second
+	// connKeepAlivePeriod 转发连接 TCP keepalive 探测间隔：空闲长连接不再被固定寿命掐断，
+	// 死连接（客户端掉线无 FIN）由 keepalive 探测失败回收。
+	connKeepAlivePeriod = 60 * time.Second
 	// udpSessionIdle 会话无任何双向活动超过此时间则回收（与 seeinps 联动）
 	udpSessionIdle = 120 * time.Second
 )
@@ -73,6 +79,9 @@ type Server struct {
 	quotaMu       sync.Mutex
 	// fatal 上抛致命错误（如控制监听失败），Start 收到后优雅关停并以错误退出
 	fatal chan error
+	// loginFailAt 登录失败审计的按 IP 节流（防 spraying 刷爆审计表）
+	loginFailMu sync.Mutex
+	loginFailAt map[string]time.Time
 }
 
 // proxyTraffic 代理流量内存计数：in/out 为进程启动以来累计（含未落库部分），
@@ -187,6 +196,7 @@ func NewServer(config *config.PMConfig) (*Server, error) {
 		shapers:            make(map[string]*shaper.Limiter),
 		quotaEnforced:      make(map[string]bool),
 		fatal:              make(chan error, 2),
+		loginFailAt:        make(map[string]time.Time),
 	}, nil
 }
 
@@ -286,6 +296,11 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("/api/v1/clients", s.authMiddleware(s.handleClientsAPI))
 	mux.HandleFunc("POST /api/v1/clients/{username}/upgrade", s.authMiddleware(s.handleClientUpgrade))
 	mux.HandleFunc("GET /api/v1/clients/{username}/upgrade-status", s.authMiddleware(s.handleUpgradeStatus))
+	// 批量升级（内存任务编排，金丝雀+限并发）
+	mux.HandleFunc("POST /api/v1/clients/upgrade-batch", s.authMiddleware(s.handleUpgradeBatchCreate))
+	mux.HandleFunc("GET /api/v1/upgrade-batches", s.authMiddleware(s.handleUpgradeBatchList))
+	mux.HandleFunc("GET /api/v1/upgrade-batch/{id}", s.authMiddleware(s.handleUpgradeBatchGet))
+	mux.HandleFunc("POST /api/v1/upgrade-batch/{id}/stop", s.authMiddleware(s.handleUpgradeBatchStop))
 	mux.HandleFunc("GET /api/v1/versions", s.authMiddleware(s.handleVersionsList))
 	mux.HandleFunc("POST /api/v1/versions", s.authMiddleware(s.handleVersionUpload))
 	mux.HandleFunc("DELETE /api/v1/versions/{id}", s.authMiddleware(s.handleVersionDelete))
@@ -300,6 +315,7 @@ func (s *Server) startHTTPListener() {
 	mux.HandleFunc("POST /api/v1/proxies/{username}/{proxyId}/disable", s.authMiddleware(s.handleProxyDisable))
 	mux.HandleFunc("POST /api/v1/proxies/{username}/{proxyId}/enable", s.authMiddleware(s.handleProxyEnable))
 	mux.HandleFunc("GET /api/v1/audit-logs", s.authMiddleware(s.handleAuditLogs))
+	mux.HandleFunc("GET /api/v1/audit-logs/export", s.authMiddleware(s.handleAuditLogsExport))
 	mux.HandleFunc("GET /api/v1/logs", s.authMiddleware(s.handleListLogFiles))
 	mux.HandleFunc("GET /api/v1/logs/content", s.authMiddleware(s.handleLogFileContent))
 	// 系统日志：运行时查询/修改日志级别（持久化到 toml，审计记录 log_level_update）
@@ -308,6 +324,8 @@ func (s *Server) startHTTPListener() {
 	// 混合架构：A 端按需拉取在线 B 端（seeinps）运行日志（经控制通道转发）
 	mux.HandleFunc("GET /api/v1/ps-logs", s.authMiddleware(s.handlePSLogList))
 	mux.HandleFunc("GET /api/v1/ps-logs/content", s.authMiddleware(s.handlePSLogContent))
+	mux.HandleFunc("PUT /api/v1/ps-logging", s.authMiddleware(s.handlePSLoggingSet))
+	mux.HandleFunc("GET /api/v1/ps-logging", s.authMiddleware(s.handlePSLoggingGet))
 
 	// 前端内嵌于二进制（internal/webui），与后端版本严格一致，随版本包同步更新
 	mux.HandleFunc("/", webui.SPAHandler(webui.PM()))
@@ -322,8 +340,8 @@ func (s *Server) startHTTPListener() {
 	downloadMux := http.NewServeMux()
 	downloadMux.HandleFunc("/api/v1/ps-release/download", s.handlePSReleaseDownload)
 	topMux := http.NewServeMux()
-	topMux.Handle("/api/v1/ps-release/download", downloadMux)
-	topMux.Handle("/", gzhttp.Handler(mux))
+	topMux.Handle("/api/v1/ps-release/download", s.accessLog(downloadMux))
+	topMux.Handle("/", s.accessLog(gzhttp.Handler(mux)))
 	if err := http.ListenAndServe(addr, topMux); err != nil {
 		logx.Errorf("[HTTP] listener error: %v", err)
 	}
@@ -362,6 +380,10 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		// 回填操作者给外层访问日志（context 里是指针，外层可读到）
+		if info, ok := r.Context().Value(accessInfoKey).(*accessInfo); ok {
+			info.operator = claims.Username
+		}
 		next(w, r.WithContext(context.WithValue(r.Context(), operatorKey, claims.Username)))
 	}
 }
@@ -374,22 +396,70 @@ func operatorFrom(r *http.Request) string {
 	return "unknown"
 }
 
-// audit 写一条操作审计记录（自动附加来源 IP）；失败只打日志不影响主流程
+// audit 写一条操作审计记录（自动附加来源 IP）。
+// best-effort：写失败记 ERROR（此前只 Warnf，业务照常成功返回，等于"动作成功但无审计"且不显眼）。
+// 需要 fail-closed 的关键动作用 auditBefore。
 func (s *Server) audit(r *http.Request, action, target, detail string) {
+	s.auditRecord(operatorFrom(r), action, target, withIP(detail, clientIP(r)))
+}
+
+// auditBefore 先落库审计、再执行关键操作（fail-closed）。
+// 仅在配置 [audit] fail_closed = true 时生效：审计写不进去就拒绝执行，
+// 避免出现"用户已删除但审计表里查不到"这类不可追溯的状态。返回 false 表示已写出响应。
+func (s *Server) auditBefore(w http.ResponseWriter, r *http.Request, action, target, detail string) bool {
+	if !s.config.Audit.FailClosed {
+		s.audit(r, action, target, detail)
+		return true
+	}
+	if err := s.auditRecord(operatorFrom(r), action, target, withIP(detail, clientIP(r))); err != nil {
+		writeErr(w, http.StatusInternalServerError, 5000, "审计日志写入失败，已拒绝该操作（fail_closed 已开启）")
+		return false
+	}
+	return true
+}
+
+// withIP 把来源 IP 追加到 detail 末尾（保持既有 "k=v; k=v" 风格）。
+func withIP(detail, ip string) string {
 	if detail != "" {
 		detail += "; "
 	}
-	detail += "ip=" + clientIP(r)
-	if err := s.store.InsertAuditLog(operatorFrom(r), action, target, detail); err != nil {
-		logx.Warnf("[AUDIT] insert error: %v", err)
+	return detail + "ip=" + ip
+}
+
+// auditRecord 落库一条 PM 本地审计；返回错误供 fail-closed 场景判定。
+func (s *Server) auditRecord(username, action, target, detail string) error {
+	if err := s.store.InsertAuditLog(username, action, target, detail); err != nil {
+		logx.Errorf("[AUDIT] insert failed action=%s user=%s err=%v", action, username, err)
+		return err
 	}
+	logx.Debugf("[AUDIT] recorded action=%s user=%s target=%q", action, username, target)
+	return nil
 }
 
 // auditLogin 登录成败审计（无 JWT，操作者取自请求体）
 func (s *Server) auditLogin(username, action string, r *http.Request) {
-	if err := s.store.InsertAuditLog(username, action, "", "ip="+clientIP(r)); err != nil {
-		logx.Warnf("[AUDIT] insert error: %v", err)
+	s.auditRecord(username, action, "", "ip="+clientIP(r))
+}
+
+// auditLoginFailed 登录失败审计的按 IP 节流：guard 的锁定按 username，
+// 攻击者换 username 喷洒可无限写审计表；同一 IP 60s 内只记一条。
+func (s *Server) auditLoginFailed(username, ip string) {
+	now := time.Now()
+	s.loginFailMu.Lock()
+	if last, ok := s.loginFailAt[ip]; ok && now.Sub(last) < time.Minute {
+		s.loginFailMu.Unlock()
+		return
 	}
+	s.loginFailAt[ip] = now
+	if len(s.loginFailAt) > 1024 {
+		for k, t := range s.loginFailAt {
+			if now.Sub(t) > time.Minute {
+				delete(s.loginFailAt, k)
+			}
+		}
+	}
+	s.loginFailMu.Unlock()
+	s.auditRecord(username, "login_failed", "", "ip="+ip)
 }
 
 // clientIP 从请求取客户端 IP（去掉端口）
@@ -399,6 +469,127 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// ---------------- HTTP 访问/错误日志中间件 ----------------
+//
+// 级别约定（PM 与 PS 一致）：
+//   - 5xx -> ERROR（服务端故障，必须能事后定位）
+//   - 4xx -> WARN （客户端/权限问题，如 401 未登录、403 无权限、400 参数错）
+//   - 其余（2xx/3xx）-> DEBUG（默认关闭，排查时开启即可看到完整调用轨迹）
+//
+// 此前所有 writeErr 只把错误回给前端、不落盘，用户报"操作报错了"时服务端零线索。
+
+// accessInfoKey 承载本次请求的访问日志附加信息（指针，便于内层处理器回填）。
+const accessInfoKey ctxKey = "access-info"
+
+// accessInfo 由外层中间件创建、内层 authMiddleware 回填操作者。
+type accessInfo struct{ operator string }
+
+// statusRecorder 捕获响应状态码与写出字节数。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += n
+	return n, err
+}
+
+// Flush / Unwrap 透传，避免破坏 gzip 中间件与大文件流式下载。
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// ReadFrom 透传底层 writer 的 ReadFrom（sendfile），否则 200MB 安装包下载会退化为纯用户态拷贝。
+// 注意必须委托给 r.ResponseWriter 而不是自己，避免 io.Copy 回调自身造成无限递归。
+func (r *statusRecorder) ReadFrom(src io.Reader) (int64, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	if rf, ok := r.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := rf.ReadFrom(src)
+		r.bytes += int(n)
+		return n, err
+	}
+	n, err := io.Copy(r.ResponseWriter, src)
+	r.bytes += int(n)
+	return n, err
+}
+
+// Unwrap 之外还需支持 Hijacker（yamux 数据流不经过 HTTP，此处为通用兼容）
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := r.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("hijack not supported")
+}
+
+// skipAccessLog 静态资源与健康检查不进访问日志，避免刷屏。
+func skipAccessLog(path string) bool {
+	return path == "/health" || !strings.HasPrefix(path, "/api/")
+}
+
+// accessLog 统一 HTTP 访问/错误日志中间件：按状态码分级记录 method/path/status/耗时/字节/IP/操作者。
+// 同时兜住 handler 内的 panic —— 此前没有 recover，一次 panic 会打挂整个 HTTP 服务。
+func (s *Server) accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if skipAccessLog(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		info := &accessInfo{}
+		rec := &statusRecorder{ResponseWriter: w}
+		start := time.Now()
+		r = r.WithContext(context.WithValue(r.Context(), accessInfoKey, info))
+
+		defer func() {
+			if rv := recover(); rv != nil {
+				if rec.status == 0 {
+					rec.status = http.StatusInternalServerError
+					rec.ResponseWriter.WriteHeader(rec.status)
+					_, _ = rec.ResponseWriter.Write([]byte(`{"code":5000,"message":"internal error"}`))
+				}
+				logx.Errorf("[HTTP] panic recovered method=%s path=%s ip=%s err=%v\n%s",
+					r.Method, r.URL.Path, clientIP(r), rv, debug.Stack())
+			}
+			dur := time.Since(start)
+			op := info.operator
+			if op == "" {
+				op = "-"
+			}
+			switch {
+			case rec.status >= 500:
+				logx.Errorf("[HTTP] %s %s status=%d dur=%s bytes=%d ip=%s operator=%s",
+					r.Method, r.URL.Path, rec.status, dur, rec.bytes, clientIP(r), op)
+			case rec.status >= 400:
+				logx.Warnf("[HTTP] %s %s status=%d dur=%s bytes=%d ip=%s operator=%s",
+					r.Method, r.URL.Path, rec.status, dur, rec.bytes, clientIP(r), op)
+			default:
+				logx.Debugf("[HTTP] %s %s status=%d dur=%s bytes=%d ip=%s operator=%s",
+					r.Method, r.URL.Path, rec.status, dur, rec.bytes, clientIP(r), op)
+			}
+		}()
+
+		next.ServeHTTP(rec, r)
+	})
 }
 
 func (s *Server) startCleanupRoutine(ctx context.Context) {
@@ -712,7 +903,13 @@ func (s *Server) udpResponsePump(pl *PublicListener, key string, sess *udpPMSess
 
 func (s *Server) handlePublicConnection(pl *PublicListener, conn net.Conn) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(connIdleTimeout))
+	// 不在连接建立时设置一次性绝对 deadline：那会让所有转发连接固定寿命
+	// （读 60s / 整体 300s），SSH 等交互式长连接空闲即被误杀。
+	// 死连接由 TCP keepalive 探测回收；写方向由 writeDeadlineConn 逐次刷新滑动超时。
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(connKeepAlivePeriod)
+	}
 
 	logx.Debugf("[PUBLIC] new connection on :%d from %s", pl.Port, conn.RemoteAddr())
 
@@ -752,27 +949,39 @@ func (s *Server) handlePublicConnection(pl *PublicListener, conn net.Conn) {
 		lim = nil
 	}
 
+	wStream := &writeDeadlineConn{Conn: stream, d: connWriteTimeout}
+	wConn := &writeDeadlineConn{Conn: conn, d: connWriteTimeout}
 	done := make(chan struct{}, 2)
 	go func() {
-		stream.SetReadDeadline(time.Now().Add(connReadTimeout))
 		if lim != nil {
-			shapedCopy(stream, inConn, lim)
+			shapedCopy(wStream, inConn, lim)
 		} else {
-			io.Copy(stream, inConn)
+			io.Copy(wStream, inConn)
 		}
 		done <- struct{}{}
 	}()
 	go func() {
-		conn.SetReadDeadline(time.Now().Add(connReadTimeout))
 		if lim != nil {
-			shapedCopy(conn, outStream, lim)
+			shapedCopy(wConn, outStream, lim)
 		} else {
-			io.Copy(conn, outStream)
+			io.Copy(wConn, outStream)
 		}
 		done <- struct{}{}
 	}()
 	<-done
 	<-done
+}
+
+// writeDeadlineConn 在每次写之前刷新写 deadline（滑动超时），
+// 既保证对端窗口僵死时写不会永久阻塞，又不给空闲连接设固定寿命。
+type writeDeadlineConn struct {
+	net.Conn
+	d time.Duration
+}
+
+func (c *writeDeadlineConn) Write(p []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.d))
+	return c.Conn.Write(p)
 }
 
 // trafficFor 获取（或创建）指定代理的流量计数器
@@ -1021,13 +1230,13 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	user, err := s.store.GetAdminUser(req.Username)
 	if err != nil {
 		failed, _ := s.guard.OnFailure(req.Username)
-		s.auditLogin(req.Username, "login_failed", r)
+		s.auditLoginFailed(req.Username, clientIP(r)) // 按 IP 节流，防喷洒刷表
 		s.writeLoginFailure(w, req.Username, failed, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
 	if !auth.CheckPassword(req.Password, user.PasswordHash) {
 		failed, lockSec := s.guard.OnFailure(req.Username)
-		s.auditLogin(req.Username, "login_failed", r)
+		s.auditLoginFailed(req.Username, clientIP(r))
 		if lockSec > 0 {
 			w.WriteHeader(http.StatusForbidden)
 			fmt.Fprintf(w, `{"code":1103,"message":"密码错误次数过多，账号已锁定","data":{"lock_remaining":%d,"failed_count":%d}}`, lockSec, failed)
@@ -1051,8 +1260,11 @@ func (s *Server) writeLoginFailure(w http.ResponseWriter, username string, faile
 		msg, failed >= guard.CaptchaThreshold, failed)
 }
 
+// handleAuthRefresh 目前是空实现（不签发新令牌，仅返回 ok）。
+// 因此不产生审计记录，也不会泄漏任何凭据；调用它只是可见性事件，记 DEBUG 供排障。
 func (s *Server) handleAuthRefresh(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	logx.Debugf("[AUTH] refresh called (no-op endpoint) ip=%s", clientIP(r))
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
 
@@ -1534,10 +1746,15 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	// 删除用户不可逆：fail_closed 开启时先落审计，写不进去就拒绝执行
+	if !s.auditBefore(w, r, "user_delete", username, "") {
+		return
+	}
 	// 删除用户：先断开在线会话，再把其全部端口释放回公共池，最后级联清理数据
 	s.kickClient(username, "user_deleted")
 	s.releaseUserPorts(username)
 	if err := s.store.DeleteUser(username); err != nil {
+		logx.Errorf("[USER] delete failed user=%s err=%v", username, err)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -1546,7 +1763,7 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	delete(s.shapers, username)
 	s.shapersMu.Unlock()
 	s.markQuotaEnforced(username, false)
-	s.audit(r, "user_delete", username, "")
+	logx.Infof("[USER] deleted user=%s by=%s", username, operatorFrom(r))
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
 
@@ -1607,18 +1824,23 @@ func (s *Server) handleUserResetCode(w http.ResponseWriter, r *http.Request) {
 	}
 	code, salt, err := auth.GenerateAuthCode()
 	if err != nil {
+		logx.Errorf("[USER] generate auth code failed user=%s err=%v", username, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, `{"code":5000,"message":"generate auth code failed"}`)
 		return
 	}
+	// 重置授权码会让 B 端断线重绑，属高敏感不可逆操作：fail_closed 时先落审计
+	if !s.auditBefore(w, r, "user_reset_code", username, "新授权码已下发，旧码吊销，在线 seeinps 已断开等待重新绑定") {
+		return
+	}
 	if err := s.store.ResetUserAuthCode(username, auth.HashAuthCode(code, salt), salt); err != nil {
+		logx.Errorf("[USER] reset auth code failed user=%s err=%v", username, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, `{"code":5000,"message":"update failed"}`)
 		return
 	}
 	s.kickClient(username, "auth_code_reset")
-	logx.Infof("[USER] auth code reset: user=%s", username)
-	s.audit(r, "user_reset_code", username, "新授权码已下发，旧码吊销，在线 seeinps 已断开等待重新绑定")
+	logx.Infof("[USER] auth code reset: user=%s by=%s", username, operatorFrom(r))
 	fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"username":"%s","authCode":"%s"}}`, username, code)
 }
 
@@ -2004,7 +2226,7 @@ func (s *Server) handleProxyEnable(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"code":0,"message":"ok"}`)
 }
 
-// handleAuditLogs 分页查询操作审计日志（?username=&action=&page=&page_size=）
+// handleAuditLogs 分页查询操作审计日志（?username=&action=&keyword=&source=&page=&page_size=）
 func (s *Server) handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	q := r.URL.Query()
@@ -2023,6 +2245,7 @@ func (s *Server) handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 		PageSize:  pageSize,
 	})
 	if err != nil {
+		logx.Errorf("[AUDIT] query failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, `{"code":5000,"message":"query failed"}`)
 		return
@@ -2050,6 +2273,69 @@ func (s *Server) handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 		"list": items, "total": total, "page": page, "pageSize": pageSize,
 	}})
 	w.Write(data)
+}
+
+// handleAuditLogsExport GET /api/v1/audit-logs/export：按筛选条件导出完整 CSV。
+//
+// 独立于分页接口的原因：ListAuditLogs 会把 PageSize 压到 200（防误查全表），
+// 前端导出曾传 page_size=10000 被静默重置为 20 —— 导出的 CSV 永远只有 20 行。
+// 导出走 ExportAuditLogs，并显式记录一条 audit_log_export（敏感数据外带需留痕）。
+func (s *Server) handleAuditLogsExport(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	start, _ := strconv.ParseInt(q.Get("start_time"), 10, 64)
+	end, _ := strconv.ParseInt(q.Get("end_time"), 10, 64)
+	f := store.AuditFilter{
+		Username:  q.Get("username"),
+		Action:    q.Get("action"),
+		Keyword:   q.Get("keyword"),
+		Source:    q.Get("source"),
+		StartTime: start,
+		EndTime:   end,
+	}
+	list, err := s.store.ExportAuditLogs(f, 200000)
+	if err != nil {
+		logx.Errorf("[AUDIT] export failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, 5000, "导出失败")
+		return
+	}
+	// 记录导出行为本身（含条数与筛选条件），保证"审计数据被带走"可追溯
+	s.audit(r, "audit_log_export", fmt.Sprintf("%d rows", len(list)),
+		fmt.Sprintf("source=%s action=%s username=%s keyword=%s start=%d end=%d",
+			f.Source, f.Action, f.Username, f.Keyword, f.StartTime, f.EndTime))
+
+	name := "audit-logs-" + time.Now().Format("20060102-150405") + ".csv"
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
+	_, _ = w.Write([]byte("\ufeff")) // BOM：Excel 直接打开不乱码
+	bw := bufio.NewWriter(w)
+	_, _ = bw.WriteString("时间,来源,操作者,动作,对象,详情\n")
+	for _, a := range list {
+		src := "seeinpm（中心端）"
+		if a.Source == "ps" {
+			src = "seeinps（服务端）"
+		}
+		row := []string{
+			time.Unix(a.CreatedAt, 0).Format("2006-01-02 15:04:05"),
+			src, a.Username, a.Action, a.Target, a.Detail,
+		}
+		for i, c := range row {
+			if i > 0 {
+				_ = bw.WriteByte(',')
+			}
+			_, _ = bw.WriteString(csvQuote(c))
+		}
+		_ = bw.WriteByte('\n')
+	}
+	_ = bw.Flush()
+	logx.Infof("[AUDIT] exported %d rows to CSV by %s", len(list), operatorFrom(r))
+}
+
+// csvQuote 按 RFC 4180 转义 CSV 字段（含逗号/引号/换行时加引号并把 " 翻倍）。
+func csvQuote(s string) string {
+	if !strings.ContainsAny(s, ",\"\n\r") {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 // logsDir 运行日志目录（相对 CWD，与部署布局一致）
@@ -2153,10 +2439,14 @@ func (s *Server) handleLogFileContent(w http.ResponseWriter, r *http.Request) {
 		}
 		b, err := os.ReadFile(path)
 		if err != nil {
+			logx.Errorf("[LOG] read log file failed file=%s err=%v", name, err)
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintf(w, `{"code":5000,"message":"read failed"}`)
 			return
 		}
+		// 运行日志外带需留痕：此前下载日志不留任何记录，等于可无声带走全部运行信息
+		s.audit(r, "log_download", name, fmt.Sprintf("size=%d", len(b)))
+		logx.Infof("[LOG] downloaded runtime log file=%s size=%d by=%s", name, len(b), operatorFrom(r))
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
 		w.Write(b)
@@ -2164,6 +2454,7 @@ func (s *Server) handleLogFileContent(w http.ResponseWriter, r *http.Request) {
 	}
 	content, err := tailLines(path, lines, 2*1024*1024)
 	if err != nil {
+		logx.Warnf("[LOG] tail log failed file=%s err=%v", name, err)
 		w.WriteHeader(http.StatusNotFound)
 		fmt.Fprintf(w, `{"code":2004,"message":"file not found"}`)
 		return
@@ -2191,7 +2482,72 @@ func (s *Server) getOnlineClient(username string) (*Client, error) {
 	return c, nil
 }
 
-// handlePSLogList 经控制通道拉取指定 B 端（seeinps）的运行日志文件列表（?username=user3）
+// handlePSLoggingGet GET /api/v1/ps-logging?username=
+// 经控制通道读取在线 B 端（seeinps）当前的日志级别与轮转配置。
+func (s *Server) handlePSLoggingGet(w http.ResponseWriter, r *http.Request) {
+	username := r.URL.Query().Get("username")
+	client, err := s.getOnlineClient(username)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, 5002, err.Error())
+		return
+	}
+	msg := protocol.NewMessage(protocol.TypeLoggingGetReq, &protocol.LoggingGetReqData{})
+	resp, err := s.clientRequest(client, msg, 10*time.Second)
+	if err != nil {
+		writeErr(w, http.StatusGatewayTimeout, 5003, err.Error())
+		return
+	}
+	if resp.Code == nil || *resp.Code != protocol.CodeOK {
+		writeErr(w, http.StatusBadGateway, 5002, "seeinps 查询日志级别失败")
+		return
+	}
+	b, _ := json.Marshal(resp.Data)
+	d := &protocol.LoggingGetRespData{}
+	_ = json.Unmarshal(b, d)
+	writeOK(w, map[string]interface{}{
+		"level": d.Level, "path": d.Path, "max_size": d.MaxSize, "max_backups": d.MaxBackups,
+	})
+}
+
+// handlePSLoggingSet PUT /api/v1/ps-logging?username=  body {"level":"debug"}
+// 经控制通道把日志级别下发给在线 B 端（seeinps）。
+// 此前 A 端只能读 B 端日志、级别必须登录 B 端管理台改，与"A 端集中管理"的定位不一致。
+func (s *Server) handlePSLoggingSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Level string `json:"level"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, 2000, "请求体格式错误")
+		return
+	}
+	if _, ok := logx.ParseLevel(req.Level); !ok {
+		writeErr(w, http.StatusBadRequest, 2000, "invalid log level (want debug/info/warn/error)")
+		return
+	}
+	username := r.URL.Query().Get("username")
+	client, err := s.getOnlineClient(username)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, 5002, err.Error())
+		return
+	}
+	msg := protocol.NewMessage(protocol.TypeLoggingSetReq, &protocol.LoggingSetReqData{Level: req.Level})
+	resp, err := s.clientRequest(client, msg, 10*time.Second)
+	if err != nil {
+		writeErr(w, http.StatusGatewayTimeout, 5003, err.Error())
+		return
+	}
+	if resp.Code == nil || *resp.Code != protocol.CodeOK {
+		writeErr(w, http.StatusBadGateway, 5002, "seeinps 拒绝了该日志级别")
+		return
+	}
+	b, _ := json.Marshal(resp.Data)
+	d := &protocol.LoggingSetRespData{}
+	_ = json.Unmarshal(b, d)
+	logx.Infof("[SYS] PS log level set user=%s level=%s by=%s", username, d.Level, operatorFrom(r))
+	writeOK(w, map[string]interface{}{"level": d.Level})
+}
+
+// handlePSLogList 经控制通道获取指定 B 端（seeinps）的日志文件列表（?username=）
 func (s *Server) handlePSLogList(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	username := r.URL.Query().Get("username")
@@ -2223,13 +2579,15 @@ func (s *Server) handlePSLogList(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// handlePSLogContent 经控制通道拉取指定 B 端（seeinps）的运行日志内容（?username=&file=&lines=）
+// handlePSLogContent 经控制通道拉取指定 B 端（seeinps）的运行日志内容
+// （?username=&file=&lines=&keyword=&download=1）。download=1 时以附件形式整文件下载。
 func (s *Server) handlePSLogContent(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	q := r.URL.Query()
 	username := q.Get("username")
+	download := q.Get("download") == "1"
 	client, err := s.getOnlineClient(username)
 	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		fmt.Fprintf(w, `{"code":5002,"message":%q}`, err.Error())
 		return
@@ -2241,14 +2599,18 @@ func (s *Server) handlePSLogContent(w http.ResponseWriter, r *http.Request) {
 	if lines > 2000 {
 		lines = 2000
 	}
-	req := protocol.NewMessage(protocol.TypeLogContentReq, &protocol.LogContentReqData{File: q.Get("file"), Lines: lines})
-	resp, err := s.clientRequest(client, req, 10*time.Second)
+	req := protocol.NewMessage(protocol.TypeLogContentReq, &protocol.LogContentReqData{
+		File: q.Get("file"), Lines: lines, Keyword: q.Get("keyword"), Download: download,
+	})
+	resp, err := s.clientRequest(client, req, 30*time.Second)
 	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusGatewayTimeout)
 		fmt.Fprintf(w, `{"code":5003,"message":%q}`, err.Error())
 		return
 	}
 	if resp.Code == nil || *resp.Code != protocol.CodeOK {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		fmt.Fprintf(w, `{"code":5002,"message":"seeinps returned error"}`)
 		return
@@ -2256,8 +2618,19 @@ func (s *Server) handlePSLogContent(w http.ResponseWriter, r *http.Request) {
 	b, _ := json.Marshal(resp.Data)
 	d := &protocol.LogContentRespData{}
 	json.Unmarshal(b, d)
+	if download {
+		// 运维侧拉取 B 端运行日志需留痕
+		s.audit(r, "ps_log_download", username+"/"+d.File, fmt.Sprintf("size=%d", len(d.Content)))
+		logx.Infof("[LOG] downloaded PS runtime log user=%s file=%s size=%d by=%s",
+			username, d.File, len(d.Content), operatorFrom(r))
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+filepath.Base(d.File)+"\"")
+		_, _ = w.Write([]byte(d.Content))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
 	data, _ := json.Marshal(map[string]interface{}{"code": 0, "data": map[string]string{"file": d.File, "content": d.Content}})
-	w.Write(data)
+	_, _ = w.Write(data)
 }
 
 func extractToken(r *http.Request) string {
@@ -2478,13 +2851,16 @@ func (s *Server) handleHeartbeat(stream net.Conn, client *Client) {
 	}
 }
 
-// handleAuditSync 处理 B 端（seeinps）上报的审计记录：写入统一 audit_logs（source='ps'）
+// handleAuditSync 处理 B 端（seeinps）上报的审计记录：写入统一 audit_logs（source='ps'）。
+// it.LocalID 为 B 端本地行 id，写入 ext_id：重连补传会重复投递同一批记录，
+// 靠 (source, ext_id) 唯一索引 + INSERT OR IGNORE 幂等去重，因此补传可安全重放。
 func (s *Server) handleAuditSync(msg *protocol.Message, client *Client) {
 	b, _ := json.Marshal(msg.Data)
 	d := &protocol.AuditSyncData{}
 	if err := json.Unmarshal(b, d); err != nil || len(d.Items) == 0 {
 		return
 	}
+	inserted := 0
 	for _, it := range d.Items {
 		username := it.Username
 		if username == "" {
@@ -2494,10 +2870,14 @@ func (s *Server) handleAuditSync(msg *protocol.Message, client *Client) {
 		if createdAt <= 0 {
 			createdAt = time.Now().Unix()
 		}
-		if err := s.store.InsertAuditLogFromPS(username, it.Action, it.Target, it.Detail, createdAt); err != nil {
-			logx.Warnf("[AUDIT] ps-sync insert error: %v", err)
+		if err := s.store.InsertAuditLogFromPS(username, it.Action, it.Target, it.Detail, createdAt, it.LocalID); err != nil {
+			logx.Errorf("[AUDIT] ps-sync insert error: action=%s user=%s err=%v", it.Action, username, err)
+			continue
 		}
+		inserted++
 	}
+	logx.Debugf("[AUDIT] ps-sync from %s: received=%d stored=%d (dup or failed skipped)",
+		client.username, len(d.Items), inserted)
 }
 
 // clientRequest 通过控制通道向在线 B 端发送请求并等待响应（10s 超时）
