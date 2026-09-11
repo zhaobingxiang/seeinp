@@ -201,6 +201,15 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.logf("[APP] version=%s banner=%s pid_entries=%d admin=%v driver_ok=%v log_level=%s",
 		version.Version, version.Banner, len(cfg.Entries), isAdmin(), driverReady(), logx.GetLevel())
+	// 自愈：文件里缺 settings.servers（历史被旧版本写回落键）→ 主动写回一次，
+	// 使磁盘内容与运行期配置一致，避免"设置页看得见、文件里找不到"的认知缝隙。
+	if serversKeyMissing() {
+		if serr := saveConfig(cfg); serr == nil {
+			a.logf("[APP] config self-healed: settings.servers persisted to config.json")
+		} else {
+			a.logWarnf("[APP] config self-heal failed: %v", serr)
+		}
+	}
 	go a.probeLoop()
 	go func() {
 		time.Sleep(3 * time.Second) // 延迟检查，不阻塞启动
@@ -307,7 +316,7 @@ func (a *App) cardViewLocked(e *Entry) CardView {
 	switch {
 	case a.session != nil && a.session.entryID == e.ID:
 		cv.Status = "running"
-	case !cv.HasPwd:
+	case !cv.HasPwd && !cv.Manual:
 		cv.Status = "waitpwd"
 	case cv.Probe == "407" || cv.Probe == "403" || cv.Probe == "unreachable" || cv.Probe == "dialfail":
 		cv.Status = "fail"
@@ -383,6 +392,9 @@ func (a *App) ConfirmSeeinps(sourcePS string, items []ConfirmOpsItem) OpResult {
 		if it.OpsID <= 0 || it.OpsID > 65535 {
 			return OpResult{Message: "存在无效的运维代理ID（应为 1-65535）"}
 		}
+		if strings.TrimSpace(it.ProxyUser) == "" {
+			return OpResult{Message: fmt.Sprintf("代理 %d 缺少运维代理用户名：该 seeinps 未提供账号，请手动补填用户名", it.OpsID)}
+		}
 		if containsFullRoute(it.ACL) {
 			return OpResult{Message: fmt.Sprintf("代理 %d 的目标网段不支持 0.0.0.0/0：会把本机全部流量导入 VPN 导致断网", it.OpsID)}
 		}
@@ -394,25 +406,29 @@ func (a *App) ConfirmSeeinps(sourcePS string, items []ConfirmOpsItem) OpResult {
 	added, updated := 0, 0
 	for _, it := range items {
 		acl := sanitizeACL(it.ACL)
+		user := strings.TrimSpace(it.ProxyUser)
 		name := strings.TrimSpace(it.Name)
 		if name == "" {
-			name = fmt.Sprintf("%s · %d", it.ProxyUser, it.OpsID)
+			name = fmt.Sprintf("%s · %d", user, it.OpsID)
 		}
-		if existing := a.findByOpsLocked(sourcePS, it.OpsID, it.ProxyUser); existing != nil {
+		if existing := a.findByOpsLocked(sourcePS, it.OpsID, user); existing != nil {
 			existing.ACL = acl
 			existing.SourcePS = sourcePS
 			if strings.TrimSpace(it.Name) != "" {
 				existing.Name = name
 			}
 			if existing.ProxyUser == "" {
-				existing.ProxyUser = it.ProxyUser
+				existing.ProxyUser = user
+			}
+			if it.ProxyPass != "" {
+				existing.ProxyPass = it.ProxyPass
 			}
 			updated++
 			continue
 		}
 		a.cfg.Entries = append(a.cfg.Entries, &Entry{
 			ID: newID(), Name: name, OpsID: it.OpsID,
-			ProxyUser: it.ProxyUser, ACL: acl, SourcePS: sourcePS,
+			ProxyUser: user, ProxyPass: it.ProxyPass, ACL: acl, SourcePS: sourcePS,
 		})
 		added++
 	}
@@ -434,8 +450,12 @@ func (a *App) ConfirmSeeinps(sourcePS string, items []ConfirmOpsItem) OpResult {
 // AddOpsDirect 直接填写运维代理（名称可选+ID+账号+密码+目标网段）生成单张卡片，无需登录 seeinps。
 // name 留空时使用默认名「代理账号 · 运维ID」。
 func (a *App) AddOpsDirect(name string, opsID int, proxyUser, proxyPass string, acl []string) OpResult {
+	proxyUser = strings.TrimSpace(proxyUser)
 	if opsID <= 0 || opsID > 65535 {
 		return OpResult{Message: "请填写有效的运维代理ID（端口 1-65535）"}
+	}
+	if proxyUser == "" {
+		return OpResult{Message: "请填写运维代理用户名（连接内网所必需）"}
 	}
 	if containsFullRoute(acl) {
 		return OpResult{Message: "目标网段不支持 0.0.0.0/0：会把本机全部流量导入 VPN 导致断网"}
@@ -487,6 +507,7 @@ func (a *App) AddOpsDirect(name string, opsID int, proxyUser, proxyPass string, 
 
 // ManualAdd 手动添加 VPN（备选入口，等价原需求文档 §9.2 手工模式）
 func (a *App) ManualAdd(name, server string, opsID int, proxyUser, proxyPass string, acl []string, probeTarget string) OpResult {
+	proxyUser = strings.TrimSpace(proxyUser)
 	if name == "" || opsID <= 0 || opsID > 65535 {
 		return OpResult{Message: "名称、端口号（1-65535）为必填项"}
 	}
@@ -543,8 +564,10 @@ func (a *App) FillPassword(id, pwd string) OpResult {
 	return OpResult{OK: true, Message: "代理密码已保存"}
 }
 
-// UpdateEntry 编辑卡片（名称/代理服务器/探测目标/目标网段）
-func (a *App) UpdateEntry(id, name, server, probeTarget string, probeIntranet bool, acl []string) OpResult {
+// UpdateEntry 编辑卡片（名称/代理服务器/用户名/密码/探测目标/目标网段）
+// 用户名必填；密码遵循「留空不修改、填写则覆盖」（卡片状态只透出是否已设密码，不回显明文）。
+func (a *App) UpdateEntry(id, name, server, probeTarget string, probeIntranet bool, acl []string, proxyUser, proxyPass string) OpResult {
+	proxyUser = strings.TrimSpace(proxyUser)
 	if containsFullRoute(acl) {
 		return OpResult{Message: "目标网段不支持 0.0.0.0/0：会把本机全部流量导入 VPN 导致断网"}
 	}
@@ -575,8 +598,17 @@ func (a *App) UpdateEntry(id, name, server, probeTarget string, probeIntranet bo
 		a.mu.Unlock()
 		return OpResult{Message: "入口不存在"}
 	}
+	if !e.Manual && proxyUser == "" {
+		a.mu.Unlock()
+		return OpResult{Message: "请填写运维代理用户名（连接内网所必需）"}
+	}
 	if name != "" {
 		e.Name = name
+	}
+	e.ProxyUser = proxyUser
+	if proxyPass != "" {
+		e.ProxyPass = proxyPass
+		delete(a.probes, id) // 密码变更后清缓存，触发重新探测
 	}
 	e.Server = server
 	e.ProbeIntranet = probeIntranet
@@ -589,8 +621,9 @@ func (a *App) UpdateEntry(id, name, server, probeTarget string, probeIntranet bo
 		a.logErrorf("[APP] update entry failed entry=%s err=%v", id, err)
 		return OpResult{Message: "保存失败: " + err.Error()}
 	}
-	a.logf("[APP] entry updated name=%s server=%q probe_target=%q probe_intranet=%v acl=%v",
-		entryName, server, probeTarget, probeIntranet, cleaned)
+	a.logf("[APP] entry updated name=%s user=%s pwd_changed=%v server=%q probe_target=%q probe_intranet=%v acl=%v",
+		entryName, proxyUser, proxyPass != "", server, probeTarget, probeIntranet, cleaned)
+	a.triggerProbe()
 	a.emitState()
 	return OpResult{OK: true, Message: "已保存"}
 }
@@ -635,9 +668,15 @@ func (a *App) Connect(id string) OpResult {
 		a.mu.Unlock()
 		return OpResult{Message: "入口不存在"}
 	}
-	if e.ProxyPass == "" {
-		a.mu.Unlock()
-		return OpResult{Message: "请先填写代理密码"}
+	if !e.Manual {
+		if strings.TrimSpace(e.ProxyUser) == "" {
+			a.mu.Unlock()
+			return OpResult{Message: "该入口缺少运维代理用户名，无法连接内网；请删除后重新添加并补填用户名"}
+		}
+		if e.ProxyPass == "" {
+			a.mu.Unlock()
+			return OpResult{Message: "请先填写代理密码"}
+		}
 	}
 	if len(e.ACL) == 0 {
 		a.mu.Unlock()
@@ -870,6 +909,14 @@ func (a *App) startVPN(e *Entry) error {
 	}
 	emitConnecting()
 
+	// 0. 代理存活预检（方案A）：连接前对服务器池做 TCP 可达校验，不通即失败，
+	//    且此时尚未创建网卡/路由/引擎，无需回滚，避免"连不存在的代理也显示已连接"。
+	if addr, verr := a.verifyProxyReachable(e); verr != nil {
+		a.logWarnf("[TUNNEL] preflight proxy unreachable entry=%s addr=%s err=%v", e.Name, addr, verr)
+		a.markProbe(e.ID, "unreachable", "无法连接代理服务器 "+addr)
+		return fmt.Errorf("无法连接代理服务器 %s：%w", addr, verr)
+	}
+
 	// 1. 创建虚拟网卡
 	a.debugf("[TUNNEL] step 1/5 create adapter name=%s mtu=%d admin=%v driver_ok=%v",
 		tunnel.AdapterName, tunnel.DefaultMTU, isAdmin(), driverReady())
@@ -944,7 +991,7 @@ func (a *App) startVPN(e *Entry) error {
 		defer a.emitState()
 		if !e.ProbeIntranet {
 			a.debugf("[PROBE] post-connect skipped entry=%s (intranet probe disabled)", e.Name)
-			a.markProbe(e.ID, "ok", "VPN 已连接（代理正常）")
+			a.markProbe(e.ID, "ok", "VPN 已连接（代理可达）")
 			return
 		}
 		target := a.probeTargetOf(e)
@@ -1205,7 +1252,24 @@ func (a *App) probeProxyTCP(e *Entry) (time.Duration, string, error) {
 	return 0, lastAddr, lastErr
 }
 
-// ---------------- 工具 ----------------
+// verifyProxyReachable 连接前对入口的代理服务器池做 TCP 可达预检（方案A）：
+// 逐台以短超时拨测 服务器:运维ID，首台成功即返回其地址；全部失败返回最后地址与错误。
+func (a *App) verifyProxyReachable(e *Entry) (string, error) {
+	var lastAddr string
+	var lastErr error = errors.New("未配置代理服务器")
+	for _, srv := range a.entryServers(e) {
+		addr := srv + ":" + fmt.Sprint(e.OpsID)
+		d := net.Dialer{Timeout: 4 * time.Second}
+		conn, err := d.Dial("tcp", addr)
+		if err != nil {
+			lastAddr, lastErr = addr, err
+			continue
+		}
+		_ = conn.Close()
+		return addr, nil
+	}
+	return lastAddr, lastErr
+}
 
 func (a *App) findEntryLocked(id string) *Entry {
 	for _, e := range a.cfg.Entries {

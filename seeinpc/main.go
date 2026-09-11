@@ -46,8 +46,13 @@ func main() {
 	}()
 
 	if _, err := acquireInstanceLock(filepath.Join(exeDir(), "seeinpc.lock")); err != nil {
-		// 已有实例在运行：弹窗告知（GUI 子系统下 stderr 不可见，静默退出曾让
+		// 已有实例在运行：优先把已运行实例的主窗口唤到前台（含从托盘恢复），
+		// 找不到窗口再弹窗告知（GUI 子系统下 stderr 不可见，静默退出曾让
 		// 用户误以为新实例的托盘失效，实为旧实例残留图标）
+		if focusExistingWindow("seeinpc") {
+			logx.Infof("[APP] second launch: focused existing instance window, exiting")
+			os.Exit(0)
+		}
 		logx.Panicf("[APP] another instance is already running, exiting: %v", err)
 		title, _ := windows.UTF16PtrFromString("seeinpc")
 		text, _ := windows.UTF16PtrFromString("seeinpc 已在运行（请查看任务栏通知区域图标）。\n如托盘图标无响应，将鼠标悬停其上即可清除失效图标。")
@@ -92,9 +97,9 @@ func main() {
 
 	err := wails.Run(&options.App{
 		Title:     "seeinpc",
-		Width:     1180,
+		Width:     1300,
 		Height:    780,
-		MinWidth:  980,
+		MinWidth:  1040,
 		MinHeight: 640,
 		Frameless: true,
 		AssetServer: &assetserver.Options{

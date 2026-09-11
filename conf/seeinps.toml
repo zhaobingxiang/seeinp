@@ -2,8 +2,10 @@
 server_addr = "see.timesee.cn:99"
 
 [auth]
-username = "user1"
-auth_code = "seeinp_7694c0274401a80bee398ccc5ec02071da8b01a244ae76792752fae46679e5be"
+# 发布模板刻意留空，不携带任何真实用户凭证。
+# 真实 username/auth_code 由部署工具生成配置时注入，或用户首次打开管理页完成初始化时填写。
+username = ""
+auth_code = ""
 
 [tls]
 enabled = true

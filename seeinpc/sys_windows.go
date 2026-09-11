@@ -187,3 +187,45 @@ var (
 	taskbarOnce       sync.Once
 	taskbarCreatedPtr *uint16
 )
+
+// focusExistingWindow 第二个实例启动时（锁被占用）唤起已运行实例的主窗口。
+// EnumWindows 能找到隐藏窗口，"最小化到托盘"状态同样可恢复；找不到返回 false。
+func focusExistingWindow(title string) bool {
+	user32 := windows.NewLazySystemDLL("user32.dll")
+	procTextLen := user32.NewProc("GetWindowTextLengthW")
+	procGetText := user32.NewProc("GetWindowTextW")
+
+	var target windows.HWND
+	cb := windows.NewCallback(func(hwnd windows.HWND, _ uintptr) uintptr {
+		if hwnd == 0 {
+			return 1
+		}
+		var pid uint32
+		_, _ = windows.GetWindowThreadProcessId(hwnd, &pid)
+		if pid == uint32(os.Getpid()) { // 跳过自身（托盘/消息窗口）
+			return 1
+		}
+		n, _, _ := procTextLen.Call(uintptr(hwnd))
+		if n == 0 || n > 512 {
+			return 1
+		}
+		buf := make([]uint16, n+1)
+		procGetText.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		if windows.UTF16ToString(buf) != title {
+			return 1
+		}
+		target = hwnd
+		return 0
+	})
+	_ = windows.EnumWindows(cb, unsafe.Pointer(nil))
+	if target == 0 {
+		return false
+	}
+	const swRestore = 9
+	user32.NewProc("ShowWindow").Call(uintptr(target), swRestore)
+	// SetForegroundWindow 受系统前台锁限制，失败时窗口至少已恢复显示（任务栏可见）
+	if _, _, err := user32.NewProc("SetForegroundWindow").Call(uintptr(target)); err != nil {
+		logx.Debugf("[APP] focus existing window hwnd=%d SetForegroundWindow failed: %v", target, err)
+	}
+	return true
+}

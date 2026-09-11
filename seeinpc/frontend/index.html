@@ -74,7 +74,7 @@
   .toolbar .spacer{flex:1}
   .summary{font-size:12.5px;color:var(--text-3)}
 
-  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
   .vcard{
     background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
     box-shadow:var(--shadow);padding:16px;display:flex;flex-direction:column;gap:12px;
@@ -102,7 +102,9 @@
   .copy{color:var(--primary);cursor:pointer;font-size:12px;margin-left:6px}
   .chips{display:flex;flex-wrap:wrap;gap:6px}
   .chip{font-size:11.5px;background:var(--bg);border:1px solid var(--border-2);color:var(--text-2);padding:1px 8px;border-radius:999px}
-  .vcard-foot{display:flex;align-items:center;gap:8px;border-top:1px solid var(--border-2);padding-top:12px}
+  .vcard-foot{display:flex;align-items:center;gap:8px;border-top:1px solid var(--border-2);padding-top:12px;margin-top:auto}
+  .acl-line{white-space:nowrap}
+  .acl-line .chip{margin-right:6px}
   .vcard-foot .info{flex:1;font-size:12px;color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .vcard-msg{font-size:12px;color:var(--red);background:var(--red-bg);border-radius:6px;padding:6px 10px}
   .vcard-msg.warn{color:var(--yellow);background:var(--yellow-bg)}
@@ -123,8 +125,9 @@
   select{width:auto}
   input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 2px rgba(37,99,235,.12)}
 
-  .set-card{background:#fff;border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px;max-width:640px;margin-bottom:14px}
+  .set-card{background:#fff;border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 20px;width:100%;max-width:920px;margin-bottom:14px}
   .set-card h3{font-size:14px;margin-bottom:12px}
+  .set-actions{position:sticky;bottom:0;z-index:5;width:100%;max-width:920px;display:flex;justify-content:flex-end;gap:10px;padding:12px 0 16px;margin-top:4px;background:var(--bg);border-top:1px solid var(--border-2)}
   .set-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:9px 0;border-bottom:1px solid var(--border-2);font-size:13px}
   .set-row:last-child{border-bottom:none}
   .set-row .desc{font-size:12px;color:var(--text-3);margin-top:2px}
@@ -323,7 +326,7 @@
             <div class="set-row"><div>已跳过的版本<div class="desc" id="ignoredList">无</div></div>
               <button class="btn btn-outline btn-sm" id="btnClrIgnore" onclick="clearIgnored()" style="display:none">清除记录</button></div>
           </div>
-          <div style="max-width:640px;display:flex;justify-content:flex-end;gap:10px;padding-bottom:20px">
+          <div class="set-actions">
             <button class="btn btn-outline" onclick="App.QuitApp()">退出 seeinpc</button>
             <button class="btn btn-primary" onclick="saveSettings()">保存设置</button>
           </div>
@@ -381,10 +384,10 @@
         <input type="text" id="dName" placeholder="留空则默认「代理账号 · 运维ID」"></div>
       <div class="field"><label>运维代理ID（端口 1-65535）<b>*</b></label>
         <input type="number" id="dOps" placeholder="见 seeinps 管理页「运维ID」"></div>
-      <div class="field"><label>运维代理用户名</label>
-        <input type="text" id="dUser" placeholder="运维代理账号"></div>
+      <div class="field"><label>运维代理用户名<b>*</b></label>
+        <input type="text" id="dUser" placeholder="运维代理账号（连接内网所必需）"></div>
       <div class="field"><label>运维代理密码</label>
-        <input type="password" id="dPwd" placeholder="运维代理密码（留空则稍后在卡片填写）"></div>
+        <input type="password" id="dPwd" placeholder="可留空，稍后在卡片填写；填写后即可连接"></div>
       <div class="field"><label>目标网段 <b>*</b></label>
         <div class="chips" id="dAclChips"></div>
         <div class="acl-input">
@@ -410,12 +413,23 @@
     <div class="sub">未接入 seeinps 管理页时的备选方式：凭「运维ID + 代理账号 + 代理密码」手工填写。</div>
     <div class="field"><label>名称 <b>*</b></label><input type="text" id="mName"></div>
     <div class="field"><label>代理服务器</label>
-      <select id="mServer"></select>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="mServer" style="flex:1"></select>
+        <button type="button" class="btn btn-outline btn-sm" onclick="toggleManualSrvAdd()">＋ 新增服务器</button>
+      </div>
+      <div id="mSrvAdd" style="display:none;margin-top:8px">
+        <div style="display:flex;gap:8px">
+          <input type="text" id="mSrvName" placeholder="名称（如 主服务器）" style="width:130px">
+          <input type="text" id="mSrvAddr" placeholder="域名或 IP（无需端口）" style="flex:1">
+          <button type="button" class="btn btn-primary btn-sm" onclick="addManualSrv()">保存</button>
+        </div>
+        <div class="hint">新增的服务器会在点「添加」后一并写入「设置 · 代理服务器」</div>
+      </div>
       <div class="hint">服务器列表在「设置 · 代理服务器」中维护；指定单台后失败不回退</div></div>
     <div class="field"><label>端口号（1-65535）<b>*</b></label>
       <input type="number" id="mOps" placeholder="运维代理对外端口"></div>
-    <div class="field"><label>代理用户名</label><input type="text" id="mUser" placeholder="可选"></div>
-    <div class="field"><label>代理密码</label><input type="password" id="mPwd" placeholder="可选，留空则稍后在卡片填写"></div>
+    <div class="field"><label>代理用户名</label><input type="text" id="mUser" placeholder="可选，其他代理可能无需认证"></div>
+    <div class="field"><label>代理密码</label><input type="password" id="mPwd" placeholder="可选，留空则以无认证方式连接"></div>
     <div class="field"><label>目标网段 <b>*</b></label>
       <div class="chips" id="mAclChips"></div>
       <div class="acl-input">
@@ -455,6 +469,11 @@
     <h3>编辑运维入口</h3>
     <div class="sub">目标网段决定哪些流量走虚拟网卡（对应 seeinps 的 ACL）。</div>
     <div class="field"><label>名称</label><input type="text" id="eName"></div>
+    <div class="field"><label>运维代理用户名<b id="eUserReq" style="color:var(--red)">*</b></label>
+      <input type="text" id="eUser" placeholder="运维代理账号（连接内网所必需）"></div>
+    <div class="field"><label>代理密码</label>
+      <input type="password" id="ePwd" autocomplete="new-password" placeholder="留空则不修改">
+      <div class="hint" id="ePwdHint"></div></div>
     <div class="field"><label>代理服务器</label>
       <select id="eServer"></select>
       <div class="hint">服务器列表在「设置 · 代理服务器」中维护；指定单台后失败不回退</div></div>
@@ -513,6 +532,7 @@ let App; // window.go.main.App
 let state = { cards: [], settings: {} };
 let captchaId = "";
 let editingId = "", pwdId = "";
+let editingManual = false;   // 当前编辑卡是否手动（其他代理）来源：手动卡用户名可选
 let editAcl = [], manualAcl = [], directAcl = [];
 let srvList = [], srvDirty = false;   // 设置页代理服务器池（进入页面时从 state 同步，编辑后置脏避免被状态刷新覆盖）
 let fetched = null;                    // 登录获取第一步结果 {src, items:[{opsId,proxyUser,name,acl,needAcl}]}
@@ -593,7 +613,6 @@ function render(){
               <button class="btn btn-outline btn-sm" onclick="openEdit('${c.id}')">编辑</button>`;
     }else{
       foot = `<button class="btn btn-primary btn-sm" onclick="doConnect('${c.id}', this)">连接 VPN</button>
-              <button class="btn btn-outline btn-sm" ${probing?"disabled":""} onclick="doRefresh()">${probing?"探测中…":"探测"}</button>
               <button class="btn btn-outline btn-sm" onclick="openEdit('${c.id}')">编辑</button>`;
     }
     const el = document.createElement("div");
@@ -607,13 +626,13 @@ function render(){
       <div>
         <div class="kv"><span class="k">代理ID</span><span class="v"><b>${c.opsId}</b>
           <span class="copy" onclick="copyText('${c.opsId}')">复制</span></span></div>
-        <div class="kv"><span class="k">代理账号</span><span class="v">${esc(c.proxyUser)} · ${c.hasPwd?"密码已保存":"密码未填写"}</span></div>
+        <div class="kv"><span class="k">代理账号</span><span class="v">${c.proxyUser?esc(c.proxyUser):"—"} · ${c.hasPwd?"密码已保存":"密码未填写"}</span></div>
         <div class="kv"><span class="k">探测状态</span><span class="v">${esc(probeTxt)}</span></div>
-        <div class="kv" style="align-items:flex-start"><span class="k">目标网段</span>
-          <span class="v"><span class="chips">${(c.acl||[]).map(a=>`<span class="chip">${esc(a)}</span>`).join("")}</span></span></div>
+        <div class="kv"><span class="k">目标网段</span>
+          <span class="v acl-line" title="${esc((c.acl||[]).join('，'))}">${(c.acl||[]).map(a=>`<span class="chip">${esc(a)}</span>`).join("")}</span></div>
       </div>
       <div class="vcard-foot">
-        <div class="info">${c.manual?"手动添加":"来自 seeinps · "+esc(c.sourcePs||"")}</div>
+        <div class="info">${c.manual ? "其他代理" : (c.sourcePs ? "来自 seeinps · 端口 "+esc(String(c.sourcePs).split(":").pop()) : "代理ID · "+c.opsId)}</div>
         ${foot}
       </div>`;
     box.appendChild(el);
@@ -621,15 +640,17 @@ function render(){
   document.getElementById("summary").textContent =
     `共 ${cards.length} 个运维入口 · ${running} 个已连接（同一时刻仅允许一个 VPN 运行）`;
 
-  // 设置页回显
+  // 关于（只读文本，随每次 state 刷新；不受页面门控，避免进设置页后才填充的延迟）
+  document.getElementById("aboutVer").textContent = state.version||"-";
+  document.getElementById("aboutAdmin").textContent = state.admin ? "是（正常）" : "否（请右键以管理员身份运行）";
+  document.getElementById("aboutDriver").textContent = state.driverOk ? "wintun 0.14.1 已就绪" : "未就绪";
+
+  // 设置页可编辑控件回显（仅在设置页、或首次尚未初始化时，避免覆盖用户正在编辑的值）
   if(curPage==="settings" || !document.getElementById("setInterval").value){
     document.getElementById("setInterval").value = String(state.settings.probeIntervalSec||30);
     document.getElementById("setTray").classList.toggle("on", !!state.settings.minimizeToTray);
     document.getElementById("setLevel").value = state.settings.logLevel||"info";
     document.getElementById("selLevel").value = state.settings.logLevel||"info";
-    document.getElementById("aboutVer").textContent = state.version||"-";
-    document.getElementById("aboutAdmin").textContent = state.admin ? "是（正常）" : "否（请右键以管理员身份运行）";
-    document.getElementById("aboutDriver").textContent = state.driverOk ? "wintun 0.14.1 已就绪" : "未就绪";
   }
 }
 
@@ -689,6 +710,7 @@ async function doAdd(){
   errEl.textContent = "";
   if(addMode==="direct"){
     const ops = parseInt(document.getElementById("dOps").value, 10);
+    if(!document.getElementById("dUser").value.trim()){ errEl.textContent = "请填写运维代理用户名"; return; }
     setBusy("btnAdd", true, "添加中…");
     try{
       const r = await App.AddOpsDirect(
@@ -730,7 +752,7 @@ async function doAdd(){
     document.getElementById("captchaRow").classList.remove("show");
     fetched = {
       src: r.sourcePs||"",
-      items: (r.items||[]).map(it=>({opsId: it.opsId, proxyUser: it.proxyUser, needAcl: !!it.needAcl, name: "", acl: [...(it.acl||[])]})),
+      items: (r.items||[]).map(it=>({opsId: it.opsId, proxyUser: it.proxyUser, proxyPass: "", needAcl: !!it.needAcl, name: "", acl: [...(it.acl||[])]})),
     };
     if(!fetched.items.length){ errEl.textContent = "未获取到运维代理"; fetched=null; return; }
     document.getElementById("fetchSrc").textContent = fetched.src;
@@ -748,9 +770,14 @@ function renderFetchItems(){
     const chips = it.acl.map((a,idx)=>`<span class="chip">${esc(a)} <b style="cursor:pointer;color:var(--red)" onclick="spliceFetchAcl(${i},${idx})">×</b></span>`).join("");
     return `<div class="fetch-item">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:13px">
-        <span>代理ID <b>${it.opsId}</b></span><span style="color:var(--text-3)">${esc(it.proxyUser||"无账号")}</span>
+        <span>代理ID <b>${it.opsId}</b></span>
         <span style="margin-left:auto;color:var(--red);cursor:pointer;font-size:12px" onclick="removeFetchItem(${i})">移除</span>
       </div>
+      <div class="field"><label>运维代理用户名<b style="color:var(--red)">*</b></label>
+        <input type="text" id="fUser_${i}" value="${esc(it.proxyUser||"")}" placeholder="服务端未提供账号时请手动补填">
+        ${it.proxyUser ? '' : '<div class="hint" style="color:var(--red)">该代理在服务端未配置账号，必须手动填写用户名后才能连接内网</div>'}</div>
+      <div class="field"><label>代理密码</label>
+        <input type="password" id="fPwd_${i}" value="${esc(it.proxyPass||"")}" placeholder="可留空，稍后在卡片填写；填写后即可连接"></div>
       <div class="field"><label>代理名称</label>
         <input type="text" id="fName_${i}" value="${esc(it.name)}" placeholder="默认「${esc(defName)}」"></div>
       <div class="field"><label>目标网段${it.needAcl?' <b style="color:var(--red)">*</b>':''}</label>
@@ -767,6 +794,10 @@ function syncFetchNames(){
   fetched.items.forEach((it,i)=>{
     const el = document.getElementById("fName_"+i);
     if(el) it.name = el.value.trim();
+    const u = document.getElementById("fUser_"+i);
+    if(u) it.proxyUser = u.value.trim();
+    const pw = document.getElementById("fPwd_"+i);
+    if(pw) it.proxyPass = pw.value;
   });
 }
 function addFetchAcl(i){
@@ -791,12 +822,13 @@ function removeFetchItem(i){
   renderFetchItems();
 }
 async function doConfirmFetch(errEl){
-  const items = fetched.items.map((it,i)=>({
-    opsId: it.opsId, proxyUser: it.proxyUser,
-    name: (document.getElementById("fName_"+i)||{}).value?.trim()||"",
-    acl: [...it.acl],
+  syncFetchNames();
+  const items = fetched.items.map(it=>({
+    opsId: it.opsId, proxyUser: it.proxyUser, proxyPass: it.proxyPass,
+    name: it.name, acl: [...it.acl],
   }));
   for(const it of items){
+    if(!it.proxyUser){ errEl.textContent = `代理 ${it.opsId} 请填写运维代理用户名`; return; }
     if(!it.acl.length){ errEl.textContent = `代理 ${it.opsId} 的目标网段为必填，请至少添加一个网段`; return; }
   }
   setBusy("btnAdd", true, "生成中…");
@@ -870,11 +902,46 @@ function checkProbeFmt(inpId, tipId){
 }
 
 /* 手动添加 */
+let manualNewServers = [];   // 手动弹窗内暂存的新服务器，点「添加」时才写入设置
 function openManual(){
-  fillServerSelect("mServer", "");
+  manualNewServers = [];
+  const add = document.getElementById("mSrvAdd"); if(add) add.style.display = "none";
+  const sn = document.getElementById("mSrvName"); if(sn) sn.value = "";
+  const sa = document.getElementById("mSrvAddr"); if(sa) sa.value = "";
+  refreshManualServerSelect("");
   const tip = document.getElementById("mProbeTip");
   if(tip){ tip.textContent=""; tip.style.display="none"; }
   openMask("maskManual");
+}
+function toggleManualSrvAdd(){
+  const box = document.getElementById("mSrvAdd");
+  if(box) box.style.display = (box.style.display==="none") ? "" : "none";
+}
+function addManualSrv(){
+  const name = document.getElementById("mSrvName").value.trim();
+  const addr = document.getElementById("mSrvAddr").value.trim();
+  if(!addr){ toast("请填写服务器地址", true); return; }
+  if(/:\d+$/.test(addr)){ toast("地址不需要端口", true); return; }
+  const all = serverPool().concat(manualNewServers);
+  if(!all.some(s=>s.addr===addr)){ manualNewServers.push({name: name||addr, addr}); }
+  refreshManualServerSelect(addr);
+  document.getElementById("mSrvName").value = "";
+  document.getElementById("mSrvAddr").value = "";
+  document.getElementById("mSrvAdd").style.display = "none";
+  toast("已暂存，点「添加」后写入设置");
+}
+function refreshManualServerSelect(selected){
+  const sel = document.getElementById("mServer");
+  if(!sel) return;
+  const opts = [{v:"", t:"自动（按列表顺序回退）"}]
+    .concat(serverPool().map(s=>({v:s.addr, t:`${s.name}（${s.addr}）`})))
+    .concat(manualNewServers.map(s=>({v:s.addr, t:`${s.name}（${s.addr}）· 新`})));
+  const seen = {}; sel.innerHTML = "";
+  opts.forEach(o=>{
+    if(o.v && seen[o.v]) return; seen[o.v] = 1;
+    const el = document.createElement("option"); el.value = o.v; el.textContent = o.t; sel.appendChild(el);
+  });
+  sel.value = (selected!=null) ? selected : "";
 }
 function addMAcl(){
   const v = document.getElementById("mAclInput").value.trim();
@@ -907,6 +974,18 @@ async function doManual(){
   const ops = parseInt(document.getElementById("mOps").value, 10);
   setBusy("btnManual", true, "添加中…");
   try{
+    if(manualNewServers.length){
+      const st = state.settings || {};
+      const merged = serverPool().concat(manualNewServers)
+        .map(x=>({name:(x.name||"").trim(), addr:(x.addr||"").trim()})).filter(x=>x.addr);
+      const sr = await App.SaveSettings({
+        probeIntervalSec: st.probeIntervalSec||30,
+        minimizeToTray: !!st.minimizeToTray,
+        logLevel: st.logLevel||"info",
+        servers: merged,
+      });
+      if(!sr.ok){ errEl.textContent = "保存服务器失败：" + sr.message; return; }
+    }
     const r = await App.ManualAdd(
       document.getElementById("mName").value.trim(),
       document.getElementById("mServer").value.trim(),
@@ -916,6 +995,7 @@ async function doManual(){
       manualAcl,
       document.getElementById("mProbe").value.trim());
     if(!r.ok){ errEl.textContent = r.message; return; }
+    manualNewServers = [];
     closeMask("maskManual");
     manualAcl = []; renderMAcl();
     toast("已添加");
@@ -942,7 +1022,18 @@ function openEdit(id){
   editingId = id;
   const c = (state.cards||[]).find(x=>x.id===id);
   if(!c) return;
+  editingManual = !!c.manual;
+  const req = document.getElementById("eUserReq");
+  if(req) req.style.display = editingManual ? "none" : "";
+  document.getElementById("eUser").placeholder = editingManual ? "可选，其他代理可能无需认证" : "运维代理账号（连接内网所必需）";
   document.getElementById("eName").value = c.name;
+  document.getElementById("eUser").value = c.proxyUser||"";
+  document.getElementById("ePwd").value = "";
+  const pwdHint = document.getElementById("ePwdHint");
+  if(pwdHint){
+    if(c.hasPwd){ pwdHint.textContent = "已设置密码，留空保持不变、填写则覆盖"; pwdHint.style.color = ""; }
+    else { pwdHint.textContent = "尚未设置密码，请填写后才能连接"; pwdHint.style.color = "var(--red)"; }
+  }
   fillServerSelect("eServer", c.server||"");
   document.getElementById("eProbe").value = c.probeTarget||"";
   const tip = document.getElementById("eProbeTip");
@@ -973,6 +1064,9 @@ async function doEdit(){
   const errEl = document.getElementById("editError");
   errEl.textContent = "";
   if(!checkProbeFmt("eProbe","eProbeTip")){ errEl.textContent = "内网探测目标格式不正确，请按 IP:端口 填写"; return; }
+  const eUser = document.getElementById("eUser").value.trim();
+  if(!eUser && !editingManual){ errEl.textContent = "请填写运维代理用户名"; return; }
+  const ePwd = document.getElementById("ePwd").value;
   setBusy("btnEdit", true, "保存中…");
   try{
     const r = await App.UpdateEntry(editingId,
@@ -980,7 +1074,9 @@ async function doEdit(){
       document.getElementById("eServer").value.trim(),
       document.getElementById("eProbe").value.trim(),
       document.getElementById("eProbeIntranet").classList.contains("on"),
-      editAcl);
+      editAcl,
+      eUser,
+      ePwd);
     if(!r.ok){ errEl.textContent = r.message; return; }
     closeMask("maskEdit");
     toast("已保存");

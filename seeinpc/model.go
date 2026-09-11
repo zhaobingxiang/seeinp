@@ -115,7 +115,8 @@ type FetchSeeinpsResult struct {
 // ConfirmOpsItem 确认生成卡片时单个代理的用户编辑结果
 type ConfirmOpsItem struct {
 	OpsID     int      `json:"opsId"`
-	ProxyUser string   `json:"proxyUser"`
-	Name      string   `json:"name"` // 代理名称（留空用默认「账号 · 运维ID」）
+	ProxyUser string   `json:"proxyUser"` // 运维代理用户名（必填，服务端为空时可在此补填）
+	ProxyPass string   `json:"proxyPass"` // 运维代理密码（可留空，稍后在卡片填写）
+	Name      string   `json:"name"`      // 代理名称（留空用默认「账号 · 运维ID」）
 	ACL       []string `json:"acl"`
 }

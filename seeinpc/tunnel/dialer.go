@@ -122,11 +122,13 @@ func (d *Dialer) handshake(conn net.Conn, target, addr string, timeout time.Dura
 		_ = conn.SetDeadline(time.Now().Add(timeout))
 	}
 
-	auth := base64.StdEncoding.EncodeToString([]byte(d.Username + ":" + d.Password))
 	req := "CONNECT " + target + " HTTP/1.1\r\n" +
-		"Host: " + target + "\r\n" +
-		"Proxy-Authorization: Basic " + auth + "\r\n" +
-		"Proxy-Connection: keep-alive\r\n\r\n"
+		"Host: " + target + "\r\n"
+	if d.Username != "" || d.Password != "" {
+		auth := base64.StdEncoding.EncodeToString([]byte(d.Username + ":" + d.Password))
+		req += "Proxy-Authorization: Basic " + auth + "\r\n"
+	}
+	req += "Proxy-Connection: keep-alive\r\n\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {
 		conn.Close()
 		lg.Debugf("handshake: write CONNECT fail addr=%s target=%s err=%v", addr, target, err)
