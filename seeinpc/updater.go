@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +27,18 @@ import (
 // updateBaseURL 官网正式站（升级检查与安装包下载）
 const updateBaseURL = "https://see.timemsee.cn"
 
+// UpdateTarget 弹窗可选的升级目标：latest=最新包，floor=强制版本地板（高于当前版本的最低被强制版本）
+type UpdateTarget struct {
+	ID         string `json:"id"`
+	Version    string `json:"version"`
+	URL        string `json:"url"`
+	Filename   string `json:"filename"`
+	Size       int64  `json:"size"`
+	SHA256     string `json:"sha256"`
+	ReleasedAt string `json:"releasedAt"`
+	Note       string `json:"note"`
+}
+
 // UpdateInfo 最新版本信息（来自官网接口）
 type UpdateInfo struct {
 	Available  bool   `json:"available"`
@@ -37,6 +50,33 @@ type UpdateInfo struct {
 	ReleasedAt string `json:"releasedAt"`
 	Note       string `json:"note"`
 	Forced     bool   `json:"forced"`
+
+	MinRequired *UpdateTarget  `json:"minRequired,omitempty"` // 强制版本地板（官网按 current 计算）
+	Targets     []UpdateTarget `json:"targets,omitempty"`    // 弹窗可选目标（1~2 个，latest 在前）
+}
+
+// PickTarget 按 id 选择升级目标；无 Targets 时回退为 latest 自身（兼容旧响应）。
+func (i *UpdateInfo) PickTarget(id string) *UpdateTarget {
+	if id == "" {
+		id = "latest"
+	}
+	for _, t := range i.Targets {
+		if t.ID == id {
+			cp := t
+			return &cp
+		}
+	}
+	if id == "latest" && len(i.Targets) == 0 && i.Available {
+		return &UpdateTarget{ID: "latest", Version: i.Version, URL: i.URL, Filename: i.Filename,
+			Size: i.Size, SHA256: i.SHA256, ReleasedAt: i.ReleasedAt, Note: i.Note}
+	}
+	return nil
+}
+
+// asUpdateInfo 把选中目标包装为下载函数需要的 UpdateInfo 形态
+func (i *UpdateInfo) asUpdateInfo(t *UpdateTarget) *UpdateInfo {
+	return &UpdateInfo{Available: true, Version: t.Version, URL: t.URL, Filename: t.Filename,
+		Size: t.Size, SHA256: t.SHA256, ReleasedAt: t.ReleasedAt, Note: t.Note, Forced: i.Forced}
 }
 
 // UpdateCheckResult 检查结果（前端升级弹窗数据源）
@@ -47,9 +87,10 @@ type UpdateCheckResult struct {
 	Message string `json:"message"`
 }
 
-// fetchUpdateInfo 拉取官网最新版本信息
+// fetchUpdateInfo 拉取官网最新版本信息（带 current，官网据此返回强制版本地板 min_required）
 func fetchUpdateInfo(ctx context.Context) (*UpdateInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, updateBaseURL+"/api/updates/seeinpc/latest", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		updateBaseURL+"/api/updates/seeinpc/latest?current="+url.QueryEscape(version.Version), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +106,7 @@ func fetchUpdateInfo(ctx context.Context) (*UpdateInfo, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("官网响应异常（HTTP %d）", resp.StatusCode)
 	}
-	var d struct {
+	type pkgDTO struct {
 		Version     string `json:"version"`
 		URL         string `json:"url"`
 		Filename    string `json:"filename"`
@@ -73,10 +114,18 @@ func fetchUpdateInfo(ctx context.Context) (*UpdateInfo, error) {
 		SHA256      string `json:"sha256"`
 		ReleasedAt  string `json:"released_at"`
 		ReleaseNote string `json:"release_note"`
-		Forced      bool   `json:"forced"`
+	}
+	var d struct {
+		pkgDTO
+		Forced      bool    `json:"forced"`
+		MinRequired *pkgDTO `json:"min_required"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&d); err != nil {
 		return nil, fmt.Errorf("解析官网响应失败: %w", err)
+	}
+	toTarget := func(id string, p *pkgDTO) *UpdateTarget {
+		return &UpdateTarget{ID: id, Version: p.Version, URL: updateBaseURL + p.URL, Filename: p.Filename,
+			Size: p.Size, SHA256: strings.ToLower(p.SHA256), ReleasedAt: p.ReleasedAt, Note: p.ReleaseNote}
 	}
 	info := &UpdateInfo{
 		Version:    d.Version,
@@ -86,9 +135,33 @@ func fetchUpdateInfo(ctx context.Context) (*UpdateInfo, error) {
 		SHA256:     strings.ToLower(d.SHA256),
 		ReleasedAt: d.ReleasedAt,
 		Note:       d.ReleaseNote,
-		Forced:     d.Forced,
 	}
-	info.Available = compareVersions(d.Version, version.Version) > 0
+	cur := version.Version
+	latestNewer := compareVersions(d.Version, cur) > 0
+	info.Available = latestNewer
+	info.Forced = d.Forced
+	if d.MinRequired != nil && compareVersions(d.MinRequired.Version, cur) > 0 {
+		// 当前版本低于强制地板：必须升级（地板语义覆盖在 latest.forced 之上）
+		info.MinRequired = toTarget("floor", d.MinRequired)
+		info.Available = true
+		info.Forced = true
+	}
+	if info.Available {
+		// 目标列表：latest 须比当前新且不低于地板；floor 与 latest 版本不同才作为第二选项
+		hasLatest := latestNewer
+		if info.MinRequired != nil && latestNewer && compareVersions(d.Version, info.MinRequired.Version) < 0 {
+			hasLatest = false
+		}
+		if hasLatest {
+			info.Targets = append(info.Targets, *toTarget("latest", &d.pkgDTO))
+		}
+		if info.MinRequired != nil && (!hasLatest || info.MinRequired.Version != d.Version) {
+			info.Targets = append(info.Targets, *info.MinRequired)
+		}
+		if len(info.Targets) == 0 {
+			info.Available = false // 理论上不可达的兜底
+		}
+	}
 	return info, nil
 }
 

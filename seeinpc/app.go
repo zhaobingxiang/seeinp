@@ -35,6 +35,7 @@ type App struct {
 	probing bool
 
 	updateInfo    *UpdateInfo // 最新检查到的升级信息
+	updateSelID   string      // 已选升级目标 "id|version"（换目标作废旧包）
 	installerPath string      // 已下载校验的安装包本地路径
 	downloading   atomic.Bool
 	updateCancel  context.CancelFunc
@@ -936,34 +937,45 @@ func (a *App) startVPN(e *Entry) error {
 	a.mu.Unlock()
 	a.logf("[TUNNEL] connected entry=%s adapter=%s routes=%d", e.Name, tunnel.AdapterName, len(added))
 
-	// 5. 连接后探测：仅当勾选"探测内网目标"时才经虚拟网卡探测，否则仅确认代理已连接
+	// 5. 连接后探测：仅当勾选"探测内网目标"时才经虚拟网卡探测，否则仅确认代理已连接。
+	//    新建网卡的路由生效有短暂窗口（单发 800ms 曾出现 WSAEHOSTUNREACH 误报），
+	//    按 0.8s/2s/4s 退避最多拨 3 次，全部失败才判不可达。
 	go func() {
-		time.Sleep(800 * time.Millisecond) // 等待路由生效
+		defer a.emitState()
 		if !e.ProbeIntranet {
 			a.debugf("[PROBE] post-connect skipped entry=%s (intranet probe disabled)", e.Name)
 			a.markProbe(e.ID, "ok", "VPN 已连接（代理正常）")
-			a.emitState()
 			return
 		}
 		target := a.probeTargetOf(e)
 		if target == "" {
 			a.debugf("[PROBE] post-connect skipped entry=%s (no probe target configured)", e.Name)
 			a.markProbe(e.ID, "ok", "VPN 已连接（未配置内网探测目标）")
-			a.emitState()
 			return
 		}
-		a.debugf("[PROBE] post-connect dial entry=%s target=%s", e.Name, target)
-		start := time.Now()
-		conn, derr := net.DialTimeout("tcp", target, 8*time.Second)
-		if derr != nil {
-			a.logWarnf("[PROBE] tunnel probe fail entry=%s target=%s err=%v", e.Name, target, derr)
-			a.markProbe(e.ID, "dialfail", "VPN 已连接，但内网目标 "+target+" 不可达")
-		} else {
-			conn.Close()
-			a.debugf("[PROBE] post-connect ok entry=%s target=%s rtt=%s", e.Name, target, time.Since(start))
-			a.markProbe(e.ID, "ok", "内网目标可达", time.Since(start))
+		var derr error
+		for i, wait := range []time.Duration{800 * time.Millisecond, 2 * time.Second, 4 * time.Second} {
+			time.Sleep(wait)
+			a.mu.Lock()
+			sess := a.session
+			a.mu.Unlock()
+			if sess == nil || sess.entryID != e.ID {
+				a.debugf("[PROBE] post-connect abort entry=%s (session changed)", e.Name)
+				return // 会话已断开/切换，结果不再有意义
+			}
+			a.debugf("[PROBE] post-connect dial entry=%s target=%s attempt=%d", e.Name, target, i+1)
+			start := time.Now()
+			conn, err := net.DialTimeout("tcp", target, 8*time.Second)
+			if err == nil {
+				conn.Close()
+				a.debugf("[PROBE] post-connect ok entry=%s target=%s attempt=%d rtt=%s", e.Name, target, i+1, time.Since(start))
+				a.markProbe(e.ID, "ok", "内网目标可达", time.Since(start))
+				return
+			}
+			derr = err
 		}
-		a.emitState()
+		a.logWarnf("[PROBE] tunnel probe fail entry=%s target=%s err=%v", e.Name, target, derr)
+		a.markProbe(e.ID, "dialfail", "VPN 已连接，但内网目标 "+target+" 不可达")
 	}()
 	return nil
 }
@@ -1394,15 +1406,27 @@ func (a *App) CheckUpdate() UpdateCheckResult {
 	return res
 }
 
-// StartDownload 开始后台下载升级包，进度经 "update-progress"、结果经
-// "update-download-done" 事件推送。
-func (a *App) StartDownload() OpResult {
+// StartDownload 开始后台下载指定升级目标的升级包（targetID: "latest"|"floor"，空=latest），
+// 进度经 "update-progress"、结果经 "update-download-done" 事件推送。
+func (a *App) StartDownload(targetID string) OpResult {
 	a.mu.Lock()
 	info := a.updateInfo
 	a.mu.Unlock()
 	if info == nil {
 		return OpResult{Message: "请先检查更新"}
 	}
+	t := info.PickTarget(targetID)
+	if t == nil {
+		return OpResult{Message: "升级目标不存在，请重新检查更新"}
+	}
+	pkg := info.asUpdateInfo(t)
+	a.mu.Lock()
+	sel := t.ID + "|" + t.Version
+	if a.updateSelID != sel {
+		a.installerPath = "" // 切换目标，旧下载结果作废
+		a.updateSelID = sel
+	}
+	a.mu.Unlock()
 	if !a.downloading.CompareAndSwap(false, true) {
 		return OpResult{OK: true, Message: "下载进行中"}
 	}
@@ -1410,11 +1434,11 @@ func (a *App) StartDownload() OpResult {
 	a.mu.Lock()
 	a.updateCancel = cancel
 	a.mu.Unlock()
-	a.logf("[UPDATE] download start version=%s size=%d src=%s", info.Version, info.Size, safeURLForLog(info.URL))
+	a.logf("[UPDATE] download start version=%s target=%s size=%d src=%s", t.Version, t.ID, pkg.Size, safeURLForLog(pkg.URL))
 	go func() {
 		defer a.downloading.Store(false)
 		defer cancel()
-		path, err := a.downloadUpdate(ctx, info)
+		path, err := a.downloadUpdate(ctx, pkg)
 		if err != nil {
 			if ctx.Err() != nil {
 				a.logf("[UPDATE] download canceled")
